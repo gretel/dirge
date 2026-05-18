@@ -170,6 +170,52 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "plugin")]
     let plugin_manager = std::sync::Arc::new(std::sync::Mutex::new(plugin::PluginManager::new()));
 
+    #[cfg(feature = "plugin")]
+    {
+        use std::path::PathBuf;
+        let hook_names = [
+            "on-init",
+            "on-prompt",
+            "on-response",
+            "on-tool-start",
+            "on-tool-end",
+            "on-error",
+            "on-complete",
+        ];
+        let search_dirs: Vec<PathBuf> = vec![
+            dirs::home_dir()
+                .unwrap_or_default()
+                .join(".config")
+                .join("dirge")
+                .join("plugins"),
+            PathBuf::from(".dirge").join("plugins"),
+        ];
+        for dir in &search_dirs {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "janet") {
+                        let mut mgr = plugin_manager.lock().unwrap();
+                        if mgr.load_file(&path).is_ok() {
+                            let stem = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("unknown");
+                            for hook in &hook_names {
+                                let fn_name = format!("{}-{}", stem, hook);
+                                // Only register if function exists in Janet VM
+                                let check = format!("(bound? '{} )", fn_name.replace('-', "_"));
+                                if mgr.eval(&check).map(|v| v == "true").unwrap_or(false) {
+                                    mgr.register(hook, &fn_name);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "acp")]
     if cli.acp_enabled {
         return extras::acp::serve(cli, cfg, context).await;

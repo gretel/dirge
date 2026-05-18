@@ -159,11 +159,15 @@ Skills are auto-discovered at agent startup and listed in the `skill` tool descr
 
 When built with `--features plugin`, dirge embeds the [Janet](https://janet-lang.org) scripting language for harness-driven workflows. Plugins are Janet scripts placed in `~/.config/dirge/plugins/` or `./.dirge/plugins/` that define hooks called at specific points in the agent lifecycle:
 
-| Hook | When | Description |
-|------|------|-------------|
-| `on-init` | Session start | Receives model, cwd, provider context |
-| `on-prompt` | Before LLM call | Can detect patterns and inject instructions |
-| `on-response` | After LLM response | Can advance workflow phases |
+| Hook | When | Context |
+|------|------|---------|
+| `on-init` | Session start | `{:model "..." :cwd "..." :provider "..."}` |
+| `on-prompt` | Before LLM call | `{:prompt "..."}` |
+| `on-response` | After LLM response | `{:response "..."}` |
+| `on-tool-start` | Before tool execution | `{:tool "bash" :args {...}}` |
+| `on-tool-end` | After tool completes | `{:output "..."}` |
+| `on-error` | Error occurred | `{:error "..."}` |
+| `on-complete` | Agent turn finishes | (no context — use on-response) |
 
 ### Harness APIs
 

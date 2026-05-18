@@ -918,9 +918,27 @@ pub async fn run_interactive(
                         response_start_line = None;
                         let line = format!("◈ {}", format_tool_call_summary(&name, &args));
                         renderer.write_line(&sanitize_output(&line), C_TOOL)?;
+
+                        #[cfg(feature = "plugin")]
+                        if let Some(pm) = plugin_manager {
+                            let mut mgr = pm.lock().unwrap();
+                            let _ = mgr.dispatch(
+                                "on-tool-start",
+                                &format!("@{{:tool \"{}\" :args {}}}", name, args),
+                            );
+                        }
                     }
                     AgentEvent::ToolResult { output } => {
                         let show_details = cfg.show_tool_details.unwrap_or(false);
+
+                        #[cfg(feature = "plugin")]
+                        if let Some(pm) = plugin_manager {
+                            let mut mgr = pm.lock().unwrap();
+                            let _ = mgr.dispatch(
+                                "on-tool-end",
+                                &format!("@{{:output \"{}\"}}", output.replace('"', "\\\"")),
+                            );
+                        }
                         if show_details {
                             let sanitized = sanitize_output(&output);
                             let char_count = sanitized.chars().count();
@@ -1098,6 +1116,16 @@ pub async fn run_interactive(
                         was_reasoning = false;
                         let safe = sanitize_output(&e);
                         renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
+
+                        #[cfg(feature = "plugin")]
+                        if let Some(pm) = plugin_manager {
+                            let mut mgr = pm.lock().unwrap();
+                            let _ = mgr.dispatch(
+                                "on-error",
+                                &format!("@{{:error \"{}\"}}", e.replace('"', "\\\"")),
+                            );
+                        }
+
                         is_running = false;
                         agent_rx = None;
                         agent_line_started = false;
