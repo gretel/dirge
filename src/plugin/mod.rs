@@ -80,8 +80,13 @@ mod tests {
 
         // Simulate auto-discovery: check each hook and register if found.
         let hook_names = [
-            "on-init", "on-prompt", "on-response",
-            "on-tool-start", "on-tool-end", "on-error", "on-complete",
+            "on-init",
+            "on-prompt",
+            "on-response",
+            "on-tool-start",
+            "on-tool-end",
+            "on-error",
+            "on-complete",
         ];
         let mut found = 0;
         for hook in &hook_names {
@@ -147,7 +152,8 @@ mod tests {
         let mut mgr = PluginManager::new();
 
         // Define test functions that use harness APIs
-        mgr.eval(r#"
+        mgr.eval(
+            r#"
             (var test-phase :idle)
             (defn test-on-init [ctx]
               (harness/log "phase test loaded")
@@ -157,7 +163,9 @@ mod tests {
                 :idle (do (set test-phase :active) "entered active")
                 :active (do (set test-phase :done) "entered done")
                 nil))
-        "#).unwrap();
+        "#,
+        )
+        .unwrap();
 
         mgr.register("on-init", "test-on-init");
         mgr.register("on-prompt", "test-on-prompt");
@@ -313,10 +321,7 @@ impl PluginManager {
 
         let mut results = Vec::new();
         for name in &names {
-            let code = format!(
-                r#"(do (def ctx {}) ({} ctx))"#,
-                context_janet, name
-            );
+            let code = format!(r#"(do (def ctx {}) ({} ctx))"#, context_janet, name);
             if let Ok(result) = self.eval(&code) {
                 let s = result.to_string();
                 // Janet nil -> skip
