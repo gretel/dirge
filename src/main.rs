@@ -204,7 +204,7 @@ async fn main() -> anyhow::Result<()> {
                             for hook in &hook_names {
                                 let fn_name = format!("{}-{}", stem, hook);
                                 // Only register if function exists in Janet VM
-                                let check = format!("(bound? '{} )", fn_name.replace('-', "_"));
+                                let check = format!("(bound? '{})", fn_name);
                                 if mgr.eval(&check).map(|v| v == "true").unwrap_or(false) {
                                     mgr.register(hook, &fn_name);
                                 }

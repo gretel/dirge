@@ -976,7 +976,10 @@ pub async fn run_interactive(
                                     plugin_followup = Some(result);
                                 }
                             }
-                            // Store response for plugin to read
+                            // Check for pending prompts queued by on-response
+                            if let Some(pending) = mgr.take_pending_prompt() {
+                                plugin_followup = Some(pending);
+                            }
                             mgr.store_response(&response);
                         }
 
