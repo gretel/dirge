@@ -61,9 +61,7 @@ mod tests {
     fn test_load_file() {
         let mut mgr = PluginManager::new();
         let fixtures = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src")
-            .join("plugin")
-            .join("fixtures")
+            .join("plugins")
             .join("test_plugin.janet");
         mgr.load_file(&fixtures).unwrap();
         mgr.register("on-init", "on-init");
