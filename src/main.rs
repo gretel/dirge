@@ -217,8 +217,9 @@ async fn main() -> anyhow::Result<()> {
                                 .unwrap_or("unknown");
                             for hook in &hook_names {
                                 let fn_name = format!("{}-{}", stem, hook);
-                                let check = format!("(bound? '{})", fn_name);
-                                if mgr.eval(&check).map(|v| v == "true").unwrap_or(false) {
+                                // Try to evaluate the symbol to check if bound
+                                let is_bound = mgr.eval(&fn_name).is_ok();
+                                if is_bound {
                                     mgr.register(hook, &fn_name);
                                     eprintln!("  registered hook: {} -> {}", hook, fn_name);
                                 }
