@@ -13,12 +13,13 @@
   nil)
 
 (defn- detect-feature-request [prompt]
-  (def pattern (string "\\b("
-                  "add a feature|implement feature|add support for|"
-                  "build a|create a|add .* to|feature request|"
-                  "new feature|enhancement|coding task"
-                  ")\\b"))
-  (peg/match (peg/compile pattern) prompt))
+  (def patterns ["add a feature" "implement feature" "add support for"
+                 "build a" "create a" "add " "feature request"
+                 "new feature" "enhancement" "coding task"])
+  (var found false)
+  (loop [p :in patterns]
+    (if (string/find p prompt) (set found true)))
+  found)
 
 (defn- architect-prompt [feature]
   (string
