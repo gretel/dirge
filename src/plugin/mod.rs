@@ -79,29 +79,105 @@ mod tests {
         mgr.load_file(&fixtures).unwrap();
 
         // Simulate auto-discovery: check each hook and register if found.
-        // The {stem}-{hook} naming convention means a plugin file named
-        // "workflow.janet" exports functions like "workflow-on-init".
-        // Here we test a file where functions are just "on-init" (no prefix).
         let hook_names = [
             "on-init", "on-prompt", "on-response",
             "on-tool-start", "on-tool-end", "on-error", "on-complete",
         ];
         let mut found = 0;
         for hook in &hook_names {
-            // Try to eval the function name directly
             if mgr.eval(hook).is_ok() {
                 mgr.register(hook, hook);
                 found += 1;
             }
         }
-        assert_eq!(found, 1, "should find exactly on-init function");
+        assert_eq!(found, 3, "should find on-init, on-prompt, on-response");
 
+        // on-init
         let result = mgr.dispatch("on-init", "@{:model \"test\"}");
         assert!(result.is_ok());
         assert!(result.unwrap().contains("loaded with test"));
 
-        // Verify unknown hooks gracefully return empty
-        let result = mgr.dispatch("on-prompt", "@{:prompt \"hello\"}");
+        // on-prompt with matching text
+        let result = mgr.dispatch("on-prompt", "@{:prompt \"hello world\"}");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "greeting detected");
+
+        // on-prompt with non-matching text
+        let result = mgr.dispatch("on-prompt", "@{:prompt \"goodbye\"}");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "");
+
+        // on-response with matching text
+        let result = mgr.dispatch("on-response", "@{:response \"error: panic\"}");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "error in response");
+
+        // unknown hook returns empty
+        let result = mgr.dispatch("on-tool-start", "@{:tool \"bash\"}");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "");
+    }
+
+    #[test]
+    fn test_janet_escaping() {
+        let mut mgr = PluginManager::new();
+
+        // Define a test function
+        mgr.eval(r#"(defn test-echo [ctx] (ctx :msg))"#).unwrap();
+        mgr.register("on-prompt", "test-echo");
+
+        // Quotes in text
+        let result = mgr.dispatch("on-prompt", "@{:msg \"he said \\\"hello\\\"\"}");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "he said \"hello\"");
+
+        // Backslashes in text
+        let result = mgr.dispatch("on-prompt", "@{:msg \"path\\\\to\\\\file\"}");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "path\\to\\file");
+
+        // Newlines in text
+        let result = mgr.dispatch("on-prompt", "@{:msg \"line1\\nline2\"}");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "line1\nline2");
+    }
+
+    #[test]
+    fn test_janet_phase_tracking() {
+        let mut mgr = PluginManager::new();
+
+        // Define test functions that use harness APIs
+        mgr.eval(r#"
+            (var test-phase :idle)
+            (defn test-on-init [ctx]
+              (harness/log "phase test loaded")
+              nil)
+            (defn test-on-prompt [ctx]
+              (case test-phase
+                :idle (do (set test-phase :active) "entered active")
+                :active (do (set test-phase :done) "entered done")
+                nil))
+        "#).unwrap();
+
+        mgr.register("on-init", "test-on-init");
+        mgr.register("on-prompt", "test-on-prompt");
+
+        // on-init should work
+        let result = mgr.dispatch("on-init", "@{}");
+        assert!(result.is_ok());
+
+        // First prompt: idle -> active
+        let result = mgr.dispatch("on-prompt", "@{:prompt \"any\"}");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "entered active");
+
+        // Second prompt: active -> done
+        let result = mgr.dispatch("on-prompt", "@{:prompt \"any\"}");
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "entered done");
+
+        // Third prompt: done -> nil
+        let result = mgr.dispatch("on-prompt", "@{:prompt \"any\"}");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "");
     }
@@ -237,10 +313,16 @@ impl PluginManager {
 
         let mut results = Vec::new();
         for name in &names {
-            let code = format!(r#"(do (def ctx {}) ({} ctx))"#, context_janet, name);
-            let result = self.eval(&code)?;
-            if !result.is_empty() {
-                results.push(result);
+            let code = format!(
+                r#"(do (def ctx {}) ({} ctx))"#,
+                context_janet, name
+            );
+            if let Ok(result) = self.eval(&code) {
+                let s = result.to_string();
+                // Janet nil -> skip
+                if s != "nil" && !s.is_empty() {
+                    results.push(s);
+                }
             }
         }
 
