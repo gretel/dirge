@@ -5,6 +5,7 @@ use rig::completion::{CompletionModel, Message};
 use rig::message::ToolResultContent;
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::agent::recovery::{self, ErrorKind, RecoveryPolicy};
 use crate::agent::tools::ToolCache;
@@ -13,6 +14,11 @@ use crate::session::{MessageRole, Session};
 
 pub struct AgentRunner {
     pub event_rx: mpsc::Receiver<AgentEvent>,
+    /// Handle to the spawned tokio task. The UI calls `abort()` on interrupt
+    /// so in-flight LLM calls and tool execution actually stop, rather than
+    /// running to completion in the background and emitting permission
+    /// prompts after the user thought they cancelled.
+    pub task: JoinHandle<()>,
 }
 
 pub fn convert_history(session: &Session) -> Vec<Message> {
@@ -143,7 +149,7 @@ where
     cache.clear();
     let (event_tx, event_rx) = mpsc::channel::<AgentEvent>(256);
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let policy = RecoveryPolicy::default();
         let mut attempts = 0;
 
@@ -215,7 +221,7 @@ where
         }
     });
 
-    AgentRunner { event_rx }
+    AgentRunner { event_rx, task }
 }
 
 pub async fn run_print<M, P>(
