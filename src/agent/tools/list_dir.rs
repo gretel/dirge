@@ -4,10 +4,10 @@ use ignore::WalkBuilder;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
+use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
     AskSender, ListDirArgs, PermCheck, ToolError, check_perm_path, is_skip_dir,
 };
-use crate::agent::tools::cache::ToolCache;
 
 fn format_size(bytes: u64) -> String {
     const UNITS: &[&str] = &["B", "KB", "MB", "GB"];
@@ -39,7 +39,11 @@ pub struct ListDirTool {
 impl ListDirTool {
     #[allow(dead_code)]
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        ListDirTool { permission, ask_tx, cache: None }
+        ListDirTool {
+            permission,
+            ask_tx,
+            cache: None,
+        }
     }
 
     pub fn with_cache(
@@ -47,7 +51,11 @@ impl ListDirTool {
         ask_tx: Option<AskSender>,
         cache: ToolCache,
     ) -> Self {
-        ListDirTool { permission, ask_tx, cache: Some(cache) }
+        ListDirTool {
+            permission,
+            ask_tx,
+            cache: Some(cache),
+        }
     }
 }
 

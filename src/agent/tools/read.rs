@@ -1,8 +1,8 @@
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
-use crate::agent::tools::{AskSender, PermCheck, ReadArgs, ToolError, check_perm_path};
 use crate::agent::tools::cache::ToolCache;
+use crate::agent::tools::{AskSender, PermCheck, ReadArgs, ToolError, check_perm_path};
 
 pub struct ReadTool {
     pub permission: Option<PermCheck>,
@@ -13,7 +13,11 @@ pub struct ReadTool {
 impl ReadTool {
     #[allow(dead_code)]
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        ReadTool { permission, ask_tx, cache: None }
+        ReadTool {
+            permission,
+            ask_tx,
+            cache: None,
+        }
     }
 
     pub fn with_cache(
@@ -21,7 +25,11 @@ impl ReadTool {
         ask_tx: Option<AskSender>,
         cache: ToolCache,
     ) -> Self {
-        ReadTool { permission, ask_tx, cache: Some(cache) }
+        ReadTool {
+            permission,
+            ask_tx,
+            cache: Some(cache),
+        }
     }
 }
 

@@ -3,10 +3,10 @@ use regex::Regex;
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
+use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
     AskSender, GrepArgs, MAX_GREP_RESULTS, PermCheck, ToolError, check_perm, is_skip_dir,
 };
-use crate::agent::tools::cache::ToolCache;
 
 pub struct GrepTool {
     pub permission: Option<PermCheck>,
@@ -17,7 +17,11 @@ pub struct GrepTool {
 impl GrepTool {
     #[allow(dead_code)]
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        GrepTool { permission, ask_tx, cache: None }
+        GrepTool {
+            permission,
+            ask_tx,
+            cache: None,
+        }
     }
 
     pub fn with_cache(
@@ -25,7 +29,11 @@ impl GrepTool {
         ask_tx: Option<AskSender>,
         cache: ToolCache,
     ) -> Self {
-        GrepTool { permission, ask_tx, cache: Some(cache) }
+        GrepTool {
+            permission,
+            ask_tx,
+            cache: Some(cache),
+        }
     }
 
     fn glob_to_regex(glob: &str) -> String {

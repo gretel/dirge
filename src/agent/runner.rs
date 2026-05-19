@@ -6,9 +6,9 @@ use rig::message::ToolResultContent;
 use rig::streaming::{StreamedAssistantContent, StreamedUserContent, StreamingChat};
 use tokio::sync::mpsc;
 
+use crate::agent::tools::ToolCache;
 use crate::event::AgentEvent;
 use crate::session::{MessageRole, Session};
-use crate::agent::tools::ToolCache;
 
 pub struct AgentRunner {
     pub event_rx: mpsc::Receiver<AgentEvent>,
