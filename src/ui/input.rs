@@ -404,21 +404,28 @@ impl InputEditor {
     /// original paste bodies. Used at submit time so the agent receives the
     /// real text.
     pub fn expanded(&self) -> CompactString {
-        let blocks = marker_blocks(&self.buffer);
+        Self::expand_with_pastes(&self.buffer, &self.pastes).into()
+    }
+
+    /// Expand markers in `s` using `pastes` for bodies. Free-function form
+    /// so it can also be used to flatten markers in kill-ring entries
+    /// before we clear `pastes`.
+    fn expand_with_pastes(s: &str, pastes: &[Option<CompactString>]) -> String {
+        let blocks = marker_blocks(s);
         if blocks.is_empty() {
-            return self.buffer.clone();
+            return s.to_string();
         }
-        let mut out = String::with_capacity(self.buffer.len());
+        let mut out = String::with_capacity(s.len());
         let mut cur = 0;
         for (start, end, idx) in blocks {
-            out.push_str(&self.buffer[cur..start]);
-            if let Some(Some(body)) = self.pastes.get(idx) {
+            out.push_str(&s[cur..start]);
+            if let Some(Some(body)) = pastes.get(idx) {
                 out.push_str(body);
             }
             cur = end;
         }
-        out.push_str(&self.buffer[cur..]);
-        out.into()
+        out.push_str(&s[cur..]);
+        out
     }
 
     /// Return (display_text, display_cursor_col) for a logical line of the
@@ -650,6 +657,16 @@ impl InputEditor {
                 self.history_pos = None;
                 self.buffer.clear();
                 self.cursor = 0;
+                // Flatten markers in kill-ring entries to their raw bodies
+                // before dropping pastes — otherwise a later Ctrl+Y would
+                // yank back marker bytes referencing indices we just
+                // cleared, and `expanded()` would silently omit them.
+                for entry in self.kill_ring.iter_mut() {
+                    if entry.contains(PASTE_MARK) {
+                        let expanded = Self::expand_with_pastes(entry, &self.pastes);
+                        *entry = expanded.into();
+                    }
+                }
                 self.pastes.clear();
                 self.reset_kill_accumulation();
                 if submitted.is_empty() {
