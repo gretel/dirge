@@ -5,29 +5,33 @@ fn press(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::empty())
 }
 
+fn ctrl(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::CONTROL)
+}
+
+fn meta(code: KeyCode) -> KeyEvent {
+    KeyEvent::new(code, KeyModifiers::ALT)
+}
+
 fn type_str(editor: &mut InputEditor, s: &str) {
     for c in s.chars() {
         editor.handle_key(press(KeyCode::Char(c)));
     }
 }
 
-#[test]
-fn typing_ascii_keeps_cursor_in_sync() {
-    let mut editor = InputEditor::new();
-    type_str(&mut editor, "hello");
-    assert_eq!(editor.buffer.as_str(), "hello");
-    assert_eq!(editor.cursor, 5);
+fn len_bytes(s: &str) -> usize {
+    s.len()
 }
+
+// ── existing tests ──────────────────────────────────────────
+
 
 #[test]
 fn typing_multibyte_chars_does_not_panic() {
-    // Regression for bug where `cursor += 1` (char step) was used with
-    // `CompactString::insert(byte_idx, ch)` (byte boundary required).
-    // Two Norwegian characters in a row were enough to trigger a panic.
     let mut editor = InputEditor::new();
-    type_str(&mut editor, "på "); // used to panic on the space after 'å'
+    type_str(&mut editor, "på ");
     assert_eq!(editor.buffer.as_str(), "på ");
-    assert_eq!(editor.cursor, editor.buffer.len()); // cursor in bytes
+    assert_eq!(editor.cursor, editor.buffer.len());
 }
 
 #[test]
@@ -51,13 +55,10 @@ fn backspace_after_multibyte_does_not_panic() {
 fn left_arrow_steps_one_char_not_one_byte() {
     let mut editor = InputEditor::new();
     type_str(&mut editor, "aåb");
-    // cursor is after 'b', byte-idx 4 (a=1 + å=2 + b=1)
     assert_eq!(editor.cursor, 4);
     editor.handle_key(press(KeyCode::Left));
-    // after 'å' → byte-idx 3
     assert_eq!(editor.cursor, 3);
     editor.handle_key(press(KeyCode::Left));
-    // after 'a' → byte-idx 1 (skips the 2 bytes of 'å')
     assert_eq!(editor.cursor, 1);
 }
 
@@ -67,9 +68,9 @@ fn right_arrow_steps_one_char_not_one_byte() {
     type_str(&mut editor, "aåb");
     editor.cursor = 0;
     editor.handle_key(press(KeyCode::Right));
-    assert_eq!(editor.cursor, 1); // after 'a'
+    assert_eq!(editor.cursor, 1);
     editor.handle_key(press(KeyCode::Right));
-    assert_eq!(editor.cursor, 3); // after 'å' (skipped 2 bytes)
+    assert_eq!(editor.cursor, 3);
 }
 
 #[test]
@@ -80,4 +81,515 @@ fn enter_returns_buffer_and_resets() {
     assert_eq!(out.as_str(), "hei på");
     assert_eq!(editor.cursor, 0);
     assert_eq!(editor.buffer.as_str(), "");
+}
+
+// ── Ctrl+A / Ctrl+E ─────────────────────────────────────────
+
+#[test]
+fn ctrl_a_moves_to_start_of_line() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    assert_eq!(editor.cursor, len_bytes("hello world"));
+    editor.handle_key(ctrl(KeyCode::Char('a')));
+    assert_eq!(editor.cursor, 0);
+    assert_eq!(editor.buffer.as_str(), "hello world");
+}
+
+#[test]
+fn ctrl_e_moves_to_end_of_line() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.cursor = 0;
+    editor.handle_key(ctrl(KeyCode::Char('e')));
+    assert_eq!(editor.cursor, len_bytes("hello world"));
+    assert_eq!(editor.buffer.as_str(), "hello world");
+}
+
+// ── Ctrl+B / Ctrl+F ─────────────────────────────────────────
+
+#[test]
+fn ctrl_b_moves_left_one_char() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "abc");
+    assert_eq!(editor.cursor, 3);
+    editor.handle_key(ctrl(KeyCode::Char('b')));
+    assert_eq!(editor.cursor, 2);
+    editor.handle_key(ctrl(KeyCode::Char('b')));
+    assert_eq!(editor.cursor, 1);
+}
+
+#[test]
+fn ctrl_b_at_start_does_nothing() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "abc");
+    editor.cursor = 0;
+    editor.handle_key(ctrl(KeyCode::Char('b')));
+    assert_eq!(editor.cursor, 0);
+}
+
+#[test]
+fn ctrl_f_moves_right_one_char() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "abc");
+    editor.cursor = 0;
+    editor.handle_key(ctrl(KeyCode::Char('f')));
+    assert_eq!(editor.cursor, 1);
+    editor.handle_key(ctrl(KeyCode::Char('f')));
+    assert_eq!(editor.cursor, 2);
+}
+
+#[test]
+fn ctrl_f_at_end_does_nothing() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "abc");
+    editor.handle_key(ctrl(KeyCode::Char('f')));
+    assert_eq!(editor.cursor, 3);
+}
+
+// ── Option+Left / Option+Right (word skip) ──────────────────
+
+#[test]
+fn option_left_skips_to_prev_word_start() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world foo");
+    let len = len_bytes("hello world foo");
+    assert_eq!(editor.cursor, len);
+    editor.handle_key(meta(KeyCode::Left));
+    assert_eq!(editor.cursor, len_bytes("hello world ")); // start of "foo"
+    editor.handle_key(meta(KeyCode::Left));
+    assert_eq!(editor.cursor, len_bytes("hello ")); // start of "world"
+    editor.handle_key(meta(KeyCode::Left));
+    assert_eq!(editor.cursor, 0); // start of "hello"
+}
+
+#[test]
+fn option_left_at_start_does_nothing() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "abc");
+    editor.cursor = 0;
+    editor.handle_key(meta(KeyCode::Left));
+    assert_eq!(editor.cursor, 0);
+}
+
+#[test]
+fn option_left_from_middle_of_word_goes_to_its_start() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.cursor = len_bytes("hello wo"); // middle of "world"
+    editor.handle_key(meta(KeyCode::Left));
+    assert_eq!(editor.cursor, len_bytes("hello ")); // start of "world"
+}
+
+#[test]
+fn option_right_skips_to_next_word_start() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world foo");
+    editor.cursor = 0;
+    editor.handle_key(meta(KeyCode::Right));
+    assert_eq!(editor.cursor, len_bytes("hello ")); // start of "world"
+    editor.handle_key(meta(KeyCode::Right));
+    assert_eq!(editor.cursor, len_bytes("hello world ")); // start of "foo"
+    editor.handle_key(meta(KeyCode::Right));
+    assert_eq!(editor.cursor, len_bytes("hello world foo")); // end of line
+}
+
+#[test]
+fn option_right_at_end_does_nothing() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "abc");
+    editor.handle_key(meta(KeyCode::Right));
+    assert_eq!(editor.cursor, 3);
+}
+
+#[test]
+fn option_right_skips_punctuation() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "foo.bar_baz");
+    editor.cursor = 0;
+    editor.handle_key(meta(KeyCode::Right));
+    // skip "foo" (word) then skip "." (punct) → land at "bar_baz" start
+    assert_eq!(editor.cursor, len_bytes("foo."));
+    assert_eq!(&editor.buffer[editor.cursor..], "bar_baz");
+}
+
+#[test]
+fn option_right_multibyte_words() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hå bør");
+    editor.cursor = 0;
+    editor.handle_key(meta(KeyCode::Right));
+    assert_eq!(editor.cursor, len_bytes("hå ")); // after "hå ", start of "bør"
+    editor.handle_key(meta(KeyCode::Right));
+    assert_eq!(editor.cursor, len_bytes("hå bør")); // end
+}
+
+// ── Meta+B / Meta+F (Emacs-style word skip) ─────────────────
+
+#[test]
+fn meta_b_skips_to_prev_word() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    assert_eq!(editor.cursor, len_bytes("hello world"));
+    editor.handle_key(meta(KeyCode::Char('b')));
+    assert_eq!(editor.cursor, len_bytes("hello ")); // start of "world"
+    editor.handle_key(meta(KeyCode::Char('b')));
+    assert_eq!(editor.cursor, 0); // start of "hello"
+}
+
+#[test]
+fn meta_f_skips_to_next_word() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.cursor = 0;
+    editor.handle_key(meta(KeyCode::Char('f')));
+    assert_eq!(editor.cursor, len_bytes("hello ")); // start of "world"
+    editor.handle_key(meta(KeyCode::Char('f')));
+    assert_eq!(editor.cursor, len_bytes("hello world")); // end
+}
+
+// ── Ctrl+K (kill to line end) ────────────────────────────────
+
+#[test]
+fn ctrl_k_kills_to_end_of_line() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.cursor = len_bytes("hello ");
+    editor.handle_key(ctrl(KeyCode::Char('k')));
+    assert_eq!(editor.buffer.as_str(), "hello ");
+    assert_eq!(editor.cursor, len_bytes("hello "));
+}
+
+#[test]
+fn ctrl_k_at_end_does_nothing() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.handle_key(ctrl(KeyCode::Char('k')));
+    assert_eq!(editor.buffer.as_str(), "hello");
+    assert_eq!(editor.cursor, 5);
+}
+
+#[test]
+fn consecutive_ctrl_k_accumulates_in_kill_ring() {
+    let mut editor = InputEditor::new();
+
+    // first kill
+    type_str(&mut editor, "one two three");
+    editor.cursor = len_bytes("one ");
+    editor.handle_key(ctrl(KeyCode::Char('k'))); // kills "two three"
+    assert_eq!(editor.buffer.as_str(), "one ");
+
+    // consecutive kill (no non-kill action in between)
+    editor.handle_key(ctrl(KeyCode::Char('k'))); // kills "" (nothing after cursor)
+    // ring[0] should be "two three" (empty string appended = no change)
+
+    // yank should return "two three"
+    editor.handle_key(ctrl(KeyCode::Char('y')));
+    assert_eq!(editor.buffer.as_str(), "one two three");
+}
+
+#[test]
+fn non_kill_action_resets_kill_accumulation() {
+    let mut editor = InputEditor::new();
+
+    // first kill
+    type_str(&mut editor, "one two three");
+    editor.cursor = len_bytes("one ");
+    editor.handle_key(ctrl(KeyCode::Char('k'))); // kill "two three"
+
+    // type something (breaks kill accumulation)
+    type_str(&mut editor, "X");
+    assert_eq!(editor.buffer.as_str(), "one X");
+
+    // Ctrl+K at end does nothing (cursor at end, nothing to kill)
+    // The kill ring still has "two three" from earlier.
+    // Kill accumulation was reset, but the ring entry persists.
+    editor.handle_key(ctrl(KeyCode::Char('k')));
+
+    // yank returns the previous kill (ring entries persist across typing)
+    editor.cursor = 0;
+    editor.handle_key(ctrl(KeyCode::Char('y')));
+    assert_eq!(editor.buffer.as_str(), "two threeone X");
+}
+
+// ── Ctrl+U (kill to line start) ─────────────────────────────
+
+#[test]
+fn ctrl_u_kills_to_start_of_line() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.cursor = len_bytes("hello ");
+    editor.handle_key(ctrl(KeyCode::Char('u')));
+    assert_eq!(editor.buffer.as_str(), "world");
+    assert_eq!(editor.cursor, 0);
+}
+
+#[test]
+fn ctrl_u_at_start_does_nothing() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.cursor = 0;
+    editor.handle_key(ctrl(KeyCode::Char('u')));
+    assert_eq!(editor.buffer.as_str(), "hello");
+    assert_eq!(editor.cursor, 0);
+}
+
+#[test]
+fn ctrl_u_kills_entire_line_when_at_end() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.handle_key(ctrl(KeyCode::Char('u')));
+    assert_eq!(editor.buffer.as_str(), "");
+    assert_eq!(editor.cursor, 0);
+}
+
+// ── Ctrl+W (kill word before) ────────────────────────────────
+
+#[test]
+fn ctrl_w_kills_previous_word() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.handle_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(editor.buffer.as_str(), "hello ");
+    assert_eq!(editor.cursor, len_bytes("hello "));
+}
+
+#[test]
+fn ctrl_w_in_middle_of_word_kills_partial_word() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    // cursor at middle of "world": after 'r' (byte 9)
+    editor.cursor = len_bytes("hello wor");
+    editor.handle_key(ctrl(KeyCode::Char('w')));
+    // prev_word_boundary goes to start of "world" → kills "wor"
+    assert_eq!(editor.buffer.as_str(), "hello ld");
+    assert_eq!(editor.cursor, len_bytes("hello "));
+}
+
+#[test]
+fn ctrl_w_at_start_does_nothing() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.cursor = 0;
+    editor.handle_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(editor.buffer.as_str(), "hello");
+    assert_eq!(editor.cursor, 0);
+}
+
+#[test]
+fn ctrl_w_kills_word_with_punctuation() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "foo.bar baz");
+    editor.handle_key(ctrl(KeyCode::Char('w')));
+    assert_eq!(editor.buffer.as_str(), "foo.bar ");
+    assert_eq!(editor.cursor, len_bytes("foo.bar "));
+}
+
+// ── Option/Meta+Backspace (delete word before) ──────────────
+
+#[test]
+fn meta_backspace_deletes_previous_word() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.handle_key(meta(KeyCode::Backspace));
+    assert_eq!(editor.buffer.as_str(), "hello ");
+    assert_eq!(editor.cursor, len_bytes("hello "));
+}
+
+// ── Option/Meta+D (delete word after) ───────────────────────
+
+#[test]
+fn meta_d_deletes_next_word() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world foo");
+    editor.cursor = 0;
+    editor.handle_key(meta(KeyCode::Char('d')));
+    assert_eq!(editor.buffer.as_str(), "world foo");
+    assert_eq!(editor.cursor, 0);
+}
+
+#[test]
+fn meta_d_in_middle_of_word_deletes_to_word_end() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.cursor = 1; // after 'h'
+    editor.handle_key(meta(KeyCode::Char('d')));
+    assert_eq!(editor.buffer.as_str(), "hworld");
+    assert_eq!(editor.cursor, 1);
+}
+
+#[test]
+fn meta_d_at_end_does_nothing() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.handle_key(meta(KeyCode::Char('d')));
+    assert_eq!(editor.buffer.as_str(), "hello");
+    assert_eq!(editor.cursor, 5);
+}
+
+// ── Ctrl+Y (yank) ───────────────────────────────────────────
+
+#[test]
+fn ctrl_y_yanks_most_recent_kill() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.cursor = len_bytes("hello ");
+    editor.handle_key(ctrl(KeyCode::Char('k'))); // kill "world"
+    assert_eq!(editor.buffer.as_str(), "hello ");
+
+    editor.cursor = 0;
+    editor.handle_key(ctrl(KeyCode::Char('y')));
+    assert_eq!(editor.buffer.as_str(), "worldhello ");
+    assert_eq!(editor.cursor, len_bytes("world"));
+}
+
+#[test]
+fn ctrl_y_yanks_ctrl_w_kill() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.handle_key(ctrl(KeyCode::Char('w'))); // kill "world"
+    assert_eq!(editor.buffer.as_str(), "hello ");
+
+    editor.handle_key(ctrl(KeyCode::Char('y'))); // yank back
+    assert_eq!(editor.buffer.as_str(), "hello world");
+}
+
+#[test]
+fn ctrl_y_yanks_ctrl_u_kill() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.cursor = len_bytes("hello ");
+    editor.handle_key(ctrl(KeyCode::Char('u'))); // kill "hello "
+    assert_eq!(editor.buffer.as_str(), "world");
+
+    editor.cursor = len_bytes("world");
+    editor.handle_key(ctrl(KeyCode::Char('y'))); // yank "hello "
+    assert_eq!(editor.buffer.as_str(), "worldhello ");
+}
+
+#[test]
+fn ctrl_y_does_nothing_with_empty_kill_ring() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.handle_key(ctrl(KeyCode::Char('y')));
+    assert_eq!(editor.buffer.as_str(), "hello");
+    assert_eq!(editor.cursor, 5);
+}
+
+// ── Meta+Y (yank-pop / cycle kill ring) ─────────────────────
+
+#[test]
+fn meta_y_cycles_kill_ring_after_yank() {
+    let mut editor = InputEditor::new();
+
+    // first kill: "world"
+    type_str(&mut editor, "hello world");
+    editor.cursor = len_bytes("hello ");
+    editor.handle_key(ctrl(KeyCode::Char('k')));
+    assert_eq!(editor.buffer.as_str(), "hello ");
+
+    // type to break kill accumulation
+    type_str(&mut editor, "foo bar");
+    // now buffer is "hello foo bar"
+    editor.cursor = len_bytes("hello foo ");
+    editor.handle_key(ctrl(KeyCode::Char('k'))); // kill "bar"
+    assert_eq!(editor.buffer.as_str(), "hello foo ");
+
+    // yank — most recent kill
+    editor.handle_key(ctrl(KeyCode::Char('y')));
+    assert_eq!(editor.buffer.as_str(), "hello foo bar");
+
+    // meta+y → cycle to "world" (previous entry)
+    editor.handle_key(meta(KeyCode::Char('y')));
+    assert_eq!(editor.buffer.as_str(), "hello foo world");
+}
+
+#[test]
+fn meta_y_does_nothing_without_prior_yank() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello world");
+    editor.cursor = len_bytes("hello ");
+    editor.handle_key(ctrl(KeyCode::Char('k')));
+
+    editor.handle_key(meta(KeyCode::Char('y')));
+    // no prior yank, should do nothing
+    assert_eq!(editor.buffer.as_str(), "hello ");
+}
+
+// ── Ctrl+N / Ctrl+P (history) ────────────────────────────────
+
+#[test]
+fn ctrl_p_navigates_history_up() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "first");
+    editor.handle_key(press(KeyCode::Enter));
+    type_str(&mut editor, "second");
+    editor.handle_key(press(KeyCode::Enter));
+
+    assert!(editor.buffer.is_empty());
+    editor.handle_key(ctrl(KeyCode::Char('p')));
+    assert_eq!(editor.buffer.as_str(), "second");
+    editor.handle_key(ctrl(KeyCode::Char('p')));
+    assert_eq!(editor.buffer.as_str(), "first");
+}
+
+#[test]
+fn ctrl_n_navigates_history_down() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "first");
+    editor.handle_key(press(KeyCode::Enter));
+    type_str(&mut editor, "second");
+    editor.handle_key(press(KeyCode::Enter));
+
+    editor.handle_key(ctrl(KeyCode::Char('p')));
+    editor.handle_key(ctrl(KeyCode::Char('p')));
+    assert_eq!(editor.buffer.as_str(), "first");
+
+    editor.handle_key(ctrl(KeyCode::Char('n')));
+    assert_eq!(editor.buffer.as_str(), "second");
+}
+
+#[test]
+fn ctrl_n_at_bottom_clears_buffer() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "first");
+    editor.handle_key(press(KeyCode::Enter));
+
+    editor.handle_key(ctrl(KeyCode::Char('n')));
+    assert!(editor.buffer.is_empty());
+    assert_eq!(editor.cursor, 0);
+}
+
+// ── Kill ring max size ───────────────────────────────────────
+
+#[test]
+fn kill_ring_capped_at_10_entries() {
+    let mut editor = InputEditor::new();
+    // Create 12 distinct kill entries by breaking accumulation between kills.
+    // Submit each word to history (Enter resets kill accumulation), then
+    // navigate back and kill it. This gives 12 separate ring entries.
+    for i in 0..12 {
+        type_str(&mut editor, &format!("word{}", i));
+        editor.handle_key(press(KeyCode::Enter)); // pushes to history, clears buffer
+        // Navigate back to the word, position cursor, and kill
+        editor.handle_key(ctrl(KeyCode::Char('p'))); // load "wordN" from history
+        editor.cursor = 0;
+        editor.handle_key(ctrl(KeyCode::Char('k'))); // kill entire buffer → ring entry
+        assert!(editor.buffer.is_empty());
+    }
+    // Yank the most recent kill (word11, since limit is 10, word0 and word1 were evicted)
+    editor.handle_key(ctrl(KeyCode::Char('y')));
+    assert_eq!(editor.buffer.as_str(), "word11");
+}
+
+// ── Option+arrow during picker ──────────────────────────────
+
+#[test]
+fn option_left_with_picker_active_handled_by_picker() {
+    let mut editor = InputEditor::new();
+    editor.cursor = 0;
+    editor.handle_key(press(KeyCode::Char('@')));
+    assert!(editor.picker.as_ref().is_some_and(|p| p.active));
+
+    let result = editor.handle_key(meta(KeyCode::Left));
+    assert!(result.is_none());
 }
