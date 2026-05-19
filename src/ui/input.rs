@@ -115,6 +115,30 @@ fn next_word_boundary(s: &str, cursor: usize) -> usize {
     idx
 }
 
+fn cursor_line_start(s: &str, cursor: usize) -> usize {
+    if cursor == 0 {
+        return 0;
+    }
+    let haystack = &s[..cursor];
+    match haystack.rfind('\n') {
+        Some(pos) => pos + 1,
+        None => 0,
+    }
+}
+
+fn prev_line_start(s: &str, cursor: usize) -> Option<usize> {
+    let line_start = cursor_line_start(s, cursor);
+    if line_start == 0 {
+        return None;
+    }
+    Some(cursor_line_start(s, line_start.saturating_sub(1)))
+}
+
+fn next_line_start(s: &str, cursor: usize) -> Option<usize> {
+    let after = &s[cursor..];
+    after.find('\n').map(|p| cursor + p + 1)
+}
+
 pub struct InputEditor {
     pub buffer: CompactString,
     pub cursor: usize,
@@ -292,12 +316,21 @@ impl InputEditor {
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<CompactString> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
         match key.code {
             KeyCode::Enter => {
                 if self.picker.as_ref().is_some_and(|p| p.active) {
                     return None;
                 }
+                // Meta+Enter or Shift+Enter inserts newline
+                if has_shift || alt {
+                    self.buffer.insert(self.cursor, '\n');
+                    self.cursor += 1;
+                    self.history_pos = None;
+                    return None;
+                }
+                // Plain Enter → submit
                 let text = self.buffer.clone();
                 if !text.is_empty() {
                     self.history.push(text.clone());
@@ -560,14 +593,48 @@ impl InputEditor {
             }
 
             KeyCode::Up => {
-                self.history_up();
                 self.reset_kill_accumulation();
+                // If already navigating history, continue.
+                if self.history_pos.is_some() {
+                    self.history_up();
+                    return None;
+                }
+                // Try moving up within the multiline buffer first.
+                if let Some(pos) = prev_line_start(&self.buffer, self.cursor) {
+                    let line_start = cursor_line_start(&self.buffer, self.cursor);
+                    let col = self.cursor - line_start;
+                    let target_line_end = self.buffer[pos..]
+                        .find('\n')
+                        .map(|p| pos + p)
+                        .unwrap_or(self.buffer.len());
+                    self.cursor = (pos + col).min(target_line_end);
+                    return None;
+                }
+                // At top of buffer → fall through to history.
+                self.history_up();
                 None
             }
 
             KeyCode::Down => {
-                self.history_down();
                 self.reset_kill_accumulation();
+                // If already navigating history, continue.
+                if self.history_pos.is_some() {
+                    self.history_down();
+                    return None;
+                }
+                // Try moving down within the multiline buffer first.
+                if let Some(pos) = next_line_start(&self.buffer, self.cursor) {
+                    let line_start = cursor_line_start(&self.buffer, self.cursor);
+                    let col = self.cursor - line_start;
+                    let target_line_end = self.buffer[pos..]
+                        .find('\n')
+                        .map(|p| pos + p)
+                        .unwrap_or(self.buffer.len());
+                    self.cursor = (pos + col).min(target_line_end);
+                    return None;
+                }
+                // At bottom of buffer → fall through to history.
+                self.history_down();
                 None
             }
 
@@ -675,5 +742,24 @@ mod tests {
         // "hå bør": 8 bytes. h(0) å(1-2=3) sp(3) b(4) ø(5-6=7) r(7→8)
         assert_eq!(next_word_boundary("hå bør", 0), 4); // skip "hå ", land at "b" (byte 4)
         assert_eq!(next_word_boundary("hå bør", 4), 8); // skip "bør", land at end
+    }
+
+    #[test]
+    fn test_cursor_line_start() {
+        assert_eq!(cursor_line_start("hello\nworld", 10), 6);
+        assert_eq!(cursor_line_start("hello\nworld", 3), 0);
+        assert_eq!(cursor_line_start("single", 6), 0);
+    }
+
+    #[test]
+    fn test_prev_line_start() {
+        assert_eq!(prev_line_start("hello\nworld", 10), Some(0));
+        assert_eq!(prev_line_start("hello\nworld", 3), None);
+    }
+
+    #[test]
+    fn test_next_line_start() {
+        assert_eq!(next_line_start("hello\nworld", 0), Some(6));
+        assert_eq!(next_line_start("hello\nworld", 10), None);
     }
 }

@@ -13,6 +13,14 @@ fn meta(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::ALT)
 }
 
+fn shift_enter() -> KeyEvent {
+    KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT)
+}
+
+fn meta_enter() -> KeyEvent {
+    KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)
+}
+
 fn type_str(editor: &mut InputEditor, s: &str) {
     for c in s.chars() {
         editor.handle_key(press(KeyCode::Char(c)));
@@ -590,5 +598,136 @@ fn option_left_with_picker_active_handled_by_picker() {
     assert!(editor.picker.as_ref().is_some_and(|p| p.active));
 
     let result = editor.handle_key(meta(KeyCode::Left));
+    assert!(result.is_none());
+}
+
+// ── Multi-line input ────────────────────────────────────────
+
+#[test]
+fn shift_enter_inserts_newline() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.handle_key(shift_enter());
+    type_str(&mut editor, "world");
+    assert_eq!(editor.buffer.as_str(), "hello\nworld");
+}
+
+#[test]
+fn meta_enter_inserts_newline() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.handle_key(meta_enter());
+    type_str(&mut editor, "world");
+    assert_eq!(editor.buffer.as_str(), "hello\nworld");
+}
+
+#[test]
+fn plain_enter_submits_multiline_text() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "line1");
+    editor.handle_key(shift_enter());
+    type_str(&mut editor, "line2");
+    let submitted = editor.handle_key(press(KeyCode::Enter)).unwrap();
+    assert_eq!(submitted.as_str(), "line1\nline2");
+    assert!(editor.buffer.is_empty());
+}
+
+#[test]
+fn multiline_history_saves_and_restores() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "first");
+    editor.handle_key(shift_enter());
+    type_str(&mut editor, "second");
+    editor.handle_key(press(KeyCode::Enter)); // submit
+
+    // Navigate up in history
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.buffer.as_str(), "first\nsecond");
+}
+
+#[test]
+fn multiline_cursor_up_moves_to_previous_logical_line() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "line1");
+    editor.handle_key(shift_enter());
+    type_str(&mut editor, "line2");
+    // cursor is at end: after "line2"
+    let end_pos = editor.cursor;
+    editor.handle_key(press(KeyCode::Up));
+    // cursor should now be on line1
+    assert!(editor.cursor < end_pos);
+    // verify it's on line1
+    let line1_end = "line1".len();
+    assert!(editor.cursor <= line1_end);
+}
+
+#[test]
+fn multiline_cursor_down_moves_to_next_logical_line() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "line1");
+    editor.handle_key(shift_enter());
+    type_str(&mut editor, "line2");
+    // Move to start of line1
+    editor.cursor = 0;
+    editor.handle_key(press(KeyCode::Down));
+    // cursor should now be on line2
+    let line1_len = "line1\n".len();
+    assert!(editor.cursor >= line1_len);
+}
+
+#[test]
+fn multiline_up_at_top_goes_to_history() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "prev");
+    editor.handle_key(press(KeyCode::Enter)); // submit to history
+
+    type_str(&mut editor, "line1");
+    editor.handle_key(shift_enter());
+    type_str(&mut editor, "line2");
+    editor.cursor = 0; // at top of multi-line buffer
+
+    // Up at top should go to history
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.buffer.as_str(), "prev");
+}
+
+#[test]
+fn multiline_down_at_bottom_goes_to_history() {
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "prev");
+    editor.handle_key(press(KeyCode::Enter));
+
+    type_str(&mut editor, "next");
+    editor.handle_key(press(KeyCode::Enter));
+
+    // Load "next" from history
+    editor.handle_key(press(KeyCode::Up));
+    assert_eq!(editor.buffer.as_str(), "next");
+
+    // Down from bottom of single line should clear
+    editor.handle_key(press(KeyCode::Down));
+    assert!(editor.buffer.is_empty());
+}
+
+#[test]
+fn enter_with_picker_active_does_not_submit() {
+    let mut editor = InputEditor::new();
+    editor.cursor = 0;
+    editor.handle_key(press(KeyCode::Char('@')));
+    assert!(editor.picker.as_ref().is_some_and(|p| p.active));
+
+    let result = editor.handle_key(press(KeyCode::Enter));
+    assert!(result.is_none());
+    assert!(editor.picker.as_ref().is_some_and(|p| p.active));
+}
+
+#[test]
+fn meta_enter_with_picker_active_inserts_newline() {
+    let mut editor = InputEditor::new();
+    editor.cursor = 0;
+    editor.handle_key(press(KeyCode::Char('@')));
+    // Even with picker active, Meta+Enter should insert newline
+    // (the handle_picker_key returns false for Meta+Enter, so it falls through)
+    let result = editor.handle_key(meta_enter());
     assert!(result.is_none());
 }

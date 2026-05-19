@@ -127,8 +127,9 @@ dirge --provider glm       # defaults to glm-4
 | Meta+D | Delete word after cursor |
 | Ctrl+Y | Yank (paste) last kill |
 | Meta+Y | Yank-pop (cycle kill ring after yank) |
-| Ctrl+N / Down | History next |
-| Ctrl+P / Up | History previous |
+| Ctrl+N / Down | History next (multi-line: next logical line, history at boundary) |
+| Ctrl+P / Up | History previous (multi-line: previous logical line, history at boundary) |
+| Shift+Enter / Meta+Enter | Insert newline (multi-line input) |
 | Tab | Insert 2 spaces |
 | `@<query>` | File picker (Tab/Enter select, Esc cancel) |
 

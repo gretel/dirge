@@ -456,8 +456,8 @@ impl Renderer {
 
     pub fn draw_bottom(
         &mut self,
-        input_line: &str,
-        cursor_pos: usize,
+        full_input: &str,
+        full_cursor: usize,
         status: &str,
         is_running: bool,
     ) -> io::Result<()> {
@@ -473,6 +473,25 @@ impl Renderer {
             "> "
         };
 
+        // Extract the current logical line for display
+        let line_start = full_input[..full_cursor]
+            .rfind('\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let line_end = full_input[full_cursor..]
+            .find('\n')
+            .map(|p| full_cursor + p)
+            .unwrap_or(full_input.len());
+        let visible_line = &full_input[line_start..line_end];
+        let col_in_line = full_cursor - line_start;
+
+        // Count lines for status display
+        let line_count = if full_input.is_empty() {
+            1
+        } else {
+            full_input.chars().filter(|&c| c == '\n').count() + 1
+        };
+
         stdout.execute(MoveTo(0, input_row))?;
         write!(stdout, "{}", " ".repeat(cols as usize))?;
         stdout.execute(MoveTo(0, input_row))?;
@@ -480,17 +499,17 @@ impl Renderer {
         write!(stdout, "{}", prompt)?;
         write!(stdout, "{}", ResetColor)?;
         let visible_width = cols.saturating_sub(2) as usize;
-        let input_len = input_line.len();
+        let input_len = visible_line.len();
 
-        if cursor_pos < self.input_scroll_offset {
-            self.input_scroll_offset = cursor_pos;
-        } else if cursor_pos >= self.input_scroll_offset + visible_width {
-            self.input_scroll_offset = cursor_pos - visible_width + 1;
+        if col_in_line < self.input_scroll_offset {
+            self.input_scroll_offset = col_in_line;
+        } else if col_in_line >= self.input_scroll_offset + visible_width {
+            self.input_scroll_offset = col_in_line - visible_width + 1;
         }
         let max_scroll = input_len.saturating_sub(visible_width);
         self.input_scroll_offset = self.input_scroll_offset.min(max_scroll);
 
-        let visible: String = input_line
+        let visible: String = visible_line
             .chars()
             .skip(self.input_scroll_offset)
             .take(visible_width)
@@ -505,16 +524,19 @@ impl Renderer {
             "{}",
             SetForegroundColor(self.color(Color::DarkGrey))
         )?;
-        let status_display = if self.scroll_offset > 0 {
+        let mut status_display = if self.scroll_offset > 0 {
             format!("-- SCROLL -- {}", status)
         } else {
             status.to_string()
         };
+        if line_count > 1 {
+            status_display.push_str(&format!(" [{} lines]", line_count));
+        }
         let truncated: String = status_display.chars().take(cols as usize).collect();
         write!(stdout, "{}", truncated)?;
         write!(stdout, "{}", ResetColor)?;
 
-        let cursor_x = (2 + cursor_pos.saturating_sub(self.input_scroll_offset)) as u16;
+        let cursor_x = (2 + col_in_line.saturating_sub(self.input_scroll_offset)) as u16;
         stdout.execute(MoveTo(cursor_x, input_row))?;
         stdout.flush()?;
         Ok(())
