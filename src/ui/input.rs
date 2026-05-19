@@ -607,6 +607,20 @@ impl InputEditor {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
+        // Ctrl+J is a portable newline trigger — many terminals never send
+        // Shift+Enter as a distinct keystroke, but Ctrl+J always arrives.
+        // Handled here before the Enter arm so it works even when the
+        // terminal collapses Ctrl+J onto KeyCode::Enter.
+        if ctrl && matches!(key.code, KeyCode::Char('j')) {
+            if !self.picker.as_ref().is_some_and(|p| p.active) {
+                self.buffer.insert(self.cursor, '\n');
+                self.cursor += 1;
+                self.history_pos = None;
+                self.reset_kill_accumulation();
+            }
+            return None;
+        }
+
         match key.code {
             KeyCode::Enter => {
                 if self.picker.as_ref().is_some_and(|p| p.active) {

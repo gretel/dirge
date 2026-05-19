@@ -888,3 +888,28 @@ fn paste_during_picker_is_ignored() {
     editor.handle_paste("a\nb\nc\nd");
     assert_eq!(editor.buffer.as_str(), buffer_before);
 }
+
+fn ctrl_j() -> KeyEvent {
+    KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL)
+}
+
+#[test]
+fn ctrl_j_inserts_newline_as_fallback() {
+    // Terminals that don't deliver Shift+Enter as a distinct event always
+    // deliver Ctrl+J. It must insert a newline, never submit.
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "hello");
+    editor.handle_key(ctrl_j());
+    type_str(&mut editor, "world");
+    assert_eq!(editor.buffer.as_str(), "hello\nworld");
+}
+
+#[test]
+fn ctrl_j_during_picker_is_noop() {
+    let mut editor = InputEditor::new();
+    editor.handle_key(press(KeyCode::Char('@')));
+    let buf_before = editor.buffer.to_string();
+    let result = editor.handle_key(ctrl_j());
+    assert!(result.is_none());
+    assert_eq!(editor.buffer.as_str(), buf_before);
+}
