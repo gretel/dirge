@@ -5,7 +5,7 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 ## Features
 
 - **Multi-provider**: OpenRouter, OpenAI, Anthropic, Gemini, DeepSeek, GLM, Ollama, plus custom providers
-- **Standard tools**: read, write, edit, bash, grep, find_files, list_dir, write_todo_list
+- **Standard tools**: read, write, edit, bash, grep, find_files, glob, list_dir, write_todo_list, apply_patch
 - **Line-numbered read output**: `read` tool prefixes each line with right-aligned line numbers (`123: content`)
 - **Environment-aware**: system prompt includes OS, shell, working directory, and git branch for context
 - **Semantic code tools** (tree-sitter): list_symbols, get_symbol_body, find_definition, find_callers, find_callees — supports TypeScript/TSX and Python
@@ -36,7 +36,7 @@ _dirge_ is one of the smallest and most performant coding agents on the market.
 
 ### Tool result caching
 
-Read-only tool calls (`read`, `grep`, `find_files`, `list_dir`) are cached per agent turn. Repeated calls with identical arguments within the same turn return cached results, avoiding redundant filesystem I/O. The cache clears automatically before each new prompt, and after `write`/`edit`/`bash` so a re-read sees fresh content.
+Most tool calls (`read`, `write`, `edit`, `bash`, `grep`, `find_files`, `list_dir`) are cached per agent turn. Repeated calls with identical arguments within the same turn return cached results, avoiding redundant filesystem I/O. The cache clears automatically before each new prompt, and after `write`/`edit`/`bash` so a re-read sees fresh content.
 
 ### Error recovery
 
@@ -107,11 +107,16 @@ dirge --provider glm       # defaults to glm-4
 | `/mode [mode]` | Set security mode (`standard`, `restrictive`, `accept`, `yolo`) |
 | `/reasoning` | Toggle reasoning visibility |
 | `/btw <question>` | Ask a quick question (no tools, doesn't affect session) |
-| `/session` | List/save/load sessions |
+| `/sessions` | List/save/load sessions |
 | `/loop [prompt]` | Start iterative coding loop |
 | `/worktree <name>` | Create a git worktree on branch |
 | `/wt-merge [branch]` | Merge worktree branch |
 | `/wt-exit` | Exit worktree |
+| `/toggle` | Toggle features on/off (currently todo tools) |
+| `/regen-prompts` | Restore built-in prompts |
+| `/mcp` | List MCP servers and tools |
+| `/quit` | Exit dirge |
+| `/retry` | Retry last prompt |
 | `/help` | Show all commands |
 
 ### Key bindings
@@ -179,10 +184,11 @@ Built-in prompts that change the agent's behavior and tone:
 | **`review-security`** | Security review mode — finds exploitable vulnerabilities |
 | **`simplify`** | Code simplification mode — refines for clarity without changing behavior |
 | **`write-prompt`** | Prompt writing mode — creates and optimizes agent prompts |
+| **`default`** | Default system prompt — the base built-in prompt |
 
 Custom prompts can be placed in `$XDG_CONFIG_HOME/dirge/prompts/` as `.md` files.
 
-The agent automatically loads `AGENTS.md` or `CLAUDE.md` from the project root or ancestor directories. Use `-n` / `--no-context-files` to disable.
+The agent automatically loads `AGENTS.md` or `CLAUDE.md` from the project root, ancestor directories, and `~/.config/dirge/agent/AGENTS.md` as a global fallback. Use `-n` / `--no-context-files` to disable.
 
 ## Claude-compatible skills
 

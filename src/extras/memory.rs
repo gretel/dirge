@@ -1,11 +1,14 @@
 use std::path::{Path, PathBuf};
 
+fn home_dir() -> PathBuf {
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+}
+
 pub fn memory_dir(cwd: &Path) -> PathBuf {
     let project_id = project_id(cwd);
-    let base = dirs::data_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("dirge")
-        .join("memories");
+    let base = home_dir().join(".dirge").join("memories");
     base.join(project_id)
 }
 

@@ -3,13 +3,13 @@
 dirge reads an optional JSON config file named `config.json` from its config
 folder:
 
-- If `ZS_CONFIG_DIR` is set: `$ZS_CONFIG_DIR/config.json`
+- If `DIRGE_CONFIG_DIR` is set: `$DIRGE_CONFIG_DIR/config.json`
 - Otherwise: the platform config directory joined with `dirge/config.json`
   (for example `$XDG_CONFIG_HOME/dirge/config.json` on Linux)
 - Fallback: `$HOME/.config/dirge/config.json`
 
 All config keys are optional. CLI flags and their environment-backed values
-(such as `ZS_PROVIDER` and `ZS_MODEL`) take precedence where both exist.
+(such as `DIRGE_PROVIDER` and `DIRGE_MODEL`) take precedence where both exist.
 
 Example:
 
@@ -59,7 +59,7 @@ Accepted top-level keys:
 
 | Key                       | Type    | Description                                                                                                                                                                 |
 | ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `provider`                | string  | Provider name. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, and `ollama`; custom provider aliases are also accepted. Default: `openrouter`.        |
+| `provider`                | string  | Provider name. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, and `ollama`; custom provider aliases are also accepted. Default: `openrouter`.        |
 | `model`                   | string  | Model name. Default: `deepseek/deepseek-v4-flash`.                                                                                                                          |
 | `max_tokens`              | integer | Maximum response tokens. Default: `8192`.                                                                                                                                   |
 | `max_agent_turns`         | integer | Maximum agent turns per response. Default: `100`.                                                                                                                           |
