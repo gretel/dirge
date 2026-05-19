@@ -982,9 +982,15 @@ pub async fn run_interactive(
                                 last_tool_name.as_deref() == Some("edit") && show_diff;
 
                             if is_edit {
-                                // Colorized diff rendering
+                                // Colorized diff rendering. The edit tool emits
+                                // its diff block starting with "--- a/<path>" —
+                                // match that exact sentinel to avoid false
+                                // positives on stray "--- " prefixes elsewhere
+                                // in the output.
                                 let lines: Vec<&str> = output.lines().collect();
-                                let diff_start = lines.iter().position(|l| l.starts_with("--- "));
+                                let diff_start = lines
+                                    .iter()
+                                    .position(|l| l.starts_with("--- a/"));
                                 if let Some(pre) = diff_start {
                                     // Show non-diff prefix
                                     for l in &lines[..pre] {
@@ -1022,9 +1028,13 @@ pub async fn run_interactive(
                                 render_tool_output(&mut renderer, &output, max_chars)?;
                             }
                         }
+                        // Clear after consuming so a future stray ToolResult
+                        // can't be coloured with a stale tool name.
+                        last_tool_name = None;
                     }
                     AgentEvent::Done { response, tokens, cost } => {
                         was_reasoning = false;
+                        last_tool_name = None;
 
                         #[allow(unused_mut, unused_variables)]
                         let mut plugin_followup: Option<String> = None;
@@ -1221,6 +1231,7 @@ pub async fn run_interactive(
                     }
                     AgentEvent::Error(e) => {
                         was_reasoning = false;
+                        last_tool_name = None;
                         let safe = sanitize_output(&e);
                         renderer.write_line(&format!("error: {}", safe), C_ERROR)?;
 
