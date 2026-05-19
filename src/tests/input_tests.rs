@@ -25,7 +25,6 @@ fn len_bytes(s: &str) -> usize {
 
 // ── existing tests ──────────────────────────────────────────
 
-
 #[test]
 fn typing_multibyte_chars_does_not_panic() {
     let mut editor = InputEditor::new();

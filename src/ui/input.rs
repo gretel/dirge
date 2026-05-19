@@ -423,8 +423,7 @@ impl InputEditor {
                         let next = (state.index + 1) % self.kill_ring.len();
                         if let Some(text) = self.kill_ring.get(next) {
                             let text = text.clone();
-                            self.buffer
-                                .replace_range(state.cursor..range_end, "");
+                            self.buffer.replace_range(state.cursor..range_end, "");
                             self.buffer.insert_str(state.cursor, &text);
                             self.cursor = state.cursor + text.len();
                             self.yank_state = Some(YankState {
