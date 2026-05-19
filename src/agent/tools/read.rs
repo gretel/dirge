@@ -55,10 +55,13 @@ impl Tool for ReadTool {
         let limit = args.limit.unwrap_or(2000);
         let end = (offset + limit).min(total_lines);
 
+        let width = (total_lines.to_string().len()).max(1);
         let excerpt: String = content
             .lines()
             .skip(offset)
             .take(end - offset)
+            .enumerate()
+            .map(|(i, line)| format!("{:>width$}: {}", offset + i + 1, line))
             .collect::<Vec<_>>()
             .join("\n");
         let info = format!(
@@ -70,5 +73,28 @@ impl Tool for ReadTool {
             excerpt
         );
         Ok(info)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Verifies the line-numbering format used in read output.
+    /// The model sees this format and must strip "NNN: " prefixes when passing text to edit.
+    #[test]
+    fn test_line_number_format() {
+        let content = "line one\nline two\nline three\n";
+        let total_lines = content.lines().count();
+        let excerpt: String = content
+            .lines()
+            .take(3)
+            .enumerate()
+            .map(|(i, line)| {
+                let width = (total_lines.to_string().len()).max(1);
+                format!("{:>width$}: {}", i + 1, line)
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(excerpt, "1: line one\n2: line two\n3: line three");
     }
 }

@@ -11,7 +11,7 @@ Formatting rules:
 - For file contents show the path and relevant lines
 
 Available tools:
-- read: Read file contents (supports offset/limit for large files, max 10MB)
+- read: Read file contents (supports offset/limit for large files, max 10MB). Lines are prefixed with right-aligned numbers for reference (e.g. \"   1: content\"). When passing text from read to edit, strip the \"NNN: \" prefix — use only the actual file content.
 - write: Create or overwrite files (creates parent dirs automatically)
 - edit: Edit files by exact text match. If old_text appears multiple times, shows all match locations with line numbers. Use replaceAll: true for bulk replace. Handles both LF and CRLF. Shows unified diff.
 - bash: Execute bash commands (supports timeout param)
