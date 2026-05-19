@@ -118,6 +118,7 @@ dirge --provider glm       # defaults to glm-4
 | `!! cmd` | Run shell command (invisible) |
 | `@<query>` | File picker (Tab/Enter select, Esc cancel) |
 | Mouse drag | Select text (copies to clipboard on release) |
+| (input) | Live token count shown next to input bar (`N tk`) |
 
 ## Prompts system
 
