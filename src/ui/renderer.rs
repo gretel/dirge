@@ -516,7 +516,7 @@ impl Renderer {
             .collect();
         write!(stdout, "{}", visible)?;
 
-        let token_est = input_line.len() as u64 / 4;
+        let token_est = full_input.len() as u64 / 4;
         if token_est > 0 {
             write!(
                 stdout,
