@@ -71,6 +71,37 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         preamble.push_str(&format!("\n\nCurrent working directory: {}", cwd_str));
     }
 
+    preamble.push_str(&format!("\nOS: {}", std::env::consts::OS));
+
+    if let Ok(shell) = std::env::var("SHELL") {
+        preamble.push_str(&format!("\nShell: {}", shell));
+    }
+
+    let git_branch = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .ok()
+            .and_then(|output| {
+                if output.status.success() {
+                    let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                    if !branch.is_empty() {
+                        Some(branch)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+    })
+    .await
+    .unwrap_or(None);
+
+    if let Some(branch) = git_branch {
+        preamble.push_str(&format!("\nGit branch: {}", branch));
+    }
+
     let mut builder = AgentBuilder::new(model).preamble(&preamble);
 
     let max_tokens = cli.resolve_max_tokens(cfg);
