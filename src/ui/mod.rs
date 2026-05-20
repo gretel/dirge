@@ -1210,49 +1210,18 @@ pub async fn run_interactive(
                         let line = format!("◈ {}", format_tool_call_summary(&name, &args));
                         renderer.write_line(&sanitize_output(&line), C_TOOL)?;
 
-                        #[cfg(feature = "plugin")]
-                        if let Some(pm) = plugin_manager {
-                            // Pass args as a JSON string so the Janet
-                            // parser never has to interpret arbitrary
-                            // JSON tokens (`:`, `,`, `null`).
-                            let args_json = args.to_string();
-                            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Err(e) = mgr.dispatch(
-                                "on-tool-start",
-                                &format!(
-                                    "@{{:tool \"{}\" :args \"{}\"}}",
-                                    crate::plugin::escape_janet_string(&name),
-                                    crate::plugin::escape_janet_string(&args_json),
-                                ),
-                            ) {
-                                renderer.write_line(
-                                    &format!("[plugin] on-tool-start error: {e}"),
-                                    C_ERROR,
-                                )?;
-                            }
-                        }
+                        // Note: on-tool-start fires from HookedToolDyn now,
+                        // around the actual tool invocation. The UI no
+                        // longer dispatches it here — that would double-
+                        // fire the hook per tool call.
                     }
                     AgentEvent::ToolResult { output } => {
                         let show_details = cfg.show_tool_details.unwrap_or(true);
                         let max_chars = cfg.resolve_tool_result_max_chars();
                         let show_diff = cfg.resolve_show_edit_diff();
 
-                        #[cfg(feature = "plugin")]
-                        if let Some(pm) = plugin_manager {
-                            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Err(e) = mgr.dispatch(
-                                "on-tool-end",
-                                &format!(
-                                    "@{{:output \"{}\"}}",
-                                    crate::plugin::escape_janet_string(&output)
-                                ),
-                            ) {
-                                renderer.write_line(
-                                    &format!("[plugin] on-tool-end error: {e}"),
-                                    C_ERROR,
-                                )?;
-                            }
-                        }
+                        // on-tool-end is also fired by HookedToolDyn so the
+                        // host doesn't re-dispatch it here.
 
                         if show_details {
                             let is_edit =

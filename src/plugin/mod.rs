@@ -375,12 +375,162 @@ mod tests {
                 .is_empty()
         );
     }
+
+    // --- Phase 1: tool-hook return-value slots --------------------------
+    //
+    // These all exercise Janet evaluation, so they're gated to the
+    // `plugin` feature. (The pre-existing test module mixes gated and
+    // non-gated tests; new ones gate explicitly.)
+
+    /// `harness/block` sets a string slot the host reads after dispatch.
+    /// Take consumes the value, leaving the slot None for the next call.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_take_pending_block_roundtrips() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        // Initially empty.
+        assert_eq!(mgr.take_pending_block(), None);
+
+        mgr.eval(r#"(harness/block "rm -rf is not allowed")"#)
+            .unwrap();
+        assert_eq!(
+            mgr.take_pending_block(),
+            Some("rm -rf is not allowed".to_string())
+        );
+        // Drained.
+        assert_eq!(mgr.take_pending_block(), None);
+    }
+
+    /// `harness/mutate-input` carries a JSON string the host will use to
+    /// re-deserialize the next tool's args.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_take_pending_mutate_input_roundtrips() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        assert_eq!(mgr.take_pending_mutate_input(), None);
+
+        mgr.eval(r#"(harness/mutate-input "{\"path\":\"/safe\"}")"#)
+            .unwrap();
+        assert_eq!(
+            mgr.take_pending_mutate_input(),
+            Some("{\"path\":\"/safe\"}".to_string())
+        );
+        assert_eq!(mgr.take_pending_mutate_input(), None);
+    }
+
+    /// `harness/replace-result` swaps the next tool's output string.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_take_pending_replace_result_roundtrips() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        assert_eq!(mgr.take_pending_replace_result(), None);
+
+        mgr.eval(r#"(harness/replace-result "filtered output")"#)
+            .unwrap();
+        assert_eq!(
+            mgr.take_pending_replace_result(),
+            Some("filtered output".to_string())
+        );
+        assert_eq!(mgr.take_pending_replace_result(), None);
+    }
+
+    /// `dispatch_tool_hook` resets slots before running so previous-call
+    /// state doesn't leak into the current tool's decision.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_dispatch_tool_hook_clears_slots_before_running() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        // Pre-populate as if a stale hook left junk.
+        mgr.eval(r#"(harness/block "stale") (harness/replace-result "stale")"#)
+            .unwrap();
+
+        // A hook that doesn't touch any slot.
+        mgr.eval(r#"(defn passthrough [ctx] nil)"#).unwrap();
+        mgr.register("on-tool-start", "passthrough");
+
+        let result = mgr
+            .dispatch_tool_hook("on-tool-start", "@{:tool \"x\"}")
+            .unwrap();
+        assert_eq!(result.block, None);
+        assert_eq!(result.mutate_input, None);
+        assert_eq!(result.replace_result, None);
+    }
+
+    /// A hook that calls (harness/block "...") surfaces via the
+    /// combined dispatch_tool_hook result.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_dispatch_tool_hook_captures_block() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn deny [ctx] (harness/block "denied by policy"))"#)
+            .unwrap();
+        mgr.register("on-tool-start", "deny");
+
+        let result = mgr
+            .dispatch_tool_hook("on-tool-start", "@{:tool \"bash\"}")
+            .unwrap();
+        assert_eq!(result.block, Some("denied by policy".to_string()));
+    }
+
+    /// A hook that calls (harness/mutate-input json) is exposed via
+    /// dispatch_tool_hook so the host can re-deserialize args.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_dispatch_tool_hook_captures_mutate_input() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn rewrite [ctx] (harness/mutate-input "{\"command\":\"echo safe\"}"))"#)
+            .unwrap();
+        mgr.register("on-tool-start", "rewrite");
+
+        let result = mgr
+            .dispatch_tool_hook("on-tool-start", "@{:tool \"bash\"}")
+            .unwrap();
+        assert_eq!(
+            result.mutate_input,
+            Some("{\"command\":\"echo safe\"}".to_string())
+        );
+    }
+
+    /// `on-tool-end` hooks can replace the tool's textual output.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_dispatch_tool_hook_captures_replace_result() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn truncate [ctx] (harness/replace-result "[truncated]"))"#)
+            .unwrap();
+        mgr.register("on-tool-end", "truncate");
+
+        let result = mgr
+            .dispatch_tool_hook("on-tool-end", "@{:tool \"read\"}")
+            .unwrap();
+        assert_eq!(result.replace_result, Some("[truncated]".to_string()));
+    }
+
+    /// Block-precedence: when multiple hooks register, any one calling
+    /// `harness/block` wins. Hooks after the blocker still run (we don't
+    /// short-circuit at the Janet level for simplicity) but the block flag
+    /// stays set.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn test_dispatch_tool_hook_block_sticks_across_hooks() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn block-it [ctx] (harness/block "no"))"#)
+            .unwrap();
+        mgr.eval(r#"(defn noop [ctx] nil)"#).unwrap();
+        mgr.register("on-tool-start", "block-it");
+        mgr.register("on-tool-start", "noop");
+
+        let result = mgr.dispatch_tool_hook("on-tool-start", "@{}").unwrap();
+        assert_eq!(result.block, Some("no".to_string()));
+    }
 }
 
 use std::collections::HashMap;
 
 #[cfg(feature = "plugin")]
 use janetrs::client::{Error as JanetError, JanetClient};
+
+pub mod hook;
 
 /// Escape a Rust string so it can be safely embedded inside a Janet
 /// double-quoted string literal. Janet's parser accepts the standard
@@ -448,6 +598,23 @@ pub struct PluginManager {
     client: JanetClient,
 }
 
+// SAFETY: dirge uses `#[tokio::main(flavor = "current_thread")]` so every
+// PluginManager access happens on the same OS thread. Janet's per-thread
+// global state is therefore stable for the lifetime of the process.
+//
+// rig's ToolDyn trait requires Send+Sync on futures returned by `call`,
+// which transitively requires the wrapper around PluginManager to be
+// Sync. Without this impl HookedToolDyn cannot be constructed.
+//
+// If dirge ever switches to `#[tokio::main]` (multi-thread runtime) or
+// otherwise lets tools execute on a different OS thread, this impl
+// becomes unsound — replace it with a dedicated Janet worker thread
+// and a message channel.
+#[cfg(feature = "plugin")]
+unsafe impl Send for PluginManager {}
+#[cfg(feature = "plugin")]
+unsafe impl Sync for PluginManager {}
+
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 impl PluginManager {
     /// Initialize a Janet VM and the harness API. Returns Err if Janet
@@ -464,6 +631,11 @@ impl PluginManager {
                 r#"
                 (var harness-pending nil)
                 (var harness-response nil)
+                # Per-tool-hook slots: cleared by the host at the start of
+                # dispatch_tool_hook so previous-call state doesn't leak.
+                (var harness-block nil)
+                (var harness-mutate-input nil)
+                (var harness-replace-result nil)
 
                 (defn harness/log [msg] (print "[plugin] " msg))
                 (defn harness/get-cwd [] (os/cwd))
@@ -474,6 +646,16 @@ impl PluginManager {
                   (set harness-response resp))
                 (defn harness/has-symbol? [name]
                   (truthy? (get (curenv) (symbol name))))
+
+                # Tool-hook slots. Plugins call these from inside
+                # on-tool-start / on-tool-end. The host reads them via
+                # dispatch_tool_hook on the Rust side.
+                (defn harness/block [reason]
+                  (when (string? reason) (set harness-block reason)))
+                (defn harness/mutate-input [json-str]
+                  (when (string? json-str) (set harness-mutate-input json-str)))
+                (defn harness/replace-result [output]
+                  (when (string? output) (set harness-replace-result output)))
             "#,
             );
 
@@ -607,4 +789,112 @@ impl PluginManager {
     pub fn dispatch(&mut self, _hook: &str, _context_janet: &str) -> Result<Vec<String>, String> {
         Ok(Vec::new())
     }
+
+    /// Read and clear the `harness-block` slot. Returns the reason a plugin
+    /// gave when calling `(harness/block "...")` from inside a tool hook,
+    /// or `None` if no plugin set it.
+    #[cfg(feature = "plugin")]
+    pub fn take_pending_block(&mut self) -> Option<String> {
+        self.take_string_slot("harness-block")
+    }
+
+    #[cfg(not(feature = "plugin"))]
+    pub fn take_pending_block(&mut self) -> Option<String> {
+        None
+    }
+
+    /// Read and clear the `harness-mutate-input` slot. The returned string,
+    /// when present, is a JSON encoding of the new tool args that the host
+    /// should re-deserialize before invoking the tool.
+    #[cfg(feature = "plugin")]
+    pub fn take_pending_mutate_input(&mut self) -> Option<String> {
+        self.take_string_slot("harness-mutate-input")
+    }
+
+    #[cfg(not(feature = "plugin"))]
+    pub fn take_pending_mutate_input(&mut self) -> Option<String> {
+        None
+    }
+
+    /// Read and clear the `harness-replace-result` slot. The returned
+    /// string, when present, is the tool output the LLM should see instead
+    /// of the real one.
+    #[cfg(feature = "plugin")]
+    pub fn take_pending_replace_result(&mut self) -> Option<String> {
+        self.take_string_slot("harness-replace-result")
+    }
+
+    #[cfg(not(feature = "plugin"))]
+    pub fn take_pending_replace_result(&mut self) -> Option<String> {
+        None
+    }
+
+    /// Shared body of the three `take_pending_*` functions: probe the type
+    /// to disambiguate Janet's nil from a string with the characters "nil",
+    /// fetch the value if it's a string, then clear the slot.
+    #[cfg(feature = "plugin")]
+    fn take_string_slot(&mut self, var: &str) -> Option<String> {
+        let is_string = self
+            .client
+            .run(format!("(if (string? {var}) true false)"))
+            .map(|v| v.to_string() == "true")
+            .unwrap_or(false);
+        if !is_string {
+            return None;
+        }
+        let val = self.client.run(var).ok()?;
+        let _ = self.client.run(format!("(set {var} nil)"));
+        Some(val.to_string())
+    }
+
+    /// Specialized dispatcher for tool-hook events (`on-tool-start`,
+    /// `on-tool-end`). Clears all tool-hook slots first so previous-call
+    /// state doesn't leak, runs every registered hook, then collects the
+    /// slot values into a structured result.
+    #[cfg(feature = "plugin")]
+    pub fn dispatch_tool_hook(
+        &mut self,
+        hook: &str,
+        context_janet: &str,
+    ) -> Result<ToolHookResult, String> {
+        // Pre-clear so a stale (harness/block ...) left by an unrelated
+        // hook can't cause us to mis-block this tool.
+        let _ = self
+            .client
+            .run("(set harness-block nil) (set harness-mutate-input nil) (set harness-replace-result nil)");
+
+        let _ = self.dispatch(hook, context_janet)?;
+
+        Ok(ToolHookResult {
+            block: self.take_pending_block(),
+            mutate_input: self.take_pending_mutate_input(),
+            replace_result: self.take_pending_replace_result(),
+        })
+    }
+
+    #[cfg(not(feature = "plugin"))]
+    pub fn dispatch_tool_hook(
+        &mut self,
+        _hook: &str,
+        _context_janet: &str,
+    ) -> Result<ToolHookResult, String> {
+        Ok(ToolHookResult::default())
+    }
+}
+
+/// Outcome of a tool-hook dispatch. All fields are `None` when no plugin
+/// set the corresponding slot. The host calls `dispatch_tool_hook` once
+/// per tool boundary and interprets the result:
+///
+/// - `block: Some(reason)` — abort the tool call, surface `reason` to the
+///   LLM as the tool error.
+/// - `mutate_input: Some(json)` — re-deserialize tool args from `json`
+///   before invoking the inner tool.
+/// - `replace_result: Some(output)` — discard the real tool output and
+///   return `output` to the LLM instead.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolHookResult {
+    pub block: Option<String>,
+    pub mutate_input: Option<String>,
+    pub replace_result: Option<String>,
 }

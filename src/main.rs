@@ -285,6 +285,14 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
+    // Make the PluginManager visible to HookedToolDyn (which runs inside
+    // rig's tool dispatch, where we can't easily plumb the Arc through).
+    // Set once, before any tool is built or called.
+    #[cfg(feature = "plugin")]
+    if let Some(pm_arc) = plugin_manager.as_ref() {
+        plugin::hook::init_global(pm_arc.clone());
+    }
+
     #[cfg(feature = "plugin")]
     if let Some(pm_arc) = plugin_manager.as_ref() {
         use std::path::PathBuf;

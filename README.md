@@ -234,7 +234,15 @@ Janet scripts access harness capabilities through built-in functions:
 (harness/set-phase :architect)    # Set workflow phase
 (harness/request-prompt "text")   # Queue prompt for the LLM
 (harness/store-response "text")   # Not called directly — harness stores automatically
+
+# Tool interception (inside on-tool-start / on-tool-end hooks):
+(harness/block "reason")          # Abort the tool call; LLM sees the reason
+(harness/mutate-input json-str)   # Rewrite tool args before the tool runs
+(harness/replace-result text)     # Swap the tool output the LLM sees
 ```
+
+See `plugins/protected_paths.janet` for a working example that blocks
+writes to sensitive paths and truncates oversized tool outputs.
 
 ### Workflow plugin
 

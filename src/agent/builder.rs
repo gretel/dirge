@@ -27,6 +27,24 @@ use crate::skill::{self, Skill};
 #[allow(dead_code)]
 pub type ZAgent = Agent<openrouter::CompletionModel>;
 
+/// Wrap every tool with `HookedToolDyn` so plugins can intercept calls.
+/// On non-plugin builds this is a no-op identity, so callers can use it
+/// unconditionally. The global PluginManager is read at tool-call time;
+/// if none was installed, the wrapper short-circuits to the inner tool.
+fn hookify(tools: Vec<Box<dyn rig::tool::ToolDyn>>) -> Vec<Box<dyn rig::tool::ToolDyn>> {
+    #[cfg(feature = "plugin")]
+    {
+        tools
+            .into_iter()
+            .map(crate::plugin::hook::HookedToolDyn::wrap_global)
+            .collect()
+    }
+    #[cfg(not(feature = "plugin"))]
+    {
+        tools
+    }
+}
+
 pub async fn build_agent_inner<M: CompletionModel + 'static>(
     model: M,
     cli: &Cli,
@@ -236,22 +254,22 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         });
 
         #[allow(unused_mut)]
-        let mut builder = builder.tools(base_tools);
+        let mut builder = builder.tools(hookify(base_tools));
 
         if let Some(qt) = question_tool {
-            builder = builder.tools(vec![qt]);
+            builder = builder.tools(hookify(vec![qt]));
         }
 
         if let Some(pt) = plan_tools {
-            builder = builder.tools(pt);
+            builder = builder.tools(hookify(pt));
         }
 
         if let Some(ws) = websearch_tool {
-            builder = builder.tools(vec![ws]);
+            builder = builder.tools(hookify(vec![ws]));
         }
 
         if let Some(wf) = webfetch_tool {
-            builder = builder.tools(vec![wf]);
+            builder = builder.tools(hookify(vec![wf]));
         }
 
         if let (Some(pm), Some(store)) = (parent_model, bg_store) {
@@ -263,7 +281,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             ));
             let status_tool =
                 Box::new(tools::TaskStatusTool::new(store)) as Box<dyn rig::tool::ToolDyn>;
-            builder = builder.tools(vec![task_tool, status_tool]);
+            builder = builder.tools(hookify(vec![task_tool, status_tool]));
         }
 
         #[cfg(feature = "lsp")]
@@ -275,7 +293,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 manager.clone(),
                 cwd,
             )) as Box<dyn rig::tool::ToolDyn>;
-            builder = builder.tools(vec![lsp_tool]);
+            builder = builder.tools(hookify(vec![lsp_tool]));
         }
 
         #[cfg(feature = "mcp")]
@@ -288,7 +306,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                     .into_iter()
                     .map(|t| Box::new(t) as Box<dyn rig::tool::ToolDyn>)
                     .collect();
-                builder = builder.tools(dyn_tools);
+                builder = builder.tools(hookify(dyn_tools));
             }
         }
 
@@ -296,7 +314,7 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         if let Some(manager) = &semantic_manager {
             let sem_tools = manager.tools(permission.clone(), ask_tx.clone());
             if !sem_tools.is_empty() {
-                builder = builder.tools(sem_tools);
+                builder = builder.tools(hookify(sem_tools));
             }
         }
 
