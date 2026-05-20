@@ -46,6 +46,7 @@ pub use websearch::WebSearchTool;
 pub use write::WriteTool;
 
 use std::io;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -207,4 +208,39 @@ pub async fn check_perm_path(
             handle_ask_inner(tx, perm, tool, path).await
         }
     }
+}
+
+/// Check whether `candidate` refers to the plan file at `plan_file`.
+///
+/// Handles relative paths (`PLAN.md`, `./PLAN.md`), absolute paths,
+/// and the case where the candidate file doesn't exist yet (the agent
+/// is about to create it). Falls back to canonicalizing the parent
+/// directory when the file itself can't be resolved.
+pub fn is_plan_file(plan_file: &Path, candidate: &str) -> bool {
+    let candidate = Path::new(candidate);
+
+    // Canonicalize the candidate: if the file exists, resolve it.
+    // If it doesn't (the agent is about to create it), resolve
+    // the parent directory and join the file name.
+    let resolved = canonicalize_or_parent(candidate);
+
+    // Same for the plan file itself. Normally PLAN.md exists by the
+    // time the agent tries to edit it (it was created first), but
+    // be defensive in case canonicalize fails.
+    let plan_resolved = canonicalize_or_parent(plan_file);
+
+    resolved == plan_resolved
+}
+
+/// Canonicalize a path. If the path itself doesn't exist (e.g. a file
+/// about to be created), canonicalize its parent directory and join
+/// the file name back.
+fn canonicalize_or_parent(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| {
+        let parent = path.parent().unwrap_or(Path::new("."));
+        let file_name = path.file_name().unwrap_or_default();
+        std::fs::canonicalize(parent)
+            .unwrap_or_else(|_| parent.to_path_buf())
+            .join(file_name)
+    })
 }

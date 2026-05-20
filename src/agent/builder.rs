@@ -192,9 +192,10 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                 ask_tx.clone(),
             )),
             Box::new(tools::MemoryTool::new(permission.clone(), ask_tx.clone())),
-            Box::new(tools::ApplyPatchTool::new(
+            Box::new(tools::ApplyPatchTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
+                cache.clone(),
             )),
         ];
 

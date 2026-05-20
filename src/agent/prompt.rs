@@ -78,7 +78,14 @@ Available tools:
 - bash: Execute bash commands (supports timeout param)
 - grep: Search file contents with regex. Respects .gitignore, skips binary files. Supports context_lines param for surrounding context (like grep -C).
 - find_files: Find files by regex pattern on filename. Respects .gitignore.
-- list_dir: List directory entries with types and sizes. Respects .gitignore. Shows entry count for subdirectories.";
+- glob: Find files by glob pattern (e.g. \"**/*.rs\"). Respects .gitignore. Sorted by modification time. Returns empty string when no matches.
+- list_dir: List directory entries with types and sizes. Respects .gitignore. Shows entry count for subdirectories.
+- apply_patch: Multi-file operations in one call (create, update by text match, delete, rename). Operations run in order, stop on first failure.
+- question: Ask the user structured questions when you need clarification, decisions, or preferences. Blocks until user answers.
+- plan_enter / plan_exit: Suggest switching to/from plan mode for complex tasks. User must confirm.
+- task: Spawn a subagent for research/analysis subtasks. Set background=true for async — completion arrives as <system-reminder> on your next turn. Do NOT poll task_status.
+- memory: Persistent per-project knowledge. Actions: view (list or read one), write (create/update), delete.
+- skill: Load a skill by name to get detailed instructions for a specific task or domain.";
 
 pub const TODO_TOOLS_PROMPT: &str = "\
 - write_todo_list: Create or update a structured task list to track progress in the current coding session. Use this for complex multi-step tasks. Replaces any existing todo list.";

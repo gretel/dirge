@@ -3,6 +3,7 @@ use rig::tool::Tool;
 use serde::Deserialize;
 use std::path::Path;
 
+use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
 
 /// Max content size for a single create operation (1MB).
@@ -28,11 +29,28 @@ pub enum PatchOp {
 pub struct ApplyPatchTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
+    cache: Option<ToolCache>,
 }
 
 impl ApplyPatchTool {
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
-        Self { permission, ask_tx }
+        Self {
+            permission,
+            ask_tx,
+            cache: None,
+        }
+    }
+
+    pub fn with_cache(
+        permission: Option<PermCheck>,
+        ask_tx: Option<AskSender>,
+        cache: ToolCache,
+    ) -> Self {
+        Self {
+            permission,
+            ask_tx,
+            cache: Some(cache),
+        }
     }
 }
 
@@ -186,7 +204,12 @@ impl Tool for ApplyPatchTool {
             };
 
             match result {
-                Ok(msg) => results.push(msg),
+                Ok(msg) => {
+                    if let Some(ref cache) = self.cache {
+                        cache.clear();
+                    }
+                    results.push(msg);
+                }
                 Err(e) => {
                     results.push(format!("FAILED: {}", e));
                     break;
