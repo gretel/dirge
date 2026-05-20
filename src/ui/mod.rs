@@ -55,6 +55,103 @@ fn with_queue(s: String, n: usize) -> String {
     if n == 0 { s } else { format!("{} q:{}", s, n) }
 }
 
+/// Snapshot the various pieces of state the info panel surfaces (cwd, MCP,
+/// LSP, todos, modified files) into a `PanelData` ready to hand to the
+/// renderer. Reads global statics (TODO_LIST, MODIFIED_FILES) under their
+/// own mutexes; safe to call from the UI loop tick.
+fn build_panel_data(
+    session: &Session,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
+) -> crate::ui::renderer::PanelData {
+    use std::path::Path;
+
+    let cwd_str = Path::new(session.working_dir.as_str())
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(session.working_dir.as_str())
+        .to_string();
+
+    #[cfg(feature = "mcp")]
+    let mcp: Vec<(String, bool)> = mcp_manager
+        .map(|m| {
+            m.handles
+                .iter()
+                .map(|h| (h.server_name.clone(), true))
+                .collect()
+        })
+        .unwrap_or_default();
+    #[cfg(not(feature = "mcp"))]
+    let mcp: Vec<(String, bool)> = Vec::new();
+
+    #[cfg(feature = "lsp")]
+    let lsp: Vec<(String, String, bool)> = lsp_manager
+        .map(|m| {
+            let cwd_path = Path::new(session.working_dir.as_str());
+            let shorten = |p: &Path| -> String {
+                p.strip_prefix(cwd_path)
+                    .map(|r| r.display().to_string())
+                    .unwrap_or_else(|_| {
+                        p.file_name()
+                            .and_then(|n| n.to_str())
+                            .map(String::from)
+                            .unwrap_or_else(|| p.display().to_string())
+                    })
+            };
+            let mut all = Vec::new();
+            for (id, root) in m.active_servers() {
+                all.push((id, shorten(&root), true));
+            }
+            for (id, root) in m.broken_servers() {
+                all.push((id, shorten(&root), false));
+            }
+            all
+        })
+        .unwrap_or_default();
+    #[cfg(not(feature = "lsp"))]
+    let lsp: Vec<(String, String, bool)> = Vec::new();
+
+    let todos: Vec<(String, String)> = {
+        let list = crate::agent::tools::todo::TODO_LIST
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        list.iter()
+            .take(8)
+            .map(|t| {
+                let status = match t.status.as_str() {
+                    "in_progress" => "[~]",
+                    "completed" => "[x]",
+                    _ => "[ ]",
+                };
+                (status.to_string(), t.content.to_string())
+            })
+            .collect()
+    };
+
+    let cwd_path = Path::new(session.working_dir.as_str()).to_path_buf();
+    let modified: Vec<String> = crate::agent::tools::modified::recent(8)
+        .into_iter()
+        .map(|p| {
+            p.strip_prefix(&cwd_path)
+                .map(|r| r.display().to_string())
+                .unwrap_or_else(|_| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(String::from)
+                        .unwrap_or_else(|| p.display().to_string())
+                })
+        })
+        .collect();
+
+    crate::ui::renderer::PanelData {
+        cwd: cwd_str,
+        mcp,
+        lsp,
+        todos,
+        modified,
+    }
+}
+
 #[inline]
 pub(crate) fn resolve_color(color: Color, monochrome: bool) -> Color {
     if monochrome {
@@ -292,6 +389,19 @@ pub async fn run_interactive(
     });
 
     loop {
+        // Refresh the info panel snapshot once per iteration so it stays
+        // close to current as the agent edits files, runs MCP tools, etc.
+        // Done at loop top (not after each redraw) to avoid touching the
+        // 40-odd individual draw sites; the data shown lags one event in
+        // the worst case, which is fine for ambient status.
+        renderer.set_panel_data(build_panel_data(
+            session,
+            #[cfg(feature = "mcp")]
+            mcp_manager,
+            #[cfg(feature = "lsp")]
+            lsp_manager.as_ref(),
+        ));
+
         tokio::select! {
             Some(ev) = user_rx.recv() => {
                 match ev {

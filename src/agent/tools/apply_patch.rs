@@ -208,6 +208,23 @@ impl Tool for ApplyPatchTool {
                     if let Some(ref cache) = self.cache {
                         cache.clear();
                     }
+                    // Record the touched path(s) for the info panel. Rename
+                    // adds the *new* path; delete still records the path the
+                    // user/agent operated on so the panel reflects the action.
+                    match op {
+                        PatchOp::Create { path, .. }
+                        | PatchOp::Update { path, .. }
+                        | PatchOp::Delete { path } => {
+                            crate::agent::tools::modified::mark_modified(std::path::Path::new(
+                                path,
+                            ));
+                        }
+                        PatchOp::Rename { new_path, .. } => {
+                            crate::agent::tools::modified::mark_modified(std::path::Path::new(
+                                new_path,
+                            ));
+                        }
+                    }
                     results.push(msg);
                 }
                 Err(e) => {

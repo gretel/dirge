@@ -797,7 +797,41 @@ pub async fn handle_slash(
             session.messages.clear();
             session.total_estimated_tokens = 0;
             session.compactions.clear();
+            crate::agent::tools::modified::clear_modified();
             render_session(renderer, session, cli, cfg, context)?;
+        }
+        "/panel" => {
+            use crate::ui::renderer::PanelMode;
+            let arg = parts.get(1).copied().unwrap_or("").trim();
+            let new_mode = match arg {
+                "" => None,
+                "on" => Some(PanelMode::On),
+                "off" => Some(PanelMode::Off),
+                "auto" => Some(PanelMode::Auto),
+                other => {
+                    renderer.write_line(
+                        &format!("unknown /panel mode '{}' (use on|off|auto)", other),
+                        C_ERROR,
+                    )?;
+                    return Ok(());
+                }
+            };
+            if let Some(mode) = new_mode {
+                renderer.set_panel_mode(mode);
+                // Force a full repaint so layout / clipping recomputes at
+                // the new width immediately, not on next event.
+                renderer.render_viewport()?;
+            }
+            let current = renderer.panel_mode();
+            let visible = renderer.panel_visible();
+            renderer.write_line(
+                &format!(
+                    "panel mode: {:?} (currently {})",
+                    current,
+                    if visible { "shown" } else { "hidden" }
+                ),
+                C_AGENT,
+            )?;
         }
         "/btw" => {
             let query = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
@@ -935,6 +969,10 @@ pub async fn handle_slash(
                 );
             }
             renderer.write_line("  /clear                 clear screen", C_RESULT)?;
+            renderer.write_line(
+                "  /panel [on|off|auto]   toggle right-hand info panel",
+                C_RESULT,
+            )?;
             renderer.write_line(
                 "  /cd [path]             change working directory",
                 C_RESULT,

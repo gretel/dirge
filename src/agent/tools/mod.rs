@@ -10,6 +10,7 @@ mod list_dir;
 #[cfg(feature = "lsp")]
 mod lsp;
 mod memory;
+pub(crate) mod modified;
 pub(crate) mod plan;
 pub(crate) mod question;
 mod read;
@@ -18,7 +19,7 @@ pub mod semantic;
 mod skill;
 mod task;
 mod task_status;
-mod todo;
+pub(crate) mod todo;
 mod webfetch;
 mod websearch;
 pub(crate) mod write;

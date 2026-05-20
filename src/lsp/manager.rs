@@ -345,6 +345,31 @@ impl LspManager {
         }
     }
 
+    /// Snapshot of the currently-active LSP clients as `(server_id, root)`
+    /// pairs. Used by the info panel to surface what's been spawned and
+    /// where it's rooted. Includes both healthy and broken-but-cached
+    /// clients (broken-set entries appear in `broken_servers`).
+    pub fn active_servers(&self) -> Vec<(String, PathBuf)> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .clients
+            .values()
+            .map(|e| (e.server_id.clone(), e.root.clone()))
+            .collect()
+    }
+
+    /// Servers we've marked broken (failed to spawn or crashed). Useful
+    /// for the info panel to show degraded LSP status alongside the
+    /// healthy ones.
+    pub fn broken_servers(&self) -> Vec<(String, PathBuf)> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .broken
+            .iter()
+            .map(|(root, id)| (id.clone(), root.clone()))
+            .collect()
+    }
+
     /// Aggregated diagnostics across all attached clients. Same key/dedupe
     /// semantics as [`LspClient::all_diagnostics`].
     pub fn all_diagnostics(&self) -> HashMap<PathBuf, Vec<Diagnostic>> {

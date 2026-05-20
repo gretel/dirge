@@ -19,6 +19,45 @@ pub struct LineEntry {
 /// the chat-history viewport would be unreasonably squashed.
 pub const MAX_INPUT_VISIBLE_LINES: usize = 8;
 
+/// Width of the optional right-hand info panel content area, in columns.
+/// Plus one column for the vertical divider gives `PANEL_RESERVE`.
+const PANEL_WIDTH: u16 = 32;
+/// Total columns the panel costs the chat area when visible (panel + divider).
+const PANEL_RESERVE: u16 = PANEL_WIDTH + 1;
+/// Minimum terminal width at which `PanelMode::Auto` decides to show the
+/// panel. Below this the chat content would be too cramped.
+const PANEL_AUTO_MIN_COLS: u16 = 100;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PanelMode {
+    /// Show panel when terminal width >= PANEL_AUTO_MIN_COLS.
+    Auto,
+    /// Force panel on (still hidden if terminal is absurdly narrow).
+    On,
+    /// Force panel off regardless of width.
+    Off,
+}
+
+/// Snapshot of the data the info panel displays. Built fresh by the UI loop
+/// at each redraw because the underlying state (todos, modified files, etc.)
+/// is mutated by the agent and we don't want stale reads.
+#[derive(Default, Clone)]
+pub struct PanelData {
+    /// Short directory name to show at the top of the panel.
+    pub cwd: String,
+    /// (server name, connected) — connected currently always true because the
+    /// MCP manager drops failed connections at connect time; future health
+    /// tracking can flip this to false.
+    pub mcp: Vec<(String, bool)>,
+    /// (server_id, short root path, ok) — ok=false for broken servers.
+    pub lsp: Vec<(String, String, bool)>,
+    /// (status glyph, todo text). Status is single-char shorthand
+    /// like "[ ]", "[~]", "[x]" depending on the todo state.
+    pub todos: Vec<(String, String)>,
+    /// Recent modified file paths, shortened relative to cwd when possible.
+    pub modified: Vec<String>,
+}
+
 pub struct Renderer {
     lines: u16,
     col: u16,
@@ -35,6 +74,11 @@ pub struct Renderer {
     pub selection_active: bool,
     pub selection_start: Option<usize>,
     pub selection_end: Option<usize>,
+    panel_mode: PanelMode,
+    /// Most-recently set panel snapshot. The UI rebuilds and pushes this
+    /// before each redraw so render_viewport/draw_bottom can repaint the
+    /// panel along with the rest of the screen.
+    panel_data: PanelData,
 }
 
 impl Renderer {
@@ -52,7 +96,45 @@ impl Renderer {
             selection_active: false,
             selection_start: None,
             selection_end: None,
+            panel_mode: PanelMode::Auto,
+            panel_data: PanelData::default(),
         })
+    }
+
+    pub fn set_panel_mode(&mut self, mode: PanelMode) {
+        self.panel_mode = mode;
+    }
+
+    pub fn panel_mode(&self) -> PanelMode {
+        self.panel_mode
+    }
+
+    pub fn set_panel_data(&mut self, data: PanelData) {
+        self.panel_data = data;
+    }
+
+    /// Whether the panel will actually be drawn given current mode and
+    /// terminal size. Hidden when `Off`, or when the terminal is too narrow
+    /// to fit both the panel and a usable content area.
+    pub fn panel_visible(&self) -> bool {
+        let (cols, _) = self.terminal_size();
+        match self.panel_mode {
+            PanelMode::Off => false,
+            PanelMode::On => cols >= PANEL_RESERVE + 20,
+            PanelMode::Auto => cols >= PANEL_AUTO_MIN_COLS,
+        }
+    }
+
+    /// Content-area width in columns: terminal width minus the panel and
+    /// divider when the panel is visible. All chat/input width math uses
+    /// this so wrapping/clipping respects the panel.
+    fn content_cols(&self) -> u16 {
+        let (cols, _) = self.terminal_size();
+        if self.panel_visible() {
+            cols.saturating_sub(PANEL_RESERVE)
+        } else {
+            cols
+        }
     }
 
     pub fn set_monochrome(&mut self, monochrome: bool) {
@@ -68,8 +150,7 @@ impl Renderer {
     }
 
     fn max_line_width(&self) -> usize {
-        let (cols, _) = self.terminal_size();
-        cols.saturating_sub(1) as usize
+        self.content_cols().saturating_sub(1) as usize
     }
 
     pub fn line_width(&self) -> usize {
@@ -271,7 +352,8 @@ impl Renderer {
     }
 
     pub fn render_viewport(&mut self) -> io::Result<()> {
-        let (cols, rows) = self.terminal_size();
+        let (_, rows) = self.terminal_size();
+        let content_cols = self.content_cols();
         let visible = rows.saturating_sub(self.input_rows + 1) as usize;
         let total = self.buffer.len();
         let mut stdout = io::stdout();
@@ -284,16 +366,17 @@ impl Renderer {
         let start = start.min(total.saturating_sub(visible));
         let end = (start + visible).min(total);
 
+        // Width of the content band (excluding the divider column at
+        // `content_cols`). All chat text is clipped here; the remaining
+        // columns belong to the divider + panel.
+        let content_band = content_cols.saturating_sub(1) as usize;
         for i in 0..visible {
             stdout.execute(MoveTo(0, i as u16))?;
-            if start + i < end {
+            let text_chars: usize = if start + i < end {
                 let entry = &self.buffer[start + i];
                 let line_idx = start + i;
-                let text: String = entry
-                    .text
-                    .chars()
-                    .take(cols.saturating_sub(1) as usize)
-                    .collect();
+                let text: String = entry.text.chars().take(content_band).collect();
+                let actual_chars = text.chars().count();
 
                 let is_selected = self.selection_active
                     && self.selection_start.is_some()
@@ -315,8 +398,22 @@ impl Renderer {
                     write!(stdout, "{}", SetAttribute(Attribute::NoReverse))?;
                 }
                 write!(stdout, "{}", ResetColor)?;
+                actual_chars
+            } else {
+                0
+            };
+            if self.panel_visible() {
+                // Manually pad to the content band; ClearType::UntilNewLine
+                // would wipe the panel area to our right.
+                let pad = content_band.saturating_sub(text_chars);
+                if pad > 0 {
+                    write!(stdout, "{}", " ".repeat(pad))?;
+                }
+            } else {
+                // No panel — safe to use the cheaper clear-to-end-of-line so
+                // stale chars at the very last column also get wiped.
+                write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
             }
-            write!(stdout, "{}", Clear(ClearType::UntilNewLine))?;
         }
 
         if self.scroll_offset > 0 {
@@ -326,7 +423,7 @@ impl Renderer {
                 0
             };
             let indicator = format!(" SCROLL {}% ", pct);
-            let x = cols.saturating_sub(indicator.len() as u16);
+            let x = content_cols.saturating_sub(indicator.len() as u16);
             stdout.execute(MoveTo(x, 0))?;
             write!(
                 stdout,
@@ -337,6 +434,10 @@ impl Renderer {
             write!(stdout, "{}", ResetColor)?;
         }
 
+        if self.panel_visible() {
+            self.draw_panel(&mut stdout, rows)?;
+        }
+
         stdout.flush()?;
         Ok(())
     }
@@ -345,10 +446,13 @@ impl Renderer {
         if self.scroll_offset > 0 {
             return;
         }
-        let (cols, rows) = self.terminal_size();
+        let (_, rows) = self.terminal_size();
         if rows < 3 {
             return;
         }
+        // Clear only the content band so the right-hand info panel keeps
+        // its pixels when the chat viewport scrolls.
+        let content_cols = self.content_cols();
         let max_content = rows.saturating_sub(self.input_rows + 1);
         if self.lines >= max_content {
             let mut stdout = io::stdout();
@@ -356,7 +460,7 @@ impl Renderer {
             self.lines = self.lines.saturating_sub(1);
             for &r in &[max_content.saturating_sub(1), max_content] {
                 let _ = stdout.execute(MoveTo(0, r));
-                let _ = write!(stdout, "{}", " ".repeat(cols as usize));
+                let _ = write!(stdout, "{}", " ".repeat(content_cols as usize));
             }
             let _ = stdout.flush();
         }
@@ -500,7 +604,11 @@ impl Renderer {
         status: &str,
         is_running: bool,
     ) -> io::Result<()> {
-        let (cols, rows) = crossterm::terminal::size()?;
+        let (_, rows) = crossterm::terminal::size()?;
+        // Width available for input/status content. When the info panel is
+        // visible this is smaller than terminal width — using it everywhere
+        // keeps the prompt + status text from spilling under the panel.
+        let cols = self.content_cols();
         let mut stdout = io::stdout();
 
         let full_input: &str = editor.buffer.as_str();
@@ -524,7 +632,7 @@ impl Renderer {
         let cursor_line_idx = full_input[..cursor_line_start].matches('\n').count();
         let cursor_col_in_line = full_cursor - cursor_line_start;
 
-        // Wrap width: terminal width minus the 2-char prompt prefix that
+        // Wrap width: content width minus the 2-char prompt prefix that
         // sits in front of every visible row. Min 1 to avoid div-by-zero in
         // wrap math on ridiculous terminal sizes.
         let wrap_width = (cols.saturating_sub(2) as usize).max(1);
@@ -645,8 +753,137 @@ impl Renderer {
             input_top + (cursor_visual_row.saturating_sub(first_visible_visual)) as u16;
         let cursor_x = (2 + cursor_visual_col).min(cols.saturating_sub(1) as usize) as u16;
         stdout.execute(MoveTo(cursor_x, cursor_row))?;
+
+        if self.panel_visible() {
+            self.draw_panel(&mut stdout, rows)?;
+            // draw_panel moves the cursor — return it to the input.
+            stdout.execute(MoveTo(cursor_x, cursor_row))?;
+        }
+
         stdout.flush()?;
         Ok(())
+    }
+
+    /// Paint the right-hand info panel in the rightmost `PANEL_WIDTH` cols,
+    /// preceded by a vertical divider. Uses cached `self.panel_data`. Caller
+    /// is responsible for moving the cursor back if needed.
+    fn draw_panel(&self, stdout: &mut io::Stdout, rows: u16) -> io::Result<()> {
+        let (cols, _) = self.terminal_size();
+        let panel_x = cols.saturating_sub(PANEL_WIDTH);
+        let divider_x = panel_x.saturating_sub(1);
+        let width = PANEL_WIDTH as usize;
+        let last_row = rows.saturating_sub(1); // status row — leave alone
+
+        // Build the rendered lines first so we know how many we have, then
+        // paint top-to-bottom up to last_row-1.
+        let lines = self.build_panel_lines(width);
+
+        let divider_color = self.color(Color::DarkGrey);
+        let header_color = self.color(Color::Cyan);
+        let dim = self.color(Color::DarkGrey);
+
+        for row in 0..last_row {
+            stdout.execute(MoveTo(divider_x, row))?;
+            write!(stdout, "{}", SetForegroundColor(divider_color))?;
+            write!(stdout, "│")?;
+            write!(stdout, "{}", ResetColor)?;
+
+            stdout.execute(MoveTo(panel_x, row))?;
+            if let Some((text, color)) = lines.get(row as usize) {
+                let c = if *color == Color::Reset { dim } else { *color };
+                let painted = if *color == Color::Cyan {
+                    header_color
+                } else {
+                    c
+                };
+                write!(stdout, "{}", SetForegroundColor(painted))?;
+                write!(stdout, "{}", text)?;
+                write!(stdout, "{}", ResetColor)?;
+                // Pad to panel width so stale text from earlier draws is wiped.
+                let len = text.chars().count();
+                if len < width {
+                    write!(stdout, "{}", " ".repeat(width - len))?;
+                }
+            } else {
+                write!(stdout, "{}", " ".repeat(width))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Materialize the panel content as `(line, color)` pairs of at most
+    /// `width` chars each. Sections are separated by blank lines and a
+    /// header. Lines past terminal height are dropped by the caller.
+    fn build_panel_lines(&self, width: usize) -> Vec<(String, Color)> {
+        let d = &self.panel_data;
+        let mut out: Vec<(String, Color)> = Vec::new();
+
+        let truncate = |s: &str, w: usize| -> String {
+            let cc = s.chars().count();
+            if cc <= w {
+                s.to_string()
+            } else if w <= 1 {
+                "…".to_string()
+            } else {
+                let mut t: String = s.chars().take(w - 1).collect();
+                t.push('…');
+                t
+            }
+        };
+
+        // Header
+        out.push((truncate(&format!(" {}", d.cwd), width), Color::Cyan));
+
+        let push_section =
+            |out: &mut Vec<(String, Color)>, title: &str, items: Vec<(String, Color)>| {
+                out.push((String::new(), Color::Reset));
+                out.push((truncate(title, width), Color::Cyan));
+                if items.is_empty() {
+                    out.push((truncate("  (none)", width), Color::DarkGrey));
+                } else {
+                    for (text, color) in items {
+                        out.push((truncate(&text, width), color));
+                    }
+                }
+            };
+
+        let mcp_items: Vec<(String, Color)> = d
+            .mcp
+            .iter()
+            .map(|(name, ok)| {
+                let glyph = if *ok { "●" } else { "○" };
+                let color = if *ok { Color::Green } else { Color::Red };
+                (format!("  {} {}", glyph, name), color)
+            })
+            .collect();
+        push_section(&mut out, "MCP", mcp_items);
+
+        let lsp_items: Vec<(String, Color)> = d
+            .lsp
+            .iter()
+            .map(|(id, root, ok)| {
+                let glyph = if *ok { "●" } else { "○" };
+                let color = if *ok { Color::Green } else { Color::Red };
+                (format!("  {} {} {}", glyph, id, root), color)
+            })
+            .collect();
+        push_section(&mut out, "LSP", lsp_items);
+
+        let todo_items: Vec<(String, Color)> = d
+            .todos
+            .iter()
+            .map(|(status, text)| (format!("  {} {}", status, text), Color::White))
+            .collect();
+        push_section(&mut out, "Todos", todo_items);
+
+        let mod_items: Vec<(String, Color)> = d
+            .modified
+            .iter()
+            .map(|p| (format!("  {}", p), Color::White))
+            .collect();
+        push_section(&mut out, "Modified", mod_items);
+
+        out
     }
 }
 

@@ -214,6 +214,7 @@ impl Tool for EditTool {
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
         tokio::fs::write(&args.path, &output).await?;
+        crate::agent::tools::modified::mark_modified(std::path::Path::new(&args.path));
         // File mutated → invalidate cached reads/greps/listings for this turn.
         if let Some(ref cache) = self.cache {
             cache.clear();

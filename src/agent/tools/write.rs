@@ -111,6 +111,7 @@ impl Tool for WriteTool {
         #[cfg(feature = "lsp")]
         let write_at = Instant::now();
         tokio::fs::write(path, &args.content).await?;
+        crate::agent::tools::modified::mark_modified(path);
         // File mutated → invalidate cached reads/greps/listings for this turn.
         if let Some(ref cache) = self.cache {
             cache.clear();
