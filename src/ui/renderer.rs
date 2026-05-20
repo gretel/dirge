@@ -27,11 +27,9 @@ pub struct Renderer {
     partial: CompactString,
     partial_color: Color,
     scroll_offset: usize,
-    input_scroll_offset: usize,
     /// Number of rows the input area currently occupies (1 by default, grows
-    /// up to MAX_INPUT_VISIBLE_LINES as the user adds newlines via
-    /// Shift+Enter / Meta+Enter / Ctrl+J). The chat viewport shrinks by the
-    /// same amount so the total layout fits.
+    /// up to MAX_INPUT_VISIBLE_LINES as the user adds newlines or types past
+    /// the wrap width). The chat viewport shrinks by the same amount.
     input_rows: u16,
     monochrome: bool,
     pub selection_active: bool,
@@ -49,7 +47,6 @@ impl Renderer {
             partial: CompactString::new(""),
             partial_color: Color::White,
             scroll_offset: 0,
-            input_scroll_offset: 0,
             input_rows: 1,
             monochrome: false,
             selection_active: false,
@@ -527,14 +524,37 @@ impl Renderer {
         let cursor_line_idx = full_input[..cursor_line_start].matches('\n').count();
         let cursor_col_in_line = full_cursor - cursor_line_start;
 
-        // Decide how many input rows to show. Cap at MAX_INPUT_VISIBLE_LINES
-        // so the chat viewport doesn't disappear under huge pastes / drafts.
-        let visible_input_rows = line_count.min(MAX_INPUT_VISIBLE_LINES).max(1);
+        // Wrap width: terminal width minus the 2-char prompt prefix that
+        // sits in front of every visible row. Min 1 to avoid div-by-zero in
+        // wrap math on ridiculous terminal sizes.
+        let wrap_width = (cols.saturating_sub(2) as usize).max(1);
 
-        // Pick which slice of logical lines to render so the cursor's line is
-        // always on screen. Simple scroll-to-keep-cursor-visible strategy.
-        let first_visible_line = if cursor_line_idx >= visible_input_rows {
-            cursor_line_idx + 1 - visible_input_rows
+        // Pre-render each logical line (placeholder expansion etc.) into the
+        // displayable form, alongside the cursor's display column on its line.
+        let display_lines: Vec<String> = logical_lines
+            .iter()
+            .map(|line| editor.render_line(line, 0).0)
+            .collect();
+        let cursor_raw_line = logical_lines[cursor_line_idx];
+        let (_, cursor_display_col) = editor.render_line(cursor_raw_line, cursor_col_in_line);
+
+        // Soft-wrap to visual rows. Each visual row spans at most
+        // `wrap_width` chars of one logical line; long lines emit multiple
+        // visual rows. Cursor mapping accounts for end-of-line at the exact
+        // wrap boundary (cursor stays at the right edge instead of jumping
+        // to a phantom next row with no content under it).
+        let (visual_rows, cursor_visual_row, cursor_visual_col) = wrap_input(
+            &display_lines,
+            cursor_line_idx,
+            cursor_display_col,
+            wrap_width,
+        );
+        let total_visual = visual_rows.len();
+        let visible_input_rows = total_visual.clamp(1, MAX_INPUT_VISIBLE_LINES);
+
+        // Window the visual rows so the cursor stays on screen.
+        let first_visible_visual = if cursor_visual_row >= visible_input_rows {
+            cursor_visual_row + 1 - visible_input_rows
         } else {
             0
         };
@@ -555,73 +575,36 @@ impl Renderer {
         } else {
             "> "
         };
-        // Continuation rows get a dimmer prompt so the user can see at a
-        // glance which row is "the" prompt and which are wrapped lines.
+        // Continuation rows get a dimmer prompt. We mark the *first* visual
+        // row of the *first* logical line as the prompt row; everything else
+        // (later logical lines, wrapped continuations) gets the cont prefix.
         let prompt_cont = "· ";
 
-        // Reserve right-edge space for the token counter so it never
-        // overdraws line content. Width is the width of the longest
-        // realistic counter string ("  (NNNN tk)" ~= 12 chars).
-        let token_est = editor.expanded().len() as u64 / 4;
-        let counter_reserve: u16 = if token_est > 0 { 12 } else { 0 };
-        let visible_width = cols.saturating_sub(2 + counter_reserve) as usize;
+        // Pre-collect chars per logical line so each visual row's slice can
+        // be cut without re-iterating.
+        let display_chars: Vec<Vec<char>> =
+            display_lines.iter().map(|s| s.chars().collect()).collect();
 
-        // Recompute horizontal scroll based on the cursor's line. Each draw
-        // re-anchors so very long single lines still pan horizontally.
-        let cursor_raw_line = logical_lines[cursor_line_idx];
-        let (_, cursor_display_col) = editor.render_line(cursor_raw_line, cursor_col_in_line);
-        if cursor_display_col < self.input_scroll_offset {
-            self.input_scroll_offset = cursor_display_col;
-        } else if cursor_display_col >= self.input_scroll_offset + visible_width {
-            self.input_scroll_offset = cursor_display_col - visible_width + 1;
-        }
-
-        // Render each visible logical line.
         for row_offset in 0..visible_input_rows {
             let row = input_top + row_offset as u16;
-            let line_idx = first_visible_line + row_offset;
+            let vr_idx = first_visible_visual + row_offset;
             stdout.execute(MoveTo(0, row))?;
             write!(stdout, "{}", " ".repeat(cols as usize))?;
             stdout.execute(MoveTo(0, row))?;
             write!(stdout, "{}", SetForegroundColor(self.color(Color::Cyan)))?;
-            if line_idx == 0 {
+            let is_prompt_row = vr_idx == 0;
+            if is_prompt_row {
                 write!(stdout, "{}", prompt_main)?;
             } else {
                 write!(stdout, "{}", prompt_cont)?;
             }
             write!(stdout, "{}", ResetColor)?;
-            let raw_line = logical_lines.get(line_idx).copied().unwrap_or("");
-            let (display_line, _) = editor.render_line(raw_line, 0);
-            // Apply horizontal scroll if this line contains the cursor; other
-            // lines render from column 0 (they'll get truncated if too wide).
-            let scroll = if line_idx == cursor_line_idx {
-                self.input_scroll_offset
-            } else {
-                0
-            };
-            let visible: String = display_line
-                .chars()
-                .skip(scroll)
-                .take(visible_width)
-                .collect();
-            write!(stdout, "{}", visible)?;
-        }
-
-        // Token counter on the last visible row, sitting in the reserved
-        // right-edge gap (see `counter_reserve` above). Doesn't overdraw
-        // line content because `visible_width` already excludes this band.
-        if counter_reserve > 0 {
-            let last_row = input_top + (visible_input_rows as u16 - 1);
-            let counter = format!("  ({} tk)", token_est);
-            let counter_col = cols.saturating_sub(counter.len() as u16);
-            stdout.execute(MoveTo(counter_col, last_row))?;
-            write!(
-                stdout,
-                "{}",
-                SetForegroundColor(self.color(Color::DarkGrey))
-            )?;
-            write!(stdout, "{}", counter)?;
-            write!(stdout, "{}", ResetColor)?;
+            if let Some(vr) = visual_rows.get(vr_idx)
+                && let Some(chars) = display_chars.get(vr.logical_line)
+            {
+                let slice: String = chars[vr.char_start..vr.char_end].iter().collect();
+                write!(stdout, "{}", slice)?;
+            }
         }
 
         // Status row.
@@ -638,28 +621,103 @@ impl Renderer {
         } else {
             status.to_string()
         };
-        if line_count > MAX_INPUT_VISIBLE_LINES {
-            // Buffer is bigger than the visible window — tell the user how
-            // many extra logical lines there are.
-            status_display.push_str(&format!(
-                " [{} lines, {} hidden]",
-                line_count,
-                line_count - MAX_INPUT_VISIBLE_LINES
-            ));
-        } else if line_count > 1 {
-            status_display.push_str(&format!(" [{} lines]", line_count));
+        if line_count > 1 || total_visual > MAX_INPUT_VISIBLE_LINES {
+            // Surface logical line count and visual-row overflow so the user
+            // knows there is content scrolled off the top of the input box.
+            let hidden = total_visual.saturating_sub(visible_input_rows);
+            if hidden > 0 {
+                status_display
+                    .push_str(&format!(" [{} lines, {} rows hidden]", line_count, hidden));
+            } else if line_count > 1 {
+                status_display.push_str(&format!(" [{} lines]", line_count));
+            }
+        }
+        let token_est = editor.expanded().len() as u64 / 4;
+        if token_est > 0 {
+            status_display.push_str(&format!(" ({} tk)", token_est));
         }
         let truncated: String = status_display.chars().take(cols as usize).collect();
         write!(stdout, "{}", truncated)?;
         write!(stdout, "{}", ResetColor)?;
 
         // Place the visible cursor on its row at the right column.
-        let cursor_row = input_top + (cursor_line_idx - first_visible_line) as u16;
-        let cursor_x = (2 + cursor_display_col.saturating_sub(self.input_scroll_offset)) as u16;
+        let cursor_row =
+            input_top + (cursor_visual_row.saturating_sub(first_visible_visual)) as u16;
+        let cursor_x = (2 + cursor_visual_col).min(cols.saturating_sub(1) as usize) as u16;
         stdout.execute(MoveTo(cursor_x, cursor_row))?;
         stdout.flush()?;
         Ok(())
     }
+}
+
+/// One visible row of the input box after soft-wrapping. A logical line
+/// (between newlines in the buffer) may produce multiple visual rows when
+/// it exceeds the terminal's wrap width.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VisualRow {
+    pub logical_line: usize,
+    pub char_start: usize,
+    pub char_end: usize,
+}
+
+/// Wrap pre-rendered display lines to `wrap_width` columns and locate the
+/// cursor in the resulting visual grid. Returns `(rows, cursor_row, cursor_col)`.
+///
+/// Cursor placement at exact wrap boundaries (cursor sits at end-of-line
+/// where chars exactly fill the row) keeps the cursor at the right edge of
+/// the filled row rather than jumping to an empty phantom row beneath it,
+/// matching what most line editors do.
+pub(crate) fn wrap_input(
+    display_lines: &[String],
+    cursor_line_idx: usize,
+    cursor_display_col: usize,
+    wrap_width: usize,
+) -> (Vec<VisualRow>, usize, usize) {
+    let wrap_width = wrap_width.max(1);
+    let mut rows: Vec<VisualRow> = Vec::new();
+    let mut cursor_visual_row = 0usize;
+    let mut cursor_visual_col = 0usize;
+
+    for (li, line) in display_lines.iter().enumerate() {
+        let char_count = line.chars().count();
+        let row_count = if char_count == 0 {
+            1
+        } else {
+            char_count.div_ceil(wrap_width)
+        };
+
+        let base = rows.len();
+        let mut emitted = row_count;
+
+        if li == cursor_line_idx {
+            let col = cursor_display_col;
+            let (vr, vc) = if col > 0 && col == char_count && col.is_multiple_of(wrap_width) {
+                // End of a line that exactly fills the last row — stay on
+                // the filled row, position cursor past its last char.
+                (col / wrap_width - 1, wrap_width)
+            } else {
+                (col / wrap_width, col % wrap_width)
+            };
+            cursor_visual_row = base + vr;
+            cursor_visual_col = vc;
+            // Empty or short logical line still needs a row for the cursor.
+            if vr + 1 > emitted {
+                emitted = vr + 1;
+            }
+        }
+
+        for r in 0..emitted {
+            let cs = (r * wrap_width).min(char_count);
+            let ce = ((r + 1) * wrap_width).min(char_count);
+            rows.push(VisualRow {
+                logical_line: li,
+                char_start: cs,
+                char_end: ce,
+            });
+        }
+    }
+
+    (rows, cursor_visual_row, cursor_visual_col)
 }
 
 pub fn copy_to_clipboard(text: &str) {
@@ -873,5 +931,100 @@ mod tests {
         r.commit_partial();
 
         assert_eq!(view_start(&r), pinned_start);
+    }
+
+    // --- wrap_input -------------------------------------------------------
+
+    fn lines(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn wrap_empty_buffer_has_one_row() {
+        let (rows, cr, cc) = wrap_input(&lines(&[""]), 0, 0, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].logical_line, 0);
+        assert_eq!((rows[0].char_start, rows[0].char_end), (0, 0));
+        assert_eq!((cr, cc), (0, 0));
+    }
+
+    #[test]
+    fn wrap_short_line_no_split() {
+        let (rows, cr, cc) = wrap_input(&lines(&["hi"]), 0, 2, 10);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((rows[0].char_start, rows[0].char_end), (0, 2));
+        assert_eq!((cr, cc), (0, 2));
+    }
+
+    #[test]
+    fn wrap_splits_long_line_into_multiple_visual_rows() {
+        // "abcdefghi" with wrap_width=3 -> 3 rows of 3 chars each.
+        let (rows, cr, cc) = wrap_input(&lines(&["abcdefghi"]), 0, 5, 3);
+        assert_eq!(rows.len(), 3);
+        assert_eq!((rows[0].char_start, rows[0].char_end), (0, 3));
+        assert_eq!((rows[1].char_start, rows[1].char_end), (3, 6));
+        assert_eq!((rows[2].char_start, rows[2].char_end), (6, 9));
+        // cursor at col 5 -> row 1, col 2
+        assert_eq!((cr, cc), (1, 2));
+    }
+
+    #[test]
+    fn wrap_cursor_at_exact_boundary_stays_on_filled_row() {
+        // "abc" with wrap_width=3 — cursor at col 3 (end of line). Should
+        // sit at the right edge of the only row, not on a phantom row 1.
+        let (rows, cr, cc) = wrap_input(&lines(&["abc"]), 0, 3, 3);
+        assert_eq!(rows.len(), 1);
+        assert_eq!((cr, cc), (0, 3));
+    }
+
+    #[test]
+    fn wrap_cursor_after_full_row_with_continuation() {
+        // "abcdef" with wrap_width=3 — cursor at col 6 (end). Two rows, cursor
+        // at end of row 1 (col 3), not at start of phantom row 2.
+        let (rows, cr, cc) = wrap_input(&lines(&["abcdef"]), 0, 6, 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((cr, cc), (1, 3));
+    }
+
+    #[test]
+    fn wrap_cursor_at_start_of_continuation_row() {
+        // "abcdef" with wrap_width=3 — cursor at col 3 (just past first row).
+        // Not the exact-boundary "at end of line" case: chars continue.
+        let (rows, cr, cc) = wrap_input(&lines(&["abcdef"]), 0, 3, 3);
+        assert_eq!(rows.len(), 2);
+        assert_eq!((cr, cc), (1, 0));
+    }
+
+    #[test]
+    fn wrap_multiple_logical_lines() {
+        // Two logical lines, second one has the cursor.
+        let (rows, cr, cc) = wrap_input(&lines(&["abc", "defgh"]), 1, 4, 3);
+        // Line 0: 1 row (3 chars); Line 1: 2 rows (3 + 2)
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].logical_line, 0);
+        assert_eq!(rows[1].logical_line, 1);
+        assert_eq!(rows[2].logical_line, 1);
+        // Cursor at line 1, col 4 -> within line 1's row 1 (visual row 2 overall), col 1
+        assert_eq!((cr, cc), (2, 1));
+    }
+
+    #[test]
+    fn wrap_empty_then_filled_line_cursor_on_empty() {
+        // ["", "abc"] with cursor on line 0 at col 0.
+        let (rows, cr, cc) = wrap_input(&lines(&["", "abc"]), 0, 0, 3);
+        // Line 0: 1 (empty) row; Line 1: 1 row of "abc"
+        assert_eq!(rows.len(), 2);
+        assert_eq!((rows[0].char_start, rows[0].char_end), (0, 0));
+        assert_eq!((rows[1].char_start, rows[1].char_end), (0, 3));
+        assert_eq!((cr, cc), (0, 0));
+    }
+
+    #[test]
+    fn wrap_width_one_degenerate() {
+        // wrap_width=1 in extremely narrow terminal — every char becomes its
+        // own row. Should not panic and cursor should still map.
+        let (rows, cr, cc) = wrap_input(&lines(&["abc"]), 0, 2, 1);
+        assert_eq!(rows.len(), 3);
+        assert_eq!((cr, cc), (2, 0));
     }
 }
