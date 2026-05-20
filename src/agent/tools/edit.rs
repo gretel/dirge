@@ -6,7 +6,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, check_perm_path};
+use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, check_perm_path, is_plan_file};
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
 
@@ -140,15 +140,7 @@ impl Tool for EditTool {
         check_perm_path(&self.permission, &self.ask_tx, "edit", &args.path).await?;
 
         if let Some(plan) = &self.plan_file {
-            let allowed = {
-                let path = std::path::Path::new(&args.path);
-                path == std::path::Path::new("PLAN.md") || {
-                    let pc = std::fs::canonicalize(path).ok();
-                    let pp = std::fs::canonicalize(plan).ok();
-                    pc.is_some() && pp.is_some() && pc.as_ref() == pp.as_ref()
-                }
-            };
-            if !allowed {
+            if !is_plan_file(plan, &args.path) {
                 return Err(ToolError::Msg(
                     "Plan mode: edits restricted to PLAN.md only. Use /prompt default to exit plan mode."
                         .to_string(),
