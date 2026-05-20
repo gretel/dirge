@@ -231,6 +231,18 @@ impl Session {
         self.tree.leaf_id = prev;
     }
 
+    /// Run both back-compat initializers as a unit. Use this instead
+    /// of calling `ensure_message_store_initialized` and
+    /// `ensure_tree_initialized` separately — they're individually
+    /// idempotent but the combined invariant ("tree + store both
+    /// reflect `messages`") is what every mutation actually depends
+    /// on. A panic between two separate calls would leave the
+    /// session half-initialized; this helper does both in one shot.
+    pub fn ensure_back_compat_initialized(&mut self) {
+        self.ensure_message_store_initialized();
+        self.ensure_tree_initialized();
+    }
+
     /// Append a plugin entry to this session. Assigns the next
     /// monotonic `seq` so renderers can produce a deterministic
     /// ordering even within a single-second timestamp bucket. Plugins
@@ -259,8 +271,7 @@ impl Session {
         // from a pre-P4b/P4c session file BEFORE we append the new
         // one — otherwise the rebuild would re-insert this new message
         // with the wrong parent.
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         let tokens = Self::estimate_tokens(content);
         let id = new_message_id();
         let timestamp = chrono::Utc::now().timestamp();
@@ -302,15 +313,17 @@ impl Session {
     /// fork's children stay reachable. In the linear case it's
     /// always safe to remove.
     pub fn pop_last_message(&mut self) -> Option<SessionMessage> {
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         let msg = self.messages.pop()?;
-        // Move leaf back to the popped node's parent.
-        let parent = self
-            .tree
-            .entries
-            .get(&msg.id)
-            .and_then(|n| n.parent.clone());
+        // Pull the popped node's parent for leaf rewind. If the tree
+        // somehow lacks this node (corruption / external mutation),
+        // fall back to the previous message in the linear cache rather
+        // than wiping the leaf — wiping would leave the tree dangling
+        // when the user pops on a branched session.
+        let parent = match self.tree.entries.get(&msg.id) {
+            Some(node) => node.parent.clone(),
+            None => self.messages.last().map(|m| m.id.clone()),
+        };
         self.tree.leaf_id = parent;
         // Only prune the node if nothing else (e.g. a forked branch)
         // refers to it as a parent.
@@ -340,8 +353,7 @@ impl Session {
     /// would indicate corruption). On error, leaves the session
     /// state untouched.
     pub fn switch_to_leaf(&mut self, new_leaf_id: &CompactString) -> Result<(), String> {
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         if !self.tree.entries.contains_key(new_leaf_id) {
             return Err(format!("unknown entry id: {}", new_leaf_id));
         }
@@ -383,10 +395,16 @@ impl Session {
     /// branch. Returns the message content (so the UI can restore
     /// it into the input editor for re-editing).
     ///
+    /// **Root-node behaviour**: if `entry_id` has no parent (it is
+    /// the conversation root), the current `messages` cache is
+    /// cleared and `tree.leaf_id` is set to `None` so the next
+    /// `add_message` starts a fresh root. The tree's other entries
+    /// (sibling branches) are *not* pruned — they remain reachable
+    /// via `/tree`.
+    ///
     /// Mirrors pi's `ctx.fork(entryId, { position: "before" })`.
     pub fn fork_at(&mut self, entry_id: &CompactString) -> Result<SessionMessage, String> {
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         let node = self
             .tree
             .entries
@@ -489,7 +507,14 @@ impl Session {
     }
 
     pub fn compress(&mut self, summary: String, first_kept_index: usize, token_savings: u64) {
+        // Bounds check — callers compute `first_kept_index` from a
+        // reverse-scan of `messages` so it should always be in range,
+        // but a buggy/racy caller could pass out-of-bounds. Clamp
+        // rather than panic on `drain(..)` so a misuse degrades to
+        // "summarize everything" instead of a hard crash.
+        let first_kept_index = first_kept_index.min(self.messages.len());
         let summarized_count = first_kept_index;
+
         // Subtract the saved tokens from estimated total
         self.total_estimated_tokens = self.total_estimated_tokens.saturating_sub(token_savings);
         // Add back estimated tokens for the summary itself
@@ -513,6 +538,8 @@ impl Session {
             .iter()
             .map(|m| m.id.clone())
             .collect();
+        let dropped_set: std::collections::HashSet<CompactString> =
+            dropped_ids.iter().cloned().collect();
 
         // Remove summarized messages and insert summary
         self.messages.drain(..first_kept_index);
@@ -521,8 +548,7 @@ impl Session {
         // Mirror into the tree + store: remove dropped nodes, insert
         // the new summary node as the new root, and re-parent the
         // first kept node to point at the summary.
-        self.ensure_tree_initialized();
-        self.ensure_message_store_initialized();
+        self.ensure_back_compat_initialized();
         for id in &dropped_ids {
             self.tree.entries.remove(id);
             self.message_store.remove(id);
@@ -544,9 +570,36 @@ impl Session {
                 node.parent = Some(summary_id.clone());
             }
         } else {
-            self.tree.leaf_id = Some(summary_id);
+            self.tree.leaf_id = Some(summary_id.clone());
+        }
+        // Re-point the tree leaf if the previous leaf was one of the
+        // pruned nodes (e.g. a branched session compressed the branch
+        // that owned the leaf). Without this the leaf dangles at an
+        // id that no longer exists in `tree.entries`.
+        let leaf_dropped = self
+            .tree
+            .leaf_id
+            .as_ref()
+            .map(|id| dropped_set.contains(id))
+            .unwrap_or(false);
+        if leaf_dropped {
+            // Anchor the leaf to the new first-kept message, or to the
+            // summary if nothing else survived.
+            self.tree.leaf_id = self
+                .messages
+                .get(1)
+                .map(|m| m.id.clone())
+                .or(Some(summary_id.clone()));
         }
 
+        // On compress we replace every prior compaction record with a
+        // single fresh one. `Compaction::first_kept_index` is meant to
+        // mark the message-index boundary for the *latest* compaction
+        // only — keeping a stale list of records from earlier compresses
+        // makes their indices meaningless after subsequent drains. The
+        // latest summary IS the conversation prefix; older summaries
+        // are folded into it via `previous_summary` in the LLM context.
+        self.compactions.clear();
         self.compactions.push(Compaction {
             summary: CompactString::from(summary),
             first_kept_index: 1, // The summary is at index 0
@@ -555,8 +608,6 @@ impl Session {
             created_at: CompactString::new(chrono::Utc::now().to_rfc3339()),
         });
 
-        // Adjust all compaction first_kept indices for the removed messages
-        // (since we never have >1 compaction with the current simple approach, this is fine)
         self.updated_at = CompactString::new(chrono::Utc::now().to_rfc3339());
     }
 }
