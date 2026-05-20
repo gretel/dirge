@@ -1,6 +1,7 @@
 use std::io::Write;
 
 use crossterm::ExecutableCommand;
+use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
@@ -19,6 +20,11 @@ impl TerminalGuard {
         // input editor relies on this to compress long pastes into a
         // `[N lines pasted]` placeholder.
         stdout.execute(EnableBracketedPaste)?;
+        // Hide the hardware cursor by default. While the agent streams output,
+        // the renderer issues many MoveTo calls and the visible cursor would
+        // flicker across the screen. draw_bottom re-shows it only after
+        // positioning it at the input prompt.
+        stdout.execute(Hide)?;
         terminal::enable_raw_mode()?;
         Ok(TerminalGuard)
     }
@@ -28,6 +34,7 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = terminal::disable_raw_mode();
         let mut stdout = std::io::stdout();
+        let _ = stdout.execute(Show);
         let _ = stdout.execute(DisableBracketedPaste);
         let _ = stdout.execute(DisableMouseCapture);
         let _ = stdout.execute(LeaveAlternateScreen);

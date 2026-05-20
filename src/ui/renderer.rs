@@ -2,7 +2,7 @@ use std::io::{self, Write};
 
 use compact_str::CompactString;
 use crossterm::ExecutableCommand;
-use crossterm::cursor::MoveTo;
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::style::{Attribute, Color, ResetColor, SetAttribute, SetForegroundColor};
 use crossterm::terminal::{Clear, ClearType, ScrollUp};
 
@@ -357,6 +357,9 @@ impl Renderer {
         let visible = rows.saturating_sub(self.input_rows + 1) as usize;
         let total = self.buffer.len();
         let mut stdout = io::stdout();
+        // Keep the cursor hidden while we paint many rows; draw_bottom is
+        // the only path that re-shows it at the input position.
+        stdout.execute(Hide)?;
 
         let start = if self.scroll_offset == 0 {
             total.saturating_sub(visible)
@@ -484,6 +487,10 @@ impl Renderer {
                 if self.scroll_offset == 0 {
                     self.ensure_room();
                     let mut stdout = io::stdout();
+                    // Hide cursor so streaming agent output doesn't drag the
+                    // hardware cursor across the chat area; draw_bottom shows
+                    // it again at the input prompt.
+                    stdout.execute(Hide)?;
                     let r = self.content_row();
                     stdout.execute(MoveTo(0, r))?;
                     stdout.execute(Clear(ClearType::CurrentLine))?;
@@ -508,6 +515,11 @@ impl Renderer {
         let max_width = self.max_line_width();
         if max_width == 0 {
             return Ok(());
+        }
+        // Hide cursor for the duration of this streamed write; draw_bottom
+        // is the only place that re-shows it at the input prompt.
+        if self.scroll_offset == 0 {
+            io::stdout().execute(Hide)?;
         }
         let parts: Vec<&str> = text.split('\n').collect();
         let last = parts.len() - 1;
@@ -760,6 +772,11 @@ impl Renderer {
             stdout.execute(MoveTo(cursor_x, cursor_row))?;
         }
 
+        // draw_bottom is the only place the visible cursor belongs (at the
+        // user's input position). Other renderer paths (render_viewport,
+        // write, write_line) keep the cursor hidden so streaming output
+        // doesn't drag the hardware cursor across the chat area.
+        stdout.execute(Show)?;
         stdout.flush()?;
         Ok(())
     }

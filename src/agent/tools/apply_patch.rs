@@ -33,6 +33,7 @@ pub struct ApplyPatchTool {
 }
 
 impl ApplyPatchTool {
+    #[allow(dead_code)]
     pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
         Self {
             permission,
