@@ -94,7 +94,9 @@ impl Tool for TaskTool {
             // single-prompt LLM task; anything longer is the
             // subagent loop misbehaving.
             const SUBAGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
-            tokio::spawn(async move {
+            let store_for_task = store.clone();
+            let tid_for_task = tid.clone();
+            let handle = tokio::spawn(async move {
                 let fut = model.btw_query(format!(
                     "You are a subagent working on a specific subtask. Complete it thoroughly.\n\nTask: {}",
                     prompt
@@ -108,8 +110,13 @@ impl Tool for TaskTool {
                         SUBAGENT_TIMEOUT.as_secs(),
                     )),
                 };
-                store.notify(&tid, state);
+                store_for_task.notify(&tid_for_task, state);
             });
+            // Register the handle so `BackgroundStore::cancel_all` (called
+            // on session swap) can abort the subagent and free its
+            // provider connection. Without this the task survived the
+            // parent's session change and kept consuming API budget.
+            store.attach_handle(&tid, handle);
 
             Ok(format!(
                 "background task started — task_id: {}\n\nThe subagent runs in the background. Completion will be delivered automatically as a <system-reminder> at the start of your next turn. Do NOT poll task_status or sleep waiting — continue with other work.",

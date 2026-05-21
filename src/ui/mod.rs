@@ -823,6 +823,15 @@ pub async fn run_interactive(
                 }
             }
             if any_session_replaced {
+                // Cancel any in-flight background subagent tasks
+                // belonging to the previous session. Without this the
+                // tasks survive the swap, continue consuming API
+                // budget against a session their parent agent no
+                // longer sees, and would later try to notify a store
+                // whose recipient is gone.
+                if let Some(store) = bg_store.as_ref() {
+                    store.cancel_all();
+                }
                 // Repaint chat from the (possibly fresh) session so
                 // the user sees the new state. The agent runtime
                 // keeps the same model — reset_to_new / switch_session

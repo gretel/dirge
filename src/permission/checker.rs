@@ -501,16 +501,58 @@ fn resolve_absolute(path: &str, working_dir: &str) -> String {
             // `/safe/parent/../../etc/passwd` style attacks where
             // the parent exists but the leaf doesn't. If even the
             // parent doesn't canonicalize, fall back to the
-            // LEXICAL join (matches pre-F7 behavior so rules on
-            // not-yet-existing paths still match).
+            // LEXICALLY-NORMALIZED join. We do NOT return the raw
+            // lexical form: `Path::starts_with` matches by
+            // components, and a string like
+            // `/cwd/nonexistent/../../etc/passwd` whose first three
+            // components are `/cwd` would classify as internal even
+            // though the path actually escapes via `..`. Normalize
+            // `.` / `..` lexically first so the starts_with check
+            // sees the real prefix.
             if let (Some(parent), Some(name)) = (joined.parent(), joined.file_name())
                 && let Ok(canonical_parent) = std::fs::canonicalize(parent)
             {
                 return canonical_parent.join(name).to_string_lossy().to_string();
             }
-            joined.to_string_lossy().to_string()
+            lexical_normalize(&joined).to_string_lossy().to_string()
         }
     }
+}
+
+/// Resolve `.` and `..` components of `p` without touching the
+/// filesystem. `..` pops the previous `Normal` component; consecutive
+/// `..` at the start (i.e. attempting to climb above root) are
+/// retained as `..` so an attacker can't disguise an escape by
+/// chaining enough `..` to underflow a real-path prefix check.
+/// Doesn't follow symlinks — callers that need symlink resolution
+/// should use `std::fs::canonicalize`; this helper exists for the
+/// nonexistent-path fallback where canonicalize is impossible.
+fn lexical_normalize(p: &Path) -> std::path::PathBuf {
+    use std::path::{Component, PathBuf};
+    let mut out: Vec<Component> = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.last(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    // No Normal to pop (we're at root, or only
+                    // RootDir / Prefix / leading `..` so far) —
+                    // keep the `..` so the result reflects the
+                    // escape attempt rather than being silently
+                    // swallowed.
+                    out.push(c);
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    let mut buf = PathBuf::new();
+    for c in &out {
+        buf.push(c.as_os_str());
+    }
+    buf
 }
 
 #[cfg(test)]
@@ -580,6 +622,50 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         assert_eq!(resolved, expected);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression for audit C3: when BOTH `canonicalize(joined)` AND
+    /// `canonicalize(parent)` fail, the previous fallback returned
+    /// the joined path with `..` components intact. Since
+    /// `Path::starts_with` operates on path *components*, a crafted
+    /// path like `/cwd/nonexistent_subdir/../../etc/passwd` would
+    /// classify as internal because the first three components match
+    /// `/cwd`. Attacker (LLM/agent) can synthesize such a path
+    /// trivially. After the fix, `..` components are lexically
+    /// resolved before the fallback returns, so the path escapes
+    /// the cwd subtree.
+    #[test]
+    fn resolve_absolute_normalizes_dotdot_in_full_lexical_fallback() {
+        // Working dir exists; subdirectory does NOT, ensuring both
+        // canonicalize(joined) and canonicalize(parent) fail and we
+        // hit the LEXICAL fallback path.
+        let dir = std::env::temp_dir().join(format!("dirge-c3-traversal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_string_lossy().into_owned();
+
+        // Build a path that, when joined to cwd, looks "inside" lexically
+        // but actually escapes via `..` after a nonexistent intermediate.
+        // joined = <cwd>/no_such_dir/no_such_subdir/../../../etc/passwd
+        let traversal = "no_such_dir/no_such_subdir/../../../etc/passwd";
+
+        let resolved = resolve_absolute(traversal, &cwd);
+
+        // The escape attempt should NOT result in a path whose
+        // components start with the cwd path. We don't insist on
+        // exactly `/etc/passwd` (canonicalization of the cwd parent
+        // can vary by host), but the resolved path must not be a
+        // child of the cwd as the starts_with check would see it.
+        let cwd_canonical = std::fs::canonicalize(&cwd).unwrap();
+        let resolved_path = std::path::PathBuf::from(&resolved);
+        assert!(
+            !resolved_path.starts_with(&cwd_canonical) && !resolved_path.starts_with(&cwd),
+            "lexical-fallback path-traversal should escape cwd subtree; got {:?}, cwd {:?}",
+            resolved_path,
+            cwd_canonical,
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

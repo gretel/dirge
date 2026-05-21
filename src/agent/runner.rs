@@ -12,6 +12,18 @@ use crate::agent::tools::ToolCache;
 use crate::event::AgentEvent;
 use crate::session::{MessageRole, Session};
 
+/// Per-chunk read deadline for streaming provider responses. Applied
+/// to every `stream.next().await` in both the interactive and
+/// `run_print` paths. If the provider stalls mid-stream (TCP alive
+/// but no SSE events — common with overloaded proxies, dropped
+/// connections that never RST, hung server-side queues), the stream
+/// would otherwise block forever and freeze the agent. Treat a
+/// chunk timeout as a transient error so the retry loop in
+/// `spawn_agent` can classify it as `Network`, back off, and
+/// re-issue. 120s matches opencode's default and is well above any
+/// reasonable real chunk gap for streaming providers.
+const STREAM_CHUNK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Turn-boundary detector. Rig's multi-turn stream is a flat sequence
 /// of assistant content + tool results + a final response; consumers
 /// downstream (plugin hooks in P3, session-tree branch accounting in
@@ -256,7 +268,30 @@ where
         }
     }
 
-    while let Some(item) = stream.next().await {
+    loop {
+        let item = match tokio::time::timeout(STREAM_CHUNK_TIMEOUT, stream.next()).await {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(_) => {
+                // Chunk-read deadline hit. Surface as a transient
+                // network-style error so `spawn_agent` retries. The
+                // message shape matches what `classify_error` already
+                // treats as `Network` (substring "timeout").
+                flush_boundaries(turns.observe_stream_end(), event_tx).await;
+                // Phrasing intentionally uses "timed out" so the
+                // existing `recovery::classify_error` substring match
+                // routes this to `ErrorKind::Network` and the retry
+                // loop picks it up — same as "connection timed out"
+                // from reqwest. Without "timed out" in the message
+                // this would fall through to `Other` and surface as
+                // a hard failure.
+                outcome.error = Some(format!(
+                    "stream chunk timed out after {}s (provider stalled or connection silently dropped)",
+                    STREAM_CHUNK_TIMEOUT.as_secs(),
+                ));
+                return outcome;
+            }
+        };
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
                 flush_boundaries(turns.observe_assistant_content(), event_tx).await;
@@ -489,7 +524,22 @@ where
 
     let mut full_response = String::new();
 
-    while let Some(item) = stream.next().await {
+    loop {
+        let item = match tokio::time::timeout(STREAM_CHUNK_TIMEOUT, stream.next()).await {
+            Ok(Some(item)) => item,
+            Ok(None) => break,
+            Err(_) => {
+                // run_print has no retry loop today (audit H3 will
+                // wire one in); a chunk timeout here surfaces to the
+                // user as an error and ends the run. Still strictly
+                // better than hanging forever.
+                eprintln!(
+                    "Error: stream chunk timed out after {}s (provider stalled or connection silently dropped)",
+                    STREAM_CHUNK_TIMEOUT.as_secs(),
+                );
+                break;
+            }
+        };
         match item {
             Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
                 full_response.push_str(&text.text);

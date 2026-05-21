@@ -1420,7 +1420,34 @@ pub fn copy_to_clipboard(text: &str) {
                 let _ = stdin.write_all(text.as_bytes());
                 let _ = stdin.flush();
             }
-            let _ = child.wait();
+            // Bounded wait so a wedged helper (broken XWayland,
+            // frozen compositor, missing $DISPLAY for xclip) can't
+            // freeze the TUI on a copy keystroke. ~2s is generous —
+            // a healthy `pbcopy`/`wl-copy`/`xclip` returns in ms.
+            // On expiry we SIGKILL the child and move on; the user
+            // sees no immediate feedback but the editor stays
+            // responsive.
+            const CLIP_WAIT_LIMIT: std::time::Duration =
+                std::time::Duration::from_millis(2000);
+            let poll_interval = std::time::Duration::from_millis(25);
+            let deadline = std::time::Instant::now() + CLIP_WAIT_LIMIT;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            // Reap the now-killed child so we don't
+                            // leave a zombie behind. Ignore errors —
+                            // best-effort cleanup.
+                            let _ = child.wait();
+                            break;
+                        }
+                        std::thread::sleep(poll_interval);
+                    }
+                    Err(_) => break,
+                }
+            }
             return;
         }
     }

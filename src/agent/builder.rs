@@ -102,7 +102,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         preamble.push_str(&format!("\nShell: {}", shell));
     }
 
-    let git_branch = tokio::task::spawn_blocking(|| {
+    // Bounded git lookup. `git rev-parse` can hang for many seconds
+    // when the repo's `.git` lives on a wedged NFS mount, the
+    // `core.fsmonitor` daemon is stalled, or a `.gitconfig` `[include]`
+    // points at a path that itself blocks (e.g. another stalled
+    // network mount). 2 s is well over a healthy local `git` (≪ 50 ms)
+    // — anything longer is the user's git misbehaving, and we'd
+    // rather show the banner without a branch than hang dirge's
+    // entire startup.
+    let git_branch_fut = tokio::task::spawn_blocking(|| {
         std::process::Command::new("git")
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
             .output()
@@ -119,9 +127,17 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
                     None
                 }
             })
-    })
-    .await
-    .unwrap_or(None);
+    });
+    let git_branch =
+        match tokio::time::timeout(std::time::Duration::from_secs(2), git_branch_fut).await {
+            Ok(Ok(branch)) => branch,
+            // spawn_blocking JoinError or wall-clock expiry: degrade
+            // gracefully. The spawned thread keeps running in the
+            // background until git returns; we simply stop awaiting
+            // it. No leak — once the OS kernel reaps the git child,
+            // the thread exits naturally.
+            _ => None,
+        };
 
     if let Some(branch) = git_branch {
         preamble.push_str(&format!("\nGit branch: {}", branch));

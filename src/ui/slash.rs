@@ -382,6 +382,14 @@ pub async fn handle_slash(
                 } else if sessions.len() == 1 {
                     if let Some(s) = sessions.into_iter().next() {
                         let msg_count = s.messages.len();
+                        // Cancel any in-flight background subagent
+                        // tasks belonging to the previous session
+                        // before swapping it out. Otherwise they
+                        // would keep consuming API budget against a
+                        // session their parent agent no longer sees.
+                        if let Some(store) = bg_store.as_ref() {
+                            store.cancel_all();
+                        }
                         *session = s;
                         // Restore the prompt that was active when the
                         // session was saved. Without this, `/sessions
