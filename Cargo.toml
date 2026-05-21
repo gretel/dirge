@@ -29,6 +29,9 @@ semantic-clojure = ["semantic", "dep:tree-sitter-clojure"]
 semantic-go = ["semantic", "dep:tree-sitter-go"]
 semantic-ruby = ["semantic", "dep:tree-sitter-ruby"]
 semantic-rust = ["semantic", "dep:tree-sitter-rust"]
+semantic-java = ["semantic", "dep:tree-sitter-java"]
+semantic-c = ["semantic", "dep:tree-sitter-c"]
+semantic-cpp = ["semantic", "dep:tree-sitter-cpp"]
 plugin = ["dep:janetrs"]
 lsp = ["dep:lsp-types"]
 
@@ -79,6 +82,9 @@ tree-sitter-clojure = { version = "0.1", optional = true }
 tree-sitter-go = { version = "0.25", optional = true }
 tree-sitter-ruby = { version = "0.23", optional = true }
 tree-sitter-rust = { version = "0.24", optional = true }
+tree-sitter-java = { version = "0.23", optional = true }
+tree-sitter-c = { version = "0.24", optional = true }
+tree-sitter-cpp = { version = "0.23", optional = true }
 streaming-iterator = { version = "0.1", optional = true }
 janetrs = { version = "0.8", optional = true }
 html2text = "0.17"
