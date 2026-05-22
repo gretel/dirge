@@ -517,52 +517,94 @@ where
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
     P: rig::agent::PromptHook<M> + 'static,
 {
-    let mut stream = agent
-        .stream_chat(prompt.to_string(), Vec::<Message>::new())
-        .multi_turn(max_turns)
-        .await;
-
-    let mut full_response = String::new();
-
+    // Retry loop. Print mode (`dirge --print "..."`) is commonly used
+    // in scripts and CI where a single transient 502 or rate-limit
+    // would otherwise turn a 5-line shell snippet into a flaky one.
+    // Use the same RecoveryPolicy as the interactive path.
+    //
+    // Caveat: we only retry when NO bytes of the response have been
+    // emitted to stdout yet. Once a byte is out, retrying would
+    // duplicate visible output — better to surface the error and let
+    // the script decide whether to re-run. This matches what
+    // opencode does for its non-interactive path.
+    let policy = RecoveryPolicy::default();
+    let mut attempts: usize = 0;
     loop {
-        let item = match tokio::time::timeout(STREAM_CHUNK_TIMEOUT, stream.next()).await {
-            Ok(Some(item)) => item,
-            Ok(None) => break,
-            Err(_) => {
-                // run_print has no retry loop today (audit H3 will
-                // wire one in); a chunk timeout here surfaces to the
-                // user as an error and ends the run. Still strictly
-                // better than hanging forever.
-                eprintln!(
-                    "Error: stream chunk timed out after {}s (provider stalled or connection silently dropped)",
-                    STREAM_CHUNK_TIMEOUT.as_secs(),
-                );
-                break;
-            }
-        };
-        match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
-                full_response.push_str(&text.text);
-                print!("{}", text.text);
-                let _ = std::io::Write::flush(&mut std::io::stdout());
-            }
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Reasoning(
-                r,
-            ))) => {
-                eprint!("{}", r.display_text());
-                let _ = std::io::Write::flush(&mut std::io::stderr());
-            }
-            Ok(MultiTurnStreamItem::FinalResponse(_)) => break,
-            Ok(_) => {}
-            Err(e) => {
-                eprintln!("Error: {}", e);
-                break;
+        let mut stream = agent
+            .stream_chat(prompt.to_string(), Vec::<Message>::new())
+            .multi_turn(max_turns)
+            .await;
+
+        let mut full_response = String::new();
+        let mut had_output = false;
+        let mut stream_error: Option<String> = None;
+
+        loop {
+            let item = match tokio::time::timeout(STREAM_CHUNK_TIMEOUT, stream.next()).await {
+                Ok(Some(item)) => item,
+                Ok(None) => break,
+                Err(_) => {
+                    stream_error = Some(format!(
+                        "stream chunk timed out after {}s (provider stalled or connection silently dropped)",
+                        STREAM_CHUNK_TIMEOUT.as_secs(),
+                    ));
+                    break;
+                }
+            };
+            match item {
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Text(text),
+                )) => {
+                    full_response.push_str(&text.text);
+                    print!("{}", text.text);
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    had_output = true;
+                }
+                Ok(MultiTurnStreamItem::StreamAssistantItem(
+                    StreamedAssistantContent::Reasoning(r),
+                )) => {
+                    eprint!("{}", r.display_text());
+                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                }
+                Ok(MultiTurnStreamItem::FinalResponse(_)) => break,
+                Ok(_) => {}
+                Err(e) => {
+                    stream_error = Some(e.to_string());
+                    break;
+                }
             }
         }
-    }
 
-    println!();
-    Ok(full_response)
+        if let Some(msg) = stream_error {
+            let kind = recovery::classify_error(&msg);
+            if !had_output && policy.should_retry(attempts, kind) {
+                let delay = policy.backoff_duration_for_msg(attempts, &msg);
+                eprintln!(
+                    "(retry {}/{} in {:.1}s — {:?})",
+                    attempts + 1,
+                    policy.max_retries(),
+                    delay.as_secs_f64(),
+                    kind,
+                );
+                tokio::time::sleep(delay).await;
+                attempts += 1;
+                continue;
+            }
+            // Either we already wrote bytes to stdout (can't safely
+            // retry without duplicating) or the retry policy says
+            // give up. Newline-terminate any in-flight output before
+            // the error so the diagnostic doesn't share a line with
+            // half a response.
+            if had_output {
+                println!();
+            }
+            eprintln!("Error: {}", msg);
+            return Err(anyhow::anyhow!("{}", msg));
+        }
+
+        println!();
+        return Ok(full_response);
+    }
 }
 
 #[cfg(test)]
