@@ -21,6 +21,44 @@
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Display width of `s` with ANSI SGR escape sequences treated as
+/// zero-width. The terminal interprets `\x1b[…m` as state changes
+/// (color / bold / underline) without emitting visible characters,
+/// so they must not count toward wrap budgets or chamber padding.
+/// `UnicodeWidthStr::width` alone counts `[31m` as 4 visible cells
+/// because the ESC byte gets width 0 but the bracketed payload is
+/// ordinary ASCII — that miscount caused chamber rows with embedded
+/// SGR (diff backgrounds, syntax highlighting) to wrap or pad wrong.
+pub fn visible_width(s: &str) -> usize {
+    let bytes = s.as_bytes();
+    let mut total = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            // CSI sequence. Skip to a final byte (0x40..=0x7E).
+            let mut j = i + 2;
+            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                j += 1;
+            }
+            i = j.saturating_add(1).min(bytes.len());
+            continue;
+        }
+        let step = match bytes[i] {
+            b if b < 0x80 => 1,
+            b if b < 0xC0 => 1,
+            b if b < 0xE0 => 2,
+            b if b < 0xF0 => 3,
+            _ => 4,
+        };
+        let end = (i + step).min(bytes.len());
+        if let Some(ch) = s[i..end].chars().next() {
+            total += ch.width().unwrap_or(0);
+        }
+        i = end;
+    }
+    total
+}
+
 /// Soft-wrap `text` to `max_width` columns. Returns one entry per
 /// visual line. Hard newlines in the input become hard line breaks
 /// in the output.
@@ -107,8 +145,15 @@ fn wrap_logical_line(
             max_width.saturating_sub(cont_w)
         };
 
-        let tok_w = UnicodeWidthStr::width(token.text);
-        let ws_w = UnicodeWidthStr::width(token.leading_ws);
+        // ANSI-aware widths: `visible_width` skips `\x1b[…m` SGR
+        // sequences so a token like `\x1b[48;5;52m-text\x1b[49m`
+        // contributes only its visible character cells to the wrap
+        // budget. Chamber rows that embed bg-color escapes were
+        // being over-counted by 15+ cells per row and falsely
+        // wrapped (which broke the escape from its closer, leaving
+        // literal `[48;5;52m` text visible on the next row).
+        let tok_w = visible_width(token.text);
+        let ws_w = visible_width(token.leading_ws);
 
         // Start of a new row. Preserve leading whitespace on the
         // FIRST row of a logical line (callers commonly indent their
@@ -258,6 +303,12 @@ fn utf8_char_len(first_byte: u8) -> usize {
 /// overflows. The first row uses `first_budget`, every subsequent
 /// row uses `continuation_budget` (which already excludes the
 /// continuation indent width).
+///
+/// ANSI-aware: when we see an `\x1b[…m` SGR sequence, the whole
+/// sequence is appended to `current` as zero-width content. This
+/// keeps escape sequences atomic — a wrap mid-escape would leave
+/// the terminal with a broken open SGR and the closing payload
+/// would render as literal text on the next row.
 #[allow(clippy::too_many_arguments)]
 fn break_long_token(
     token: &str,
@@ -269,11 +320,24 @@ fn break_long_token(
     cont_indent: &str,
     is_first_row: &mut bool,
 ) {
+    let bytes = token.as_bytes();
     let mut remaining_budget = first_budget;
-    for ch in token.chars() {
+    let mut i = 0;
+    while i < bytes.len() {
+        // Atomic ANSI SGR copy: ESC `[` … final-byte.
+        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+            let mut j = i + 2;
+            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
+                j += 1;
+            }
+            let end = j.saturating_add(1).min(bytes.len());
+            current.push_str(&token[i..end]);
+            i = end;
+            continue;
+        }
+        let ch = token[i..].chars().next().unwrap_or('\u{FFFD}');
         let cw = ch.width().unwrap_or(0);
         if cw > remaining_budget {
-            // Row full. Flush + start a new continuation row.
             if *is_first_row {
                 out.push(std::mem::take(current));
                 *is_first_row = false;
@@ -290,6 +354,7 @@ fn break_long_token(
         current.push(ch);
         *current_w += cw;
         remaining_budget = remaining_budget.saturating_sub(cw);
+        i += ch.len_utf8();
     }
 }
 
@@ -418,5 +483,43 @@ mod tests {
     fn preserves_leading_whitespace_only_line() {
         let out = soft_wrap("  ", 80, "");
         assert_eq!(out[0], "  ");
+    }
+
+    /// User bug: chamber_row_with_bg embeds `\x1b[48;5;52m…\x1b[49m`.
+    /// `UnicodeWidthStr::width` counts the bracketed payload as
+    /// visible cells, so soft_wrap previously thought the row was
+    /// 15+ cells wider than max_width and split it — breaking the
+    /// escape from its closer and leaving literal `[49m` text on
+    /// the next row.
+    #[test]
+    fn visible_width_skips_ansi_sgr() {
+        // Plain text reference.
+        let plain = "-    // ng_max = ceil(32 / 8) = 4";
+        // Same content wrapped in bg-color SGR + reset.
+        let styled = format!("\x1b[48;5;52m{}\x1b[49m", plain);
+        let pw = visible_width(plain);
+        let sw = visible_width(&styled);
+        assert_eq!(pw, sw, "SGR escapes must not contribute to width");
+    }
+
+    /// Soft-wrap a chamber-row-shaped string that's already padded
+    /// to exactly `max_width` cells of VISIBLE content but carries
+    /// 15+ chars of SGR escapes. It must NOT split into two rows.
+    #[test]
+    fn ansi_padded_row_does_not_overwrap() {
+        let inner = 60;
+        // Visible width: 1 (`-`) + 4 (pad) + visible text + trailing
+        // pad = exactly `inner`. Wrap into 60-wide rows.
+        let visible_content: String = format!("-text{}", " ".repeat(inner - 5));
+        assert_eq!(visible_width(&visible_content), inner);
+        let row = format!("│ \x1b[48;5;52m{}\x1b[49m │", visible_content);
+        // The full chamber row is `inner + 4` cells wide (visible).
+        let out = soft_wrap(&row, inner + 4, "");
+        assert_eq!(
+            out.len(),
+            1,
+            "row with embedded SGR must not split: got {} rows",
+            out.len()
+        );
     }
 }

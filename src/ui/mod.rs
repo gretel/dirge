@@ -4139,6 +4139,14 @@ fn chamber_bottom(frame_w: usize) -> String {
 fn chamber_row(content: &str, inner: usize) -> String {
     use unicode_width::UnicodeWidthChar;
     use unicode_width::UnicodeWidthStr;
+    // Expand tabs to spaces before measuring. `\t` has Unicode width
+    // 0 but the terminal renders it as advance-to-next-tabstop
+    // (typically 8 cells). The previous behavior under-counted the
+    // visible row width and the right `│` drifted right by the
+    // tab-expansion delta. Hardcode tab-stop at 4 (common in code
+    // display); the visual artifact is bounded.
+    let content_expanded = expand_tabs(content, 4);
+    let content = content_expanded.as_str();
     let total_w = UnicodeWidthStr::width(content);
     let (trimmed, trimmed_w): (String, usize) = if total_w <= inner {
         (content.to_string(), total_w)
@@ -4165,6 +4173,32 @@ fn chamber_row(content: &str, inner: usize) -> String {
     format!("│ {}{} │", trimmed, " ".repeat(pad))
 }
 
+/// Expand `\t` to spaces honoring a fixed tab stop. Walks the string
+/// tracking the column so a tab N cells before the next stop expands
+/// to exactly `stop - (col % stop)` spaces — same shape as `expand(1)`
+/// or what most terminals do. Cheap and self-contained; callers use
+/// it before width measurement / chamber padding.
+fn expand_tabs(s: &str, tab_stop: usize) -> String {
+    if !s.contains('\t') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut col = 0usize;
+    for ch in s.chars() {
+        if ch == '\t' {
+            let pad = tab_stop - (col % tab_stop);
+            for _ in 0..pad {
+                out.push(' ');
+            }
+            col += pad;
+        } else {
+            out.push(ch);
+            col += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        }
+    }
+    out
+}
+
 /// Background-tinted chamber row for diff `+`/`-` lines. Emits raw
 /// SGR `48;5;{bg}` background sequence inside the row so the diff
 /// tint fills the inner width; the left + right border glyphs sit
@@ -4175,6 +4209,11 @@ fn chamber_row(content: &str, inner: usize) -> String {
 /// scanability. We approximate that with the 256-color palette:
 /// dim green (22) for adds, dim red (52) for removes.
 fn chamber_row_with_bg(content: &str, inner: usize, bg_idx: u8) -> String {
+    // Same tab-expansion as `chamber_row` so diff `+`/`-` lines with
+    // leading tabs don't drift the right border. Bug surfaced in
+    // real-world C/C++ diffs where the source uses tab indentation.
+    let content_expanded = expand_tabs(content, 4);
+    let content = content_expanded.as_str();
     let chars: Vec<char> = content.chars().collect();
     let trimmed: String = if chars.len() <= inner {
         chars.iter().collect()
@@ -5187,5 +5226,59 @@ mod tests {
         let s = with_queue("running".to_string(), 3);
         assert!(s.ends_with("q:3"));
         assert!(s.starts_with("running"));
+    }
+
+    /// User bug: `read` output containing a tab caused the chamber's
+    /// right border to drift right. `\t` has Unicode width 0 but the
+    /// terminal renders it as 4+ cells, so width-based padding
+    /// undercounted. The fix expands tabs to spaces (stop=4) before
+    /// measurement so the right `│` lands at the expected column.
+    #[test]
+    fn chamber_row_right_border_aligns_with_tabs() {
+        use unicode_width::UnicodeWidthStr;
+        let inner = 60;
+        // Three rows: no tab, one tab at start, tab embedded mid-line.
+        // After tab-expansion all should produce equal display width.
+        let rows = [
+            chamber_row("plain text", inner),
+            chamber_row("\tindented", inner),
+            chamber_row("2:\t(cd ..; make library)", inner),
+        ];
+        let widths: Vec<usize> = rows
+            .iter()
+            .map(|r| UnicodeWidthStr::width(r.as_str()))
+            .collect();
+        // All rows occupy exactly `inner + 4` cells (`│ ` + inner + ` │`).
+        let expected = inner + 4;
+        for (r, w) in rows.iter().zip(widths.iter()) {
+            assert_eq!(
+                *w, expected,
+                "chamber row width mismatch — content {r:?} measured {w} cells, want {expected}"
+            );
+        }
+        // Sanity: every row ends with `│` (right border didn't get
+        // pushed off into oblivion by under-padded tab).
+        for r in &rows {
+            assert!(r.ends_with('│'), "row {r:?} missing right border");
+        }
+    }
+
+    /// `chamber_row_with_bg` gets the same tab-expansion treatment so
+    /// diff `+`/`-` lines whose source uses tab indentation also
+    /// align correctly.
+    #[test]
+    fn chamber_row_with_bg_right_border_aligns_with_tabs() {
+        use unicode_width::UnicodeWidthStr;
+        let inner = 60;
+        let row = chamber_row_with_bg("+\tadded line", inner, 22);
+        // chamber_row_with_bg wraps content in SGR escapes; the
+        // visible width should still be inner + 4.
+        let visible = crate::ui::wrap::visible_width(&row);
+        assert_eq!(visible, inner + 4);
+        // Plain UnicodeWidthStr counts SGR payload too, but the
+        // visible-width helper from `wrap.rs` is the right tool.
+        // Sanity-only width assertion via the visible helper.
+        let _ = UnicodeWidthStr::width(row.as_str());
+        assert!(row.ends_with('│'));
     }
 }
