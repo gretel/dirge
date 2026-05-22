@@ -274,66 +274,84 @@ async fn h7_scenario_2_turn_boundaries() {
 /// **Scenario 5 (slim)** — error path: invalid API key surfaces
 /// as an Error event (not a panic, not silent).
 ///
-/// Forces an Auth error by temporarily masking the key. This is
-/// in-test env mutation — relies on no parallel tests running
-/// against the same key. We use a process-wide env var override
-/// inside the test.
+/// Uses `create_client`'s explicit `api_key` parameter to inject
+/// a known-bad key WITHOUT mutating the process env (earlier
+/// versions of this test mutated `DEEPSEEK_API_KEY` and raced
+/// with parallel tests reading the same var).
 #[tokio::test]
-#[ignore = "requires provider API key (uses env)"]
+#[ignore = "requires provider API key"]
 async fn h7_scenario_5_auth_error_surfaces() {
-    let original = match std::env::var("DEEPSEEK_API_KEY") {
-        Ok(v) => Some(v),
-        Err(_) => {
-            eprintln!("[skipped] need DEEPSEEK_API_KEY to override");
+    // Skip if no provider is configured at all.
+    let provider = match detect_provider() {
+        Some(p) => p,
+        None => {
+            eprintln!("[skipped] no API key");
             return;
         }
     };
-    // Set a known-invalid key.
-    // SAFETY: tests run with parallel=false implicitly because of
-    // mutex around env vars in the rest of the suite; this
-    // mutation is reverted at the end of the test even on panic.
-    unsafe {
-        std::env::set_var("DEEPSEEK_API_KEY", "invalid-key-for-h7-test");
-    }
-    let result = std::panic::AssertUnwindSafe(async {
-        let stream_fn = build_stream_fn().expect("build stream_fn with bad key");
-        let cfg = LoopSpawnConfig {
-            stream_fn,
-            system_prompt: String::new(),
-            history: Vec::new(),
-            initial_prompt: "hi".to_string(),
-            tools: Vec::new(),
-            #[cfg(feature = "plugin")]
-            plugin_mgr: None,
-            steering_queue: None,
-            tool_execution: crate::agent::agent_loop::types::ToolExecutionMode::Parallel,
-            event_channel_capacity: 256,
-        };
-        let runner = spawn_loop_runner(cfg).into_agent_runner();
-        let (events, _) = drain_to_done(runner).await;
-        dump_events(&events);
-        // Auth error → either Error event (non-retryable
-        // classification per recovery::classify_error) OR Done
-        // with an empty / error-formatted response. The retry
-        // wrapper's classification routes Auth → no retry.
-        let had_error = events
-            .iter()
-            .any(|e| matches!(e, AgentEvent::Error(_) | AgentEvent::ContextOverflow { .. }));
-        assert!(
-            had_error,
-            "expected Error or ContextOverflow event for invalid key"
-        );
-    })
-    .await;
+    let model_name = default_model(provider);
 
-    // Restore original key.
-    unsafe {
-        if let Some(v) = original {
-            std::env::set_var("DEEPSEEK_API_KEY", v);
+    // Build the client with an EXPLICIT bad key (overrides
+    // env). `create_client` takes Option<&str> for this exact
+    // case.
+    let client = match crate::provider::create_client(
+        provider,
+        Some("invalid-key-for-h7-test"),
+        &std::collections::HashMap::new(),
+    ) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[skipped] create_client failed: {e}");
+            return;
         }
-    }
-    // Re-raise panic if the inner block panicked.
-    let _ = result; // suppress warning; AssertUnwindSafe drops without catch
+    };
+    let any_model = client.completion_model(model_name);
+    let chunk_timeout = Some(std::time::Duration::from_secs(60));
+    let inner = match any_model {
+        crate::provider::AnyModel::DeepSeek(m) => {
+            rig_stream_fn_from_model(m, vec![], chunk_timeout)
+        }
+        crate::provider::AnyModel::OpenAI(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
+        crate::provider::AnyModel::Anthropic(m) => {
+            rig_stream_fn_from_model(m, vec![], chunk_timeout)
+        }
+        crate::provider::AnyModel::OpenRouter(m) => {
+            rig_stream_fn_from_model(m, vec![], chunk_timeout)
+        }
+        _ => {
+            eprintln!("[skipped] unsupported provider variant for this scenario");
+            return;
+        }
+    };
+    let stream_fn = retrying_stream_fn(inner, RecoveryPolicy::default());
+
+    let cfg = LoopSpawnConfig {
+        stream_fn,
+        system_prompt: String::new(),
+        history: Vec::new(),
+        initial_prompt: "hi".to_string(),
+        tools: Vec::new(),
+        #[cfg(feature = "plugin")]
+        plugin_mgr: None,
+        steering_queue: None,
+        tool_execution: crate::agent::agent_loop::types::ToolExecutionMode::Parallel,
+        event_channel_capacity: 256,
+    };
+    let runner = spawn_loop_runner(cfg).into_agent_runner();
+    let (events, _) = drain_to_done(runner).await;
+    dump_events(&events);
+
+    // Auth error → either Error event (non-retryable
+    // classification per recovery::classify_error) OR Done
+    // with an empty / error-formatted response. The retry
+    // wrapper routes Auth → no retry.
+    let had_error = events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::Error(_) | AgentEvent::ContextOverflow { .. }));
+    assert!(
+        had_error,
+        "expected Error or ContextOverflow event for invalid key"
+    );
 }
 
 /// **Scenario 3 (slim)** — tool dispatch against a real LLM.
@@ -501,6 +519,213 @@ async fn h7_scenario_3_tool_dispatch() {
     assert!(
         final_resp.to_lowercase().contains("pineapple"),
         "expected final response to reference 'pineapple'; got: {final_resp:?}"
+    );
+}
+
+// =====================================================================
+// GLM (Zhipu) scenarios. The key lives in ZHIPU_API_KEY in this
+// environment; dirge's create_client reads GLM_API_KEY. We alias
+// at the test boundary.
+// =====================================================================
+
+/// Build a StreamFn explicitly for GLM with the glm-5.1 model.
+/// Reads the key from ZHIPU_API_KEY (or GLM_API_KEY) and passes
+/// it through `create_client`'s explicit `api_key` arg — NO env
+/// mutation, so this is safe to run in parallel with other
+/// smoke tests.
+fn build_glm_stream_fn() -> Option<crate::agent::agent_loop::StreamFn> {
+    use crate::provider::AnyModel;
+    use std::collections::HashMap;
+
+    let key = match std::env::var("ZHIPU_API_KEY").or_else(|_| std::env::var("GLM_API_KEY")) {
+        Ok(k) => k,
+        Err(_) => {
+            eprintln!("[skipped] need ZHIPU_API_KEY or GLM_API_KEY");
+            return None;
+        }
+    };
+
+    let model_name = "glm-5.1";
+    let client = match crate::provider::create_client("glm", Some(key.as_str()), &HashMap::new()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[h7-smoke] failed to build glm client: {e}");
+            return None;
+        }
+    };
+    let any_model = client.completion_model(model_name);
+
+    let chunk_timeout = Some(std::time::Duration::from_secs(60));
+    let stream_fn = match any_model {
+        AnyModel::Glm(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
+        _ => {
+            eprintln!("[h7-smoke] expected AnyModel::Glm");
+            return None;
+        }
+    };
+
+    eprintln!("[h7-smoke] using provider=glm model={model_name}");
+    Some(retrying_stream_fn(stream_fn, RecoveryPolicy::default()))
+}
+
+/// GLM Scenario 1 — simple text Q&A.
+#[tokio::test]
+#[ignore = "requires ZHIPU_API_KEY"]
+async fn h7_glm_scenario_1_simple_text() {
+    let stream_fn = match build_glm_stream_fn() {
+        Some(f) => f,
+        None => return,
+    };
+    let cfg = LoopSpawnConfig {
+        stream_fn,
+        system_prompt: "You are a helpful assistant. Reply concisely.".to_string(),
+        history: Vec::new(),
+        initial_prompt: "What is 2+2? Reply with just the number, nothing else.".to_string(),
+        tools: Vec::new(),
+        #[cfg(feature = "plugin")]
+        plugin_mgr: None,
+        steering_queue: None,
+        tool_execution: crate::agent::agent_loop::types::ToolExecutionMode::Parallel,
+        event_channel_capacity: 256,
+    };
+    let runner = spawn_loop_runner(cfg).into_agent_runner();
+    let (events, response) = drain_to_done(runner).await;
+    dump_events(&events);
+
+    let done = response.unwrap_or_default();
+    assert!(
+        done.contains('4'),
+        "expected response to contain '4', got: {done:?}"
+    );
+    for e in &events {
+        if let AgentEvent::Error(msg) = e {
+            panic!("unexpected Error: {msg}");
+        }
+    }
+}
+
+/// GLM Scenario 3 — tool dispatch. Uses the same inline echo
+/// tool as the DeepSeek scenario but routed through GLM.
+#[tokio::test]
+#[ignore = "requires ZHIPU_API_KEY"]
+async fn h7_glm_scenario_3_tool_dispatch() {
+    use crate::agent::agent_loop::result::LoopToolResult as ResultT;
+    use crate::agent::agent_loop::tool::{AbortSignal, LoopToolUpdate};
+    use crate::agent::agent_loop::{LoopTool, loop_tool_to_rig_definition};
+    use serde_json::Value;
+    use std::pin::Pin;
+
+    let key = match std::env::var("ZHIPU_API_KEY").or_else(|_| std::env::var("GLM_API_KEY")) {
+        Ok(k) => k,
+        Err(_) => {
+            eprintln!("[skipped] need ZHIPU_API_KEY or GLM_API_KEY");
+            return;
+        }
+    };
+
+    #[derive(Debug)]
+    struct EchoTool;
+    impl LoopTool for EchoTool {
+        fn name(&self) -> &str {
+            "echo_tool"
+        }
+        fn description(&self) -> &str {
+            "Echo the given text back. Use this when asked to echo something."
+        }
+        fn label(&self) -> &str {
+            "Echo"
+        }
+        fn parameters(&self) -> &Value {
+            static P: std::sync::OnceLock<Value> = std::sync::OnceLock::new();
+            P.get_or_init(|| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "Text to echo"}
+                    },
+                    "required": ["text"]
+                })
+            })
+        }
+        fn execute<'a>(
+            &'a self,
+            _id: &'a str,
+            args: Value,
+            _signal: AbortSignal,
+            _on_update: LoopToolUpdate,
+        ) -> Pin<Box<dyn Future<Output = Result<ResultT, String>> + Send + 'a>> {
+            Box::pin(async move {
+                let text = args
+                    .get("text")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(none)")
+                    .to_string();
+                Ok(ResultT {
+                    content: vec![serde_json::json!({
+                        "type": "text",
+                        "text": format!("ECHO: {text}"),
+                    })],
+                    details: Value::Null,
+                    terminate: None,
+                })
+            })
+        }
+    }
+
+    let tool = Arc::new(EchoTool) as Arc<dyn LoopTool>;
+    let tool_def = loop_tool_to_rig_definition(tool.as_ref());
+
+    let client = crate::provider::create_client(
+        "glm",
+        Some(key.as_str()),
+        &std::collections::HashMap::new(),
+    )
+    .expect("client");
+    let any_model = client.completion_model("glm-5.1");
+    let chunk_timeout = Some(std::time::Duration::from_secs(60));
+    let inner = match any_model {
+        crate::provider::AnyModel::Glm(m) => {
+            rig_stream_fn_from_model(m, vec![tool_def], chunk_timeout)
+        }
+        _ => panic!("expected Glm variant"),
+    };
+    let stream_fn = retrying_stream_fn(inner, RecoveryPolicy::default());
+
+    eprintln!("[h7-smoke] glm tool-dispatch test");
+    let cfg = LoopSpawnConfig {
+        stream_fn,
+        system_prompt: "You have access to an echo_tool that echoes text back. \
+                        When the user asks you to echo something, USE THE TOOL — \
+                        do not just reply with the text directly. After calling \
+                        the tool, briefly confirm what was echoed."
+            .to_string(),
+        history: Vec::new(),
+        initial_prompt: "Echo the word 'pineapple'.".to_string(),
+        tools: vec![tool],
+        #[cfg(feature = "plugin")]
+        plugin_mgr: None,
+        steering_queue: None,
+        tool_execution: crate::agent::agent_loop::types::ToolExecutionMode::Sequential,
+        event_channel_capacity: 256,
+    };
+    let runner = spawn_loop_runner(cfg).into_agent_runner();
+    let (events, response) = drain_to_done(runner).await;
+    dump_events(&events);
+
+    let tool_calls = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolCall { .. }))
+        .count();
+    let tool_results = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::ToolResult { .. }))
+        .count();
+    assert!(tool_calls >= 1, "expected echo_tool call from GLM, got 0");
+    assert_eq!(tool_calls, tool_results, "call/result count mismatch");
+    let final_resp = response.unwrap_or_default();
+    assert!(
+        final_resp.to_lowercase().contains("pineapple"),
+        "expected 'pineapple' in final response; got: {final_resp:?}"
     );
 }
 
