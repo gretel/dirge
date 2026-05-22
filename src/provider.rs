@@ -487,6 +487,11 @@ impl AnyAgent {
     /// definitions. Used by the new loop path (`spawn_loop_runner`)
     /// to drive a real LLM through the ported agent_loop.
     ///
+    /// `#[allow(dead_code)]` is transitional — production caller
+    /// (replacing the rig multi-turn path inside
+    /// `spawn_runner`) lands in phase 4.5h-6. Until then this
+    /// method is exercised only by the in-module tests.
+    ///
     /// Dispatch is a match over `AnyAgentInner`; each variant
     /// extracts its provider-specific `Arc<M>` and threads it
     /// through `rig_stream_fn_from_model::<M>`. The Arc deref +
@@ -501,7 +506,7 @@ impl AnyAgent {
     /// each `Arc<dyn LoopTool>` to a rig `ToolDefinition` via
     /// `agent_loop::loop_tool_to_rig_definition` before calling
     /// this method.
-    #[cfg(feature = "agent-loop")]
+    #[allow(dead_code)]
     pub fn build_stream_fn(
         &self,
         tools: Vec<rig::completion::ToolDefinition>,
@@ -747,7 +752,6 @@ mod tests {
     /// (the variant `AnyAgentInner::OpenAI` holds); the default
     /// `completion_model` on a fresh `Client` returns the
     /// responses-api model, which is a different type.
-    #[cfg(feature = "agent-loop")]
     fn build_openai_any_agent() -> AnyAgent {
         use rig::providers::openai;
         let client = openai::Client::new("test-key")
@@ -766,7 +770,6 @@ mod tests {
     /// `StreamFn` for the OpenAI variant. Compile-time check —
     /// if the bounds don't match the type would fail to
     /// construct.
-    #[cfg(feature = "agent-loop")]
     #[test]
     fn build_stream_fn_returns_send_sync_static() {
         fn assert_send_sync_static<T: Send + Sync + 'static>(_: &T) {}
@@ -778,7 +781,6 @@ mod tests {
     /// `build_stream_fn` is callable as a `Fn` (multi-call) —
     /// the loop invokes it once per turn. Verify by calling
     /// twice and checking both invocations produce streams.
-    #[cfg(feature = "agent-loop")]
     #[tokio::test]
     async fn build_stream_fn_is_multi_callable() {
         use crate::agent::agent_loop::LlmContext;
@@ -819,7 +821,6 @@ mod tests {
     /// `build_stream_fn`, the build breaks. Runtime
     /// dispatch is exercised by the OpenAI-backed tests
     /// above.
-    #[cfg(feature = "agent-loop")]
     #[test]
     fn build_stream_fn_covers_all_variants_compile_time() {
         // Just constructs one variant and calls

@@ -13,13 +13,14 @@
 //! divergences can be audited against the reference. Pi is the spec —
 //! we're not redesigning, we're porting.
 
-// Phase 0 lands the type surface but no production caller yet — phase
-// 1+ wires this up. The dead-code lint is correctly noting "deliberate
-// API surface with no consumer"; silenced at the module level until
-// phase 4 flips the feature default.
+// Module-level allows cover the transitional state: 4.5h-1 through
+// 4.5h-2 have landed the building blocks but production callsites
+// (`provider::spawn_runner`) still route through the legacy
+// `runner::run_stream` path. The unused warnings are correctly
+// noting "API surface with no production consumer yet"; both
+// allows come off in 4.5h-6 when the legacy path is deleted and
+// every public item has a real caller.
 #![allow(dead_code)]
-// Re-exports for the eventual public API. They look "unused" because
-// nothing imports `crate::agent::agent_loop::Foo` yet — phase 1+ will.
 #![allow(unused_imports)]
 
 pub mod bridge;
