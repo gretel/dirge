@@ -374,6 +374,11 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             .steering_queue
             .map(|q| steering_from_queue(q, QueueMode::All)),
         get_followup_messages: None,
+        reasoning: None,
+        thinking_budgets: None,
+        headers: std::collections::HashMap::new(),
+        metadata: std::collections::HashMap::new(),
+        request_timeout: None,
     };
 
     #[cfg(feature = "plugin")]
@@ -526,7 +531,7 @@ mod tests {
     fn canned_factory(responses: Vec<AssistantMessage>) -> StreamFn {
         let counter = Arc::new(AtomicUsize::new(0));
         let responses = Arc::new(responses);
-        Arc::new(move |_ctx, _key, _signal| {
+        Arc::new(move |_ctx, _opts| {
             let n = counter.fetch_add(1, Ordering::SeqCst);
             let msg = responses.get(n).cloned().unwrap_or_else(|| {
                 AssistantMessage::new(
@@ -672,7 +677,7 @@ mod tests {
         let saw_clone = saw.clone();
         let counter = Arc::new(AtomicUsize::new(0));
 
-        let factory: StreamFn = Arc::new(move |llm_ctx, _key, _signal| {
+        let factory: StreamFn = Arc::new(move |llm_ctx, _opts| {
             let n = counter.fetch_add(1, Ordering::SeqCst);
             if n == 1 {
                 let found = llm_ctx.messages.iter().any(|m| {

@@ -336,7 +336,7 @@ mod tests {
         let call_counter = Arc::new(AtomicUsize::new(0));
         let queue_writer = queue.clone();
 
-        let factory: StreamFn = Arc::new(move |llm_ctx, _key, _signal| {
+        let factory: StreamFn = Arc::new(move |llm_ctx, _opts| {
             let n = call_counter.fetch_add(1, Ordering::SeqCst);
             if n == 1 {
                 // Second call: inspect ctx for the interrupt.
@@ -400,6 +400,11 @@ mod tests {
             should_stop_after_turn: None,
             get_steering_messages: None,
             get_followup_messages: None,
+            reasoning: None,
+            thinking_budgets: None,
+            headers: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            request_timeout: None,
         };
         config.get_steering_messages = Some(steering_from_queue(queue.clone(), QueueMode::All));
 

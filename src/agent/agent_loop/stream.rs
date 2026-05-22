@@ -49,6 +49,51 @@ pub struct LlmContext {
     pub messages: Vec<serde_json::Value>,
 }
 
+/// Per-call options threaded from the loop to the stream
+/// function. Faithful port of pi's `StreamOptions` +
+/// `SimpleStreamOptions` shape (ai/src/types.ts:75-196).
+///
+/// Each field has a different lifecycle:
+///   - `api_key`: resolved per-call via getApiKey hook (token
+///     rotation). May change between turns.
+///   - `reasoning`: per-call (prepareNextTurn can swap the level).
+///   - `thinking_budgets` / `headers` / `metadata` /
+///     `request_timeout`: usually constant per-run; can vary
+///     across calls if prepareNextTurn rewrites config.
+///   - `signal`: per-call cancellation; same Arc for the whole
+///     run by convention.
+///
+/// Pi provider implementations spread `{...config, signal,
+/// apiKey}` into the call — we mirror that by passing an
+/// explicit struct so providers don't need to know about
+/// LoopConfig.
+#[derive(Clone)]
+pub struct StreamOptions {
+    pub api_key: Option<String>,
+    pub reasoning: Option<super::types::ThinkingLevel>,
+    pub thinking_budgets: Option<super::types::ThinkingBudgets>,
+    pub headers: std::collections::HashMap<String, String>,
+    pub metadata: std::collections::HashMap<String, serde_json::Value>,
+    pub request_timeout: Option<std::time::Duration>,
+    pub signal: AbortSignal,
+}
+
+impl StreamOptions {
+    /// Minimal options — only the signal is provided. Used by
+    /// tests that don't care about provider-side options.
+    pub fn from_signal(signal: AbortSignal) -> Self {
+        Self {
+            api_key: None,
+            reasoning: None,
+            thinking_budgets: None,
+            headers: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            request_timeout: None,
+            signal,
+        }
+    }
+}
+
 /// Stream function signature. Caller provides one; the function
 /// is invoked ONCE PER LLM CALL within a run — multi-turn runs
 /// call it N times. Returns a fresh stream of `StreamEvent`s
@@ -57,19 +102,17 @@ pub struct LlmContext {
 /// In pi (types.ts:24): `StreamFn = (...args: Parameters<typeof
 /// streamSimple>) => ReturnType<typeof streamSimple>`. Pi's
 /// `streamSimple` takes `(model, context, options)`; we collapse
-/// model/options into `LlmContext` + `api_key` separately for
-/// now.
+/// model into the closure (captured at construction) and pass
+/// `(LlmContext, StreamOptions)` per-call. StreamOptions matches
+/// pi's full options surface (api_key, reasoning, headers,
+/// metadata, timeouts) so providers have parity with pi.
 ///
 /// `Arc<dyn Fn …>` so the loop can clone the same StreamFn across
 /// every turn without consuming it. Stateful closures (e.g. test
 /// mocks tracking `callIndex`) use interior mutability
 /// (`Arc<AtomicUsize>` captured by the closure).
 pub type StreamFn = Arc<
-    dyn Fn(
-            LlmContext,
-            Option<String>, // resolved api_key
-            AbortSignal,
-        ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
+    dyn Fn(LlmContext, StreamOptions) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
         + Send
         + Sync,
 >;
@@ -112,12 +155,24 @@ pub async fn stream_assistant_response(
         config.api_key.clone()
     };
 
-    // 4. Build LlmContext and invoke the stream function.
+    // 4. Build LlmContext + StreamOptions and invoke the stream
+    //    function. Phase 4.6: StreamOptions carries all
+    //    pi-parity provider knobs (reasoning, headers, metadata,
+    //    request timeout).
     let llm_ctx = LlmContext {
         system_prompt: context.system_prompt.clone(),
         messages: llm_messages,
     };
-    let mut stream = stream_fn(llm_ctx, resolved_api_key, signal);
+    let stream_options = StreamOptions {
+        api_key: resolved_api_key,
+        reasoning: config.reasoning,
+        thinking_budgets: config.thinking_budgets.clone(),
+        headers: config.headers.clone(),
+        metadata: config.metadata.clone(),
+        request_timeout: config.request_timeout,
+        signal,
+    };
+    let mut stream = stream_fn(llm_ctx, stream_options);
 
     // 5. Iterate events.
     let mut added_partial = false;
@@ -285,7 +340,7 @@ mod tests {
     /// from pi (createAssistantMessage + done push).
     fn canned_done_stream(content_text: &str) -> StreamFn {
         let text = content_text.to_string();
-        Arc::new(move |_ctx, _key, _signal| {
+        Arc::new(move |_ctx, _opts| {
             let message = AssistantMessage::new(
                 vec![ContentBlock::Text { text: text.clone() }],
                 StopReason::Stop,
@@ -312,16 +367,83 @@ mod tests {
             should_stop_after_turn: None,
             get_steering_messages: None,
             get_followup_messages: None,
+            reasoning: None,
+            thinking_budgets: None,
+            headers: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            request_timeout: None,
         }
     }
 
     /// Port of pi test 84 ("should emit events with AgentMessage
     /// types"), reduced to what `stream_assistant_response`
-    /// alone produces. Pi's test asserts the FULL event sequence
-    /// from `agentLoop` (agent_start / turn_start / message_start
-    /// / message_end / turn_end / agent_end); this phase-1
-    /// equivalent only checks the message_* family our function
-    /// emits. The outer turn / agent events come in phase 4.
+    /// Phase 4.6 — verify StreamOptions populated from
+    /// LoopConfig reaches the stream function. The closure
+    /// observes the options struct and we assert each field
+    /// was threaded correctly.
+    #[tokio::test]
+    async fn test_stream_options_threaded_from_loop_config() {
+        use crate::agent::agent_loop::types::{ThinkingBudgets, ThinkingLevel};
+        use std::sync::Mutex;
+
+        let observed: Arc<Mutex<Option<StreamOptions>>> = Arc::new(Mutex::new(None));
+        let observed_clone = observed.clone();
+        let stream_fn: StreamFn = Arc::new(move |_ctx, opts: StreamOptions| {
+            *observed_clone.lock().unwrap() = Some(opts);
+            let message = AssistantMessage::new(
+                vec![ContentBlock::Text {
+                    text: "ok".to_string(),
+                }],
+                StopReason::Stop,
+            );
+            Box::pin(futures::stream::iter(vec![StreamEvent::Done {
+                reason: StopReason::Stop,
+                message,
+            }]))
+        });
+
+        let mut config = build_config(identity_converter());
+        config.api_key = Some("static-key".to_string());
+        config.reasoning = Some(ThinkingLevel::High);
+        config.thinking_budgets = Some(ThinkingBudgets {
+            high: Some(8192),
+            ..Default::default()
+        });
+        config
+            .headers
+            .insert("X-Test".to_string(), "yes".to_string());
+        config
+            .metadata
+            .insert("user_id".to_string(), serde_json::json!("u42"));
+        config.request_timeout = Some(std::time::Duration::from_secs(120));
+
+        let mut ctx = Context {
+            system_prompt: String::new(),
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            tools: Vec::new(),
+        };
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(8);
+        let _ =
+            stream_assistant_response(&mut ctx, &config, AbortSignal::new(), &tx, &stream_fn).await;
+
+        let opts = observed.lock().unwrap().clone().expect("opts captured");
+        assert_eq!(opts.api_key.as_deref(), Some("static-key"));
+        assert_eq!(opts.reasoning, Some(ThinkingLevel::High));
+        assert_eq!(
+            opts.thinking_budgets.as_ref().and_then(|b| b.high),
+            Some(8192)
+        );
+        assert_eq!(opts.headers.get("X-Test").map(String::as_str), Some("yes"));
+        assert_eq!(
+            opts.metadata.get("user_id"),
+            Some(&serde_json::json!("u42")),
+        );
+        assert_eq!(
+            opts.request_timeout,
+            Some(std::time::Duration::from_secs(120))
+        );
+    }
+
     #[tokio::test]
     async fn test_emits_message_start_and_end() {
         let mut ctx = Context {
@@ -494,6 +616,11 @@ mod tests {
             should_stop_after_turn: None,
             get_steering_messages: None,
             get_followup_messages: None,
+            reasoning: None,
+            thinking_budgets: None,
+            headers: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            request_timeout: None,
         };
         let signal = AbortSignal::new();
         let (tx, mut rx) = mpsc::channel::<LoopEvent>(32);
@@ -533,9 +660,8 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<LoopEvent>(32);
 
         // Stream that yields nothing — closes immediately.
-        let empty_stream: StreamFn = Arc::new(|_ctx, _key, _sig| {
-            Box::pin(futures::stream::iter::<Vec<StreamEvent>>(vec![]))
-        });
+        let empty_stream: StreamFn =
+            Arc::new(|_ctx, _opts| Box::pin(futures::stream::iter::<Vec<StreamEvent>>(vec![])));
 
         let final_msg =
             stream_assistant_response(&mut ctx, &config, signal, &tx, &empty_stream).await;

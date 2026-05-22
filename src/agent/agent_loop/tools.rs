@@ -868,6 +868,11 @@ mod tests {
             should_stop_after_turn: None,
             get_steering_messages: None,
             get_followup_messages: None,
+            reasoning: None,
+            thinking_budgets: None,
+            headers: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            request_timeout: None,
         }
     }
 

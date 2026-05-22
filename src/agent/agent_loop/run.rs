@@ -447,7 +447,7 @@ mod tests {
     fn canned_factory(responses: Vec<AssistantMessage>) -> StreamFn {
         let counter = std::sync::Arc::new(AtomicUsize::new(0));
         let responses = std::sync::Arc::new(responses);
-        std::sync::Arc::new(move |_ctx, _key, _signal| {
+        std::sync::Arc::new(move |_ctx, _opts| {
             let n = counter.fetch_add(1, Ordering::SeqCst);
             let msg = responses.get(n).cloned().unwrap_or_else(|| {
                 AssistantMessage::new(
@@ -491,6 +491,11 @@ mod tests {
             should_stop_after_turn: None,
             get_steering_messages: None,
             get_followup_messages: None,
+            reasoning: None,
+            thinking_budgets: None,
+            headers: std::collections::HashMap::new(),
+            metadata: std::collections::HashMap::new(),
+            request_timeout: None,
         }
     }
 
@@ -683,7 +688,7 @@ mod tests {
         let observed_prompts = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
         let observed_clone = observed_prompts.clone();
         let counter = std::sync::Arc::new(AtomicUsize::new(0));
-        let factory: StreamFn = std::sync::Arc::new(move |llm_ctx, _key, _sig| {
+        let factory: StreamFn = std::sync::Arc::new(move |llm_ctx, _opts| {
             observed_clone.lock().unwrap().push(llm_ctx.system_prompt);
             let n = counter.fetch_add(1, Ordering::SeqCst);
             let msg = if n == 0 {
@@ -756,9 +761,9 @@ mod tests {
         let llm_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let llm_calls_clone = llm_calls.clone();
         // Wrap factory to count invocations.
-        let factory_counted: StreamFn = std::sync::Arc::new(move |ctx, k, s| {
+        let factory_counted: StreamFn = std::sync::Arc::new(move |ctx, opts| {
             llm_calls_clone.fetch_add(1, Ordering::SeqCst);
-            factory(ctx, k, s)
+            factory(ctx, opts)
         });
 
         let hook: ShouldStopAfterTurnFn = std::sync::Arc::new(|_ctx| Box::pin(async move { true }));
@@ -798,7 +803,7 @@ mod tests {
 
         let llm_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let llm_calls_clone = llm_calls.clone();
-        let factory: StreamFn = std::sync::Arc::new(move |_ctx, _k, _s| {
+        let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
             llm_calls_clone.fetch_add(1, Ordering::SeqCst);
             let msg = tool_use_response("call-1", "echo", serde_json::json!({"v": 1}));
             Box::pin(futures::stream::iter(vec![StreamEvent::Done {
@@ -835,7 +840,7 @@ mod tests {
 
         let llm_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let llm_calls_clone = llm_calls.clone();
-        let factory: StreamFn = std::sync::Arc::new(move |_ctx, _k, _s| {
+        let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
             llm_calls_clone.fetch_add(1, Ordering::SeqCst);
             let msg = tool_use_response("call-1", "echo", serde_json::json!({"v": 1}));
             Box::pin(futures::stream::iter(vec![StreamEvent::Done {
@@ -882,7 +887,7 @@ mod tests {
 
         let llm_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let llm_calls_clone = llm_calls.clone();
-        let factory: StreamFn = std::sync::Arc::new(move |_ctx, _k, _s| {
+        let factory: StreamFn = std::sync::Arc::new(move |_ctx, _opts| {
             let n = llm_calls_clone.fetch_add(1, Ordering::SeqCst);
             let msg = if n == 0 {
                 tool_use_response("call-1", "echo", serde_json::json!({"v": 1}))
@@ -949,7 +954,7 @@ mod tests {
         let saw_clone = saw_interrupt_on_second.clone();
         let call_counter = std::sync::Arc::new(AtomicUsize::new(0));
 
-        let factory: StreamFn = std::sync::Arc::new(move |llm_ctx, _k, _s| {
+        let factory: StreamFn = std::sync::Arc::new(move |llm_ctx, _opts| {
             let n = call_counter.fetch_add(1, Ordering::SeqCst);
             if n == 1 {
                 // Second call: check for "interrupt" in messages.

@@ -1021,7 +1021,10 @@ mod tests {
             system_prompt: String::new(),
             messages: vec![],
         };
-        let mut s = stream_fn(ctx, None, AbortSignal::new());
+        let mut s = stream_fn(
+            ctx,
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        );
         let first = s.next().await;
         assert!(first.is_some(), "first call should produce events");
 
@@ -1030,7 +1033,10 @@ mod tests {
             system_prompt: String::new(),
             messages: vec![],
         };
-        let mut s2 = stream_fn(ctx2, None, AbortSignal::new());
+        let mut s2 = stream_fn(
+            ctx2,
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        );
         let second = s2.next().await;
         assert!(second.is_some(), "second call should also produce events");
     }

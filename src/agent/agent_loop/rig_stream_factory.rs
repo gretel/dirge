@@ -90,10 +90,10 @@ where
     M::StreamingResponse: Clone + Unpin + Send + Sync + GetTokenUsage + 'static,
 {
     let tools = Arc::new(tools);
-    Arc::new(move |ctx: LlmContext, _api_key, _signal: AbortSignal| {
+    Arc::new(move |ctx: LlmContext, opts: super::stream::StreamOptions| {
         let model = model.clone();
         let tools = tools.clone();
-        invoke_one_stream(model, tools, ctx, chunk_timeout)
+        invoke_one_stream(model, tools, ctx, chunk_timeout, opts)
     })
 }
 
@@ -111,6 +111,7 @@ fn invoke_one_stream<M>(
     tools: Arc<Vec<ToolDefinition>>,
     ctx: LlmContext,
     chunk_timeout: Option<std::time::Duration>,
+    opts: super::stream::StreamOptions,
 ) -> Pin<Box<dyn Stream<Item = StreamEvent> + Send>>
 where
     M: CompletionModel + Clone + Send + Sync + 'static,
@@ -136,7 +137,12 @@ where
             (last, messages)
         };
 
-        // 3. Build the rig CompletionRequest.
+        // 3. Build the rig CompletionRequest. Phase 4.6: pack
+        //    reasoning + headers + metadata into the request's
+        //    `additional_params` so providers that know about
+        //    these fields can read them. Rig's underlying
+        //    provider implementations vary in which they honor;
+        //    unsupported fields are silently ignored downstream.
         let mut builder = CompletionRequestBuilder::new(model.clone(), prompt);
         if !ctx.system_prompt.is_empty() {
             builder = builder.preamble(ctx.system_prompt);
@@ -144,6 +150,41 @@ where
         builder = builder.messages(history);
         if !tools.is_empty() {
             builder = builder.tools((*tools).clone());
+        }
+        // Build additional_params from opts.reasoning + headers +
+        // metadata. Provider-specific mapping for reasoning lives
+        // in `provider::AnyAgent::build_stream_fn` — the mapper
+        // is captured in this closure's environment by the time
+        // we get here. For phase 4.6's initial implementation we
+        // pass the raw fields under conventional keys; downstream
+        // commits add per-provider transformers if needed.
+        let mut additional = serde_json::Map::new();
+        if let Some(reasoning) = opts.reasoning {
+            additional.insert(
+                "reasoning_level".to_string(),
+                serde_json::to_value(reasoning).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        if let Some(budgets) = &opts.thinking_budgets {
+            if let Ok(v) = serde_json::to_value(budgets) {
+                additional.insert("thinking_budgets".to_string(), v);
+            }
+        }
+        if !opts.headers.is_empty() {
+            if let Ok(v) = serde_json::to_value(&opts.headers) {
+                additional.insert("headers".to_string(), v);
+            }
+        }
+        if !opts.metadata.is_empty() {
+            additional.insert(
+                "metadata".to_string(),
+                serde_json::Value::Object(
+                    opts.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                ),
+            );
+        }
+        if !additional.is_empty() {
+            builder = builder.additional_params(serde_json::Value::Object(additional));
         }
         let request = builder.build();
 
@@ -535,7 +576,10 @@ mod tests {
             system_prompt: "test preamble".to_string(),
             messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
         };
-        let mut stream = factory(ctx, None, AbortSignal::new());
+        let mut stream = factory(
+            ctx,
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        );
         let mut kinds = Vec::new();
         while let Some(evt) = stream.next().await {
             kinds.push(match &evt {
@@ -562,7 +606,10 @@ mod tests {
             system_prompt: String::new(),
             messages: Vec::new(),
         };
-        let mut stream = factory(ctx, None, AbortSignal::new());
+        let mut stream = factory(
+            ctx,
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        );
         let mut found_error = false;
         while let Some(evt) = stream.next().await {
             if matches!(evt, StreamEvent::Error { .. }) {

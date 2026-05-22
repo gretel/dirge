@@ -74,6 +74,22 @@ pub enum ThinkingLevel {
     Xhigh,
 }
 
+/// Per-level token budgets for thinking/reasoning. Token-based
+/// providers (Anthropic budget-mode, etc.) consume this to size
+/// the reasoning allocation per turn. Effort-based providers
+/// (OpenAI Responses, Anthropic adaptive models like Opus 4.6+)
+/// ignore it in favor of the `ThinkingLevel` mapping.
+///
+/// Port of pi `ThinkingBudgets` (types.ts:67-72). Missing
+/// fields default to provider-specific sensible values.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct ThinkingBudgets {
+    pub minimal: Option<u32>,
+    pub low: Option<u32>,
+    pub medium: Option<u32>,
+    pub high: Option<u32>,
+}
+
 /// Conversation context passed to the loop and threaded through
 /// hooks. Port of pi `AgentContext` (types.ts:387).
 ///
@@ -210,6 +226,39 @@ pub struct LoopConfig {
     /// continuation messages. Port of pi `getFollowUpMessages?`
     /// (types.ts:243).
     pub get_followup_messages: Option<super::hooks::GetFollowupMessagesFn>,
+
+    // ============================================================
+    // Phase 4.6 — provider stream options (pi parity)
+    // ============================================================
+    /// Reasoning / thinking level. Threaded to the stream factory
+    /// per-call; provider-specific mapping (Anthropic effort or
+    /// budget tokens; OpenAI Responses `reasoning.effort`) lives
+    /// in `provider::AnyAgent::build_stream_fn`. Other providers
+    /// ignore. Port of pi `SimpleStreamOptions.reasoning?`
+    /// (types.ts:193).
+    pub reasoning: Option<ThinkingLevel>,
+    /// Per-level token budgets. Honored by token-based providers
+    /// (Anthropic budget mode). Effort-based providers ignore.
+    /// Port of pi `SimpleStreamOptions.thinkingBudgets?`
+    /// (types.ts:195).
+    pub thinking_budgets: Option<ThinkingBudgets>,
+    /// Custom HTTP headers merged with provider defaults. Pi
+    /// `StreamOptions.headers?` (types.ts:120). Some rig
+    /// providers honor at request build time; others at client
+    /// config time only.
+    pub headers: std::collections::HashMap<String, String>,
+    /// Provider-specific metadata (e.g. Anthropic `user_id` for
+    /// abuse / rate-limit tracking). Pi `StreamOptions.metadata?`
+    /// (types.ts:142).
+    pub metadata: std::collections::HashMap<String, serde_json::Value>,
+    /// Request-level timeout (full HTTP request). Separate from
+    /// dirge's per-chunk timeout (`chunk_timeout` on `AnyAgent`)
+    /// which guards individual stream chunks. Pi
+    /// `StreamOptions.timeoutMs?` (types.ts:125). Rig clients
+    /// expose this at client-construction time today; per-request
+    /// override is not yet wired — field present so future
+    /// commits can honor it without another LoopConfig change.
+    pub request_timeout: Option<std::time::Duration>,
 }
 
 /// `convertToLlm` signature. Synchronous in pi (returns
@@ -278,6 +327,11 @@ impl std::fmt::Debug for LoopConfig {
                 "get_followup_messages",
                 &self.get_followup_messages.as_ref().map(|_| "<fn>"),
             )
+            .field("reasoning", &self.reasoning)
+            .field("thinking_budgets", &self.thinking_budgets)
+            .field("headers", &self.headers)
+            .field("metadata", &self.metadata)
+            .field("request_timeout", &self.request_timeout)
             .finish()
     }
 }
@@ -296,6 +350,11 @@ impl Clone for LoopConfig {
             should_stop_after_turn: self.should_stop_after_turn.clone(),
             get_steering_messages: self.get_steering_messages.clone(),
             get_followup_messages: self.get_followup_messages.clone(),
+            reasoning: self.reasoning,
+            thinking_budgets: self.thinking_budgets.clone(),
+            headers: self.headers.clone(),
+            metadata: self.metadata.clone(),
+            request_timeout: self.request_timeout,
         }
     }
 }

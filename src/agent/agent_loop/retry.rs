@@ -74,12 +74,10 @@ use super::tool::AbortSignal;
 /// `AbortSignal` poll inside its own loop).
 pub fn retrying_stream_fn(inner: StreamFn, policy: RecoveryPolicy) -> StreamFn {
     let policy = Arc::new(policy);
-    Arc::new(move |ctx, key, signal: AbortSignal| {
+    Arc::new(move |ctx, opts: super::stream::StreamOptions| {
         let inner = inner.clone();
         let policy = policy.clone();
-        let ctx = ctx;
-        let key = key;
-        let signal_outer = signal;
+        let signal_outer = opts.signal.clone();
         Box::pin(async_stream::stream! {
             let mut attempts: usize = 0;
             loop {
@@ -89,7 +87,7 @@ pub fn retrying_stream_fn(inner: StreamFn, policy: RecoveryPolicy) -> StreamFn {
                     };
                     return;
                 }
-                let mut inner_stream = inner(ctx.clone(), key.clone(), signal_outer.clone());
+                let mut inner_stream = inner(ctx.clone(), opts.clone());
 
                 // Per-attempt state.
                 let mut committed = false;
@@ -219,7 +217,7 @@ mod tests {
     fn canned_stream_fn(events: Vec<Vec<StreamEvent>>) -> StreamFn {
         let counter = Arc::new(AtomicUsize::new(0));
         let events = Arc::new(Mutex::new(events));
-        Arc::new(move |_ctx, _key, _signal| {
+        Arc::new(move |_ctx, _opts| {
             let n = counter.fetch_add(1, Ordering::SeqCst);
             let attempts = events.lock().unwrap();
             let attempt_events = attempts.get(n).cloned().unwrap_or_default();
@@ -232,7 +230,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let events = Arc::new(Mutex::new(events));
         let counter_clone = counter.clone();
-        let factory: StreamFn = Arc::new(move |_ctx, _key, _signal| {
+        let factory: StreamFn = Arc::new(move |_ctx, _opts| {
             let n = counter_clone.fetch_add(1, Ordering::SeqCst);
             let attempts = events.lock().unwrap();
             let attempt_events = attempts.get(n).cloned().unwrap_or_default();
@@ -274,7 +272,11 @@ mod tests {
             },
         ]]);
         let wrapped = retrying_stream_fn(inner, RecoveryPolicy::default());
-        let events = drain(wrapped(ctx(), None, AbortSignal::new())).await;
+        let events = drain(wrapped(
+            ctx(),
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        ))
+        .await;
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0], StreamEvent::Start { .. }));
         assert!(matches!(events[1], StreamEvent::Done { .. }));
@@ -310,8 +312,13 @@ mod tests {
         // accept the ~1s backoff cost for this test. Use
         // tokio::time::pause to make it free.
         tokio::time::pause();
-        let drain_task =
-            tokio::spawn(async move { drain(wrapped(ctx(), None, AbortSignal::new())).await });
+        let drain_task = tokio::spawn(async move {
+            drain(wrapped(
+                ctx(),
+                crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+            ))
+            .await
+        });
         // Advance virtual time to skip the backoff sleep.
         tokio::time::advance(std::time::Duration::from_secs(10)).await;
         let events = drain_task.await.unwrap();
@@ -339,7 +346,11 @@ mod tests {
             error: "401 unauthorized: invalid api key".to_string(),
         }]]);
         let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
-        let events = drain(wrapped(ctx(), None, AbortSignal::new())).await;
+        let events = drain(wrapped(
+            ctx(),
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        ))
+        .await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], StreamEvent::Error { .. }));
@@ -352,7 +363,11 @@ mod tests {
             error: "context length exceeded: prompt is too long".to_string(),
         }]]);
         let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
-        let events = drain(wrapped(ctx(), None, AbortSignal::new())).await;
+        let events = drain(wrapped(
+            ctx(),
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        ))
+        .await;
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         assert!(matches!(events[0], StreamEvent::Error { .. }));
     }
@@ -377,7 +392,11 @@ mod tests {
             },
         ]]);
         let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
-        let events = drain(wrapped(ctx(), None, AbortSignal::new())).await;
+        let events = drain(wrapped(
+            ctx(),
+            crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+        ))
+        .await;
         // No retry — only one inner call.
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         // Consumer saw Start, Delta, Error in that order.
@@ -412,8 +431,13 @@ mod tests {
         let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
 
         tokio::time::pause();
-        let task =
-            tokio::spawn(async move { drain(wrapped(ctx(), None, AbortSignal::new())).await });
+        let task = tokio::spawn(async move {
+            drain(wrapped(
+                ctx(),
+                crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+            ))
+            .await
+        });
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
         let events = task.await.unwrap();
 
@@ -437,8 +461,13 @@ mod tests {
         let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
 
         tokio::time::pause();
-        let task =
-            tokio::spawn(async move { drain(wrapped(ctx(), None, AbortSignal::new())).await });
+        let task = tokio::spawn(async move {
+            drain(wrapped(
+                ctx(),
+                crate::agent::agent_loop::StreamOptions::from_signal(AbortSignal::new()),
+            ))
+            .await
+        });
         // Advance plenty for all backoffs to elapse.
         tokio::time::advance(std::time::Duration::from_secs(600)).await;
         let events = task.await.unwrap();
@@ -460,7 +489,11 @@ mod tests {
         let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
         let signal = AbortSignal::new();
         signal.cancel();
-        let events = drain(wrapped(ctx(), None, signal)).await;
+        let events = drain(wrapped(
+            ctx(),
+            crate::agent::agent_loop::StreamOptions::from_signal(signal),
+        ))
+        .await;
         assert_eq!(counter.load(Ordering::SeqCst), 0);
         assert!(matches!(events[0], StreamEvent::Error { .. }));
     }
@@ -487,7 +520,13 @@ mod tests {
         let signal_clone = signal.clone();
 
         tokio::time::pause();
-        let task = tokio::spawn(async move { drain(wrapped(ctx(), None, signal_clone)).await });
+        let task = tokio::spawn(async move {
+            drain(wrapped(
+                ctx(),
+                crate::agent::agent_loop::StreamOptions::from_signal(signal_clone),
+            ))
+            .await
+        });
         // Let the spawned task start and run the first inner
         // attempt. Without yielding, the cancel below races with
         // the task's signal check at the top of the loop —

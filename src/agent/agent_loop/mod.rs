@@ -69,7 +69,7 @@ pub use rig_stream_factory::{
 pub use rig_tool::RigToolAdapter;
 pub use run::{LoopError, run_agent_loop, run_agent_loop_continue, run_loop};
 pub use steering::{steering_from_queue, steering_from_queue_with_sanitizer};
-pub use stream::{LlmContext, StreamFn, stream_assistant_response};
+pub use stream::{LlmContext, StreamFn, StreamOptions, stream_assistant_response};
 pub use tool::LoopTool;
 pub use tools::{
     ExecutedToolCallBatch, ToolCall, execute_tool_calls, execute_tool_calls_parallel,
