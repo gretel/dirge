@@ -90,7 +90,7 @@ async fn apply_create(path: &str, content: &str) -> Result<String, String> {
             MAX_APPLY_PATCH_BYTES,
         ));
     }
-    tokio::fs::write(p, content)
+    crate::fs_atomic::atomic_write(p, content.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
     Ok(format!("created {}", path))
@@ -152,7 +152,7 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
     } else {
         updated_normalized
     };
-    tokio::fs::write(path, &to_write)
+    crate::fs_atomic::atomic_write(std::path::Path::new(path), to_write.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
     Ok(format!("updated {}", path))

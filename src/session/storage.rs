@@ -58,40 +58,18 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", session.id));
     let json = serde_json::to_string_pretty(session)?;
-    // Atomic write: write to a sibling temp file, fsync, then rename
-    // over the target. A crash mid-write leaves the temp behind but
-    // never a truncated `.json`. The rename is atomic on every OS we
-    // target. Use the same parent dir so rename stays on one filesystem.
+    // Atomic write — write to a sibling `.tmp.<nonce>` file,
+    // fsync, then rename over the target. A crash mid-write leaves
+    // the temp behind but never a truncated `.json`. POSIX
+    // rename(2) is atomic on the same filesystem; the helper picks
+    // a temp in the same parent dir to preserve that invariant.
     //
-    // The tmp filename includes a per-call nonce (pid + nanos +
-    // monotonic counter) so two concurrent saves of the same session
-    // id don't collide on the tmp file. The counter is the
-    // load-bearing piece — two threads firing in the same nanosecond
-    // still get distinct counter values, eliminating same-process
-    // collisions. The rename race remains harmless (last writer wins
-    // on the target; each tmp is fully written before rename).
-    static SAVE_NONCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let nonce = format!(
-        "{}-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0),
-        SAVE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-    );
-    let tmp = dir.join(format!(".{}.{}.json.tmp", session.id, nonce));
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(json.as_bytes())?;
-        // Best-effort fsync; non-fatal if the platform doesn't support it.
-        let _ = f.sync_all();
-    }
-    if let Err(e) = std::fs::rename(&tmp, &path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e.into());
-    }
+    // Extracted into `crate::fs_atomic` so this path + the
+    // file-mutating tools (`write`/`edit`/`apply_patch`) share one
+    // implementation. Previously the tools called
+    // `tokio::fs::write` directly which truncates in place — a
+    // corruption vector on crash.
+    crate::fs_atomic::atomic_write_sync(&path, json.as_bytes())?;
     Ok(())
 }
 

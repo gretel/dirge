@@ -102,7 +102,12 @@ impl Tool for WriteTool {
         let was_creation = !path.exists();
         #[cfg(feature = "lsp")]
         let write_at = Instant::now();
-        tokio::fs::write(path, &args.content).await?;
+        // Atomic write: tmp + fsync + rename so a crash mid-write
+        // leaves the previous file content intact, not a truncated
+        // half-write. `tokio::fs::write` opens with O_TRUNC and
+        // writes in-place — a corruption vector on power loss /
+        // OOM-kill / SIGKILL.
+        crate::fs_atomic::atomic_write(path, args.content.as_bytes()).await?;
         crate::agent::tools::modified::mark_modified(path);
         // File mutated → invalidate cached reads/greps/listings for this turn.
         if let Some(ref cache) = self.cache {

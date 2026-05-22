@@ -231,7 +231,10 @@ impl Tool for EditTool {
 
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
-        tokio::fs::write(&resolved_path, &output).await?;
+        // Atomic write so a mid-write crash leaves the previous
+        // content intact rather than a truncated half-write.
+        crate::fs_atomic::atomic_write(std::path::Path::new(&resolved_path), output.as_bytes())
+            .await?;
         crate::agent::tools::modified::mark_modified(std::path::Path::new(&resolved_path));
         // File mutated → invalidate cached reads/greps/listings for this turn.
         if let Some(ref cache) = self.cache {

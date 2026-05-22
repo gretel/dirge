@@ -4,6 +4,7 @@ mod config;
 mod context;
 mod event;
 mod extras;
+mod fs_atomic;
 #[cfg(feature = "lsp")]
 mod lsp;
 mod permission;
