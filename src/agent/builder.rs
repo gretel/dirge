@@ -413,6 +413,341 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     }
 }
 
+// ============================================================
+// Phase 4.5h-4 — parallel LoopTool registry builder
+// ============================================================
+
+/// Build the LoopTool registry for the new agent_loop path.
+///
+/// Mirrors the tool construction in `build_agent_inner` but
+/// wraps each tool via `RigToolAdapter` so it implements the
+/// `LoopTool` trait the new loop dispatches against. Mutating
+/// tools (bash, edit, write, apply_patch, ...) are tagged
+/// `ToolExecutionMode::Sequential` — phase 3's umbrella
+/// dispatcher promotes the WHOLE batch to sequential when any
+/// included tool declares Sequential, which is the safe default
+/// for fs / process mutators.
+///
+/// Read-only tools (read, grep, list_dir, ...) leave the
+/// execution mode at None so they pick up the loop config's
+/// default (Parallel) — batches of all-read-only tools dispatch
+/// concurrently.
+///
+/// This temporarily duplicates the tool list from
+/// `build_agent_inner`. Phase 4.5h-6 unifies the two paths
+/// (single tool-construction site routed through the loop) and
+/// this duplication goes away.
+///
+/// `#[allow(dead_code)]` is transitional — production caller
+/// (replacing the rig multi-turn path) lands in phase 4.5h-6.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub async fn build_loop_tools(
+    cache: ToolCache,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+    question_tx: Option<QuestionSender>,
+    plan_tx: Option<PlanSwitchSender>,
+    bg_store: Option<BackgroundStore>,
+    #[cfg(feature = "lsp")] lsp_manager: Option<std::sync::Arc<crate::lsp::manager::LspManager>>,
+    sandbox: Sandbox,
+    parent_model: Option<AnyModel>,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+    #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
+    cli: &Cli,
+    cfg: &Config,
+) -> Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>> {
+    use crate::agent::agent_loop::types::ToolExecutionMode;
+    use crate::agent::agent_loop::{LoopTool, RigToolAdapter};
+
+    if cli.resolve_no_tools(cfg) {
+        return Vec::new();
+    }
+
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let skills: Arc<[Skill]> = Arc::from(
+        tokio::task::spawn_blocking(move || skill::discover_skills(&cwd))
+            .await
+            .unwrap_or_default(),
+    );
+
+    // Wrap a built tool as a LoopTool adapter with optional
+    // execution_mode override. Async because rig's `definition`
+    // is async (RigToolAdapter::new resolves it eagerly).
+    async fn wrap<T>(inner: T, mode: Option<ToolExecutionMode>) -> Arc<dyn LoopTool>
+    where
+        T: rig::tool::ToolDyn + 'static,
+    {
+        let adapter = RigToolAdapter::new(Box::new(inner)).await;
+        let adapter = match mode {
+            Some(m) => adapter.with_execution_mode(m),
+            None => adapter,
+        };
+        Arc::new(adapter)
+    }
+
+    let mut tools: Vec<Arc<dyn LoopTool>> = Vec::new();
+
+    // Read-only — leave at default (Parallel).
+    tools.push(
+        wrap(
+            tools::ReadTool::with_cache(
+                permission.clone(),
+                ask_tx.clone(),
+                cache.clone(),
+                #[cfg(feature = "lsp")]
+                lsp_manager.clone(),
+            ),
+            None,
+        )
+        .await,
+    );
+
+    // Mutating — Sequential.
+    tools.push(
+        wrap(
+            tools::WriteTool::with_cache(
+                permission.clone(),
+                ask_tx.clone(),
+                cache.clone(),
+                #[cfg(feature = "lsp")]
+                lsp_manager.clone(),
+            ),
+            Some(ToolExecutionMode::Sequential),
+        )
+        .await,
+    );
+    tools.push(
+        wrap(
+            tools::EditTool::with_cache(
+                permission.clone(),
+                ask_tx.clone(),
+                cache.clone(),
+                #[cfg(feature = "lsp")]
+                lsp_manager.clone(),
+            ),
+            Some(ToolExecutionMode::Sequential),
+        )
+        .await,
+    );
+    tools.push(
+        wrap(
+            tools::BashTool::with_cache(
+                permission.clone(),
+                ask_tx.clone(),
+                sandbox.clone(),
+                cache.clone(),
+            ),
+            Some(ToolExecutionMode::Sequential),
+        )
+        .await,
+    );
+
+    // Read-only batch.
+    tools.push(
+        wrap(
+            tools::GrepTool::with_cache(permission.clone(), ask_tx.clone(), cache.clone()),
+            None,
+        )
+        .await,
+    );
+    tools.push(
+        wrap(
+            tools::FindFilesTool::with_cache(permission.clone(), ask_tx.clone(), cache.clone()),
+            None,
+        )
+        .await,
+    );
+    tools.push(
+        wrap(
+            tools::GlobTool::with_cache(permission.clone(), ask_tx.clone(), cache.clone()),
+            None,
+        )
+        .await,
+    );
+    tools.push(
+        wrap(
+            tools::ListDirTool::with_cache(permission.clone(), ask_tx.clone(), cache.clone()),
+            None,
+        )
+        .await,
+    );
+    tools.push(
+        wrap(
+            tools::RepoOverviewTool::with_cache(permission.clone(), ask_tx.clone(), cache.clone()),
+            None,
+        )
+        .await,
+    );
+
+    // Mutates internal todo state — Sequential.
+    tools.push(
+        wrap(
+            tools::WriteTodoList::new(permission.clone(), ask_tx.clone()),
+            Some(ToolExecutionMode::Sequential),
+        )
+        .await,
+    );
+
+    // SkillTool runs arbitrary skill bodies — Sequential to be
+    // safe (a skill body could do anything).
+    tools.push(
+        wrap(
+            tools::SkillTool::new(Arc::clone(&skills), permission.clone(), ask_tx.clone()),
+            Some(ToolExecutionMode::Sequential),
+        )
+        .await,
+    );
+
+    // Writes to memory file — Sequential.
+    tools.push(
+        wrap(
+            tools::MemoryTool::new(permission.clone(), ask_tx.clone()),
+            Some(ToolExecutionMode::Sequential),
+        )
+        .await,
+    );
+
+    // Mutates fs — Sequential.
+    tools.push(
+        wrap(
+            tools::ApplyPatchTool::with_cache(permission.clone(), ask_tx.clone(), cache.clone()),
+            Some(ToolExecutionMode::Sequential),
+        )
+        .await,
+    );
+
+    // Question / Plan tools — interactive (model asks user).
+    // Multiple in parallel would be UX-bad. Sequential.
+    if let Some(tx) = question_tx {
+        tools.push(
+            wrap(
+                tools::QuestionTool::new(tx).with_permission(permission.clone(), ask_tx.clone()),
+                Some(ToolExecutionMode::Sequential),
+            )
+            .await,
+        );
+    }
+    if let Some(tx) = plan_tx {
+        tools.push(
+            wrap(
+                tools::PlanEnterTool::new(tx.clone()).with_permission(permission.clone()),
+                Some(ToolExecutionMode::Sequential),
+            )
+            .await,
+        );
+        tools.push(
+            wrap(
+                tools::PlanExitTool::new(tx).with_permission(permission.clone()),
+                Some(ToolExecutionMode::Sequential),
+            )
+            .await,
+        );
+    }
+
+    // Web tools — network reads, leave at default Parallel.
+    let env_true = |k: &str| {
+        std::env::var(k)
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(false)
+    };
+    let websearch_enabled = cfg.tools.as_ref().and_then(|t| t.websearch).unwrap_or(true)
+        || env_true("WEBSEARCH_ENABLED");
+    let webfetch_enabled =
+        cfg.tools.as_ref().and_then(|t| t.webfetch).unwrap_or(true) || env_true("WEBFETCH_ENABLED");
+    if websearch_enabled {
+        let key = std::env::var("EXA_API_KEY").ok().filter(|k| !k.is_empty());
+        tools.push(
+            wrap(
+                tools::WebSearchTool::new(permission.clone(), ask_tx.clone(), key),
+                None,
+            )
+            .await,
+        );
+    }
+    if webfetch_enabled {
+        tools.push(
+            wrap(
+                tools::WebFetchTool::new(permission.clone(), ask_tx.clone()),
+                None,
+            )
+            .await,
+        );
+    }
+
+    // Task / TaskStatus tools — spawn background work.
+    // TaskTool itself is Sequential (mutates the background
+    // store); TaskStatus is read-only.
+    if let (Some(pm), Some(store)) = (parent_model, bg_store) {
+        tools.push(
+            wrap(
+                tools::TaskTool::new(permission.clone(), ask_tx.clone(), pm, store.clone()),
+                Some(ToolExecutionMode::Sequential),
+            )
+            .await,
+        );
+        tools.push(
+            wrap(
+                tools::TaskStatusTool::new(store)
+                    .with_permission(permission.clone(), ask_tx.clone()),
+                None,
+            )
+            .await,
+        );
+    }
+
+    // LSP tool — read-only queries against the manager.
+    #[cfg(feature = "lsp")]
+    if let Some(manager) = &lsp_manager {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+        tools.push(
+            wrap(
+                tools::LspTool::new(permission.clone(), ask_tx.clone(), manager.clone(), cwd),
+                None,
+            )
+            .await,
+        );
+    }
+
+    // MCP tools — variable per-server semantics. Default
+    // Parallel; future work can let an MCP server declare
+    // execution_mode in its definition. Same name-collision
+    // filtering as build_agent_inner (skip names that shadow
+    // built-ins).
+    #[cfg(feature = "mcp")]
+    if let Some(manager) = &mcp_manager {
+        let mcp_tools = manager
+            .collect_tools(permission.clone(), ask_tx.clone())
+            .await;
+        let builtin_names: &[&str] = tools::BUILTIN_TOOL_NAMES;
+        for mcp_tool in mcp_tools {
+            let name = mcp_tool.definition.name.to_string();
+            if builtin_names.contains(&name.as_str()) {
+                eprintln!(
+                    "warning: MCP server '{}' exports tool '{}' which collides with a dirge built-in; skipping MCP version",
+                    mcp_tool.server_name, name,
+                );
+                continue;
+            }
+            tools.push(wrap(mcp_tool, None).await);
+        }
+    }
+
+    // Semantic tools — read-only queries.
+    #[cfg(feature = "semantic")]
+    if let Some(manager) = &semantic_manager {
+        let sem_tools = manager.tools(permission.clone(), ask_tx.clone());
+        for sem_tool in sem_tools {
+            // Semantic tools come as Box<dyn ToolDyn> — wrap
+            // via the boxed-variant helper.
+            let adapter = RigToolAdapter::new(sem_tool).await;
+            tools.push(Arc::new(adapter));
+        }
+    }
+
+    tools
+}
+
 #[allow(dead_code)]
 pub fn create_client(api_key: Option<&str>) -> anyhow::Result<openrouter::Client> {
     let key = api_key
@@ -454,6 +789,8 @@ pub(crate) fn append_mode_reminder(preamble: &mut String, prompt_name: &str, pla
 #[cfg(test)]
 mod reminder_tests {
     use super::append_mode_reminder;
+    use super::*;
+    use clap::Parser;
 
     #[test]
     fn plan_mode_injects_plan_reminder() {
@@ -547,6 +884,166 @@ mod reminder_tests {
         // const inside build_agent_inner is the source of truth.
         for name in expected_builtins {
             assert!(!name.is_empty());
+        }
+    }
+
+    // ============================================================
+    // Phase 4.5h-4 — build_loop_tools tests
+    // ============================================================
+
+    /// Default config + minimal CLI → build_loop_tools produces
+    /// a non-empty registry with the expected core tool names.
+    #[tokio::test]
+    async fn build_loop_tools_produces_core_registry() {
+        let cli = Cli::parse_from::<_, &str>(["dirge"]);
+        let cfg = Config::default();
+        let cache = ToolCache::new();
+        let sandbox = Sandbox::new(false);
+
+        let tools = build_loop_tools(
+            cache,
+            None, // permission
+            None, // ask_tx
+            None, // question_tx
+            None, // plan_tx
+            None, // bg_store
+            #[cfg(feature = "lsp")]
+            None,
+            sandbox,
+            None, // parent_model
+            #[cfg(feature = "mcp")]
+            None,
+            #[cfg(feature = "semantic")]
+            None,
+            &cli,
+            &cfg,
+        )
+        .await;
+
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        // Spot-check: required built-ins are present.
+        for expected in ["read", "write", "edit", "bash", "grep", "list_dir"] {
+            assert!(
+                names.contains(&expected),
+                "missing built-in {expected} in {names:?}"
+            );
+        }
+    }
+
+    /// `--no-tools` (or equivalent config) yields an empty
+    /// registry. Mirrors `build_agent_inner`'s short-circuit.
+    #[tokio::test]
+    async fn build_loop_tools_empty_with_no_tools() {
+        let cli = Cli::parse_from::<_, &str>(["dirge", "--no-tools"]);
+        let cfg = Config::default();
+        let cache = ToolCache::new();
+        let sandbox = Sandbox::new(false);
+        let tools = build_loop_tools(
+            cache,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "lsp")]
+            None,
+            sandbox,
+            None,
+            #[cfg(feature = "mcp")]
+            None,
+            #[cfg(feature = "semantic")]
+            None,
+            &cli,
+            &cfg,
+        )
+        .await;
+        assert!(tools.is_empty(), "--no-tools should yield empty registry");
+    }
+
+    /// Mutating tools (write/edit/bash/apply_patch) declare
+    /// `Sequential` execution mode. Phase 3's umbrella dispatcher
+    /// uses this to force the whole batch sequential on any
+    /// inclusion of a mutating tool — protects against concurrent
+    /// fs / process state races.
+    #[tokio::test]
+    async fn build_loop_tools_mutating_tools_are_sequential() {
+        use crate::agent::agent_loop::types::ToolExecutionMode;
+        let cli = Cli::parse_from::<_, &str>(["dirge"]);
+        let cfg = Config::default();
+        let cache = ToolCache::new();
+        let sandbox = Sandbox::new(false);
+        let tools = build_loop_tools(
+            cache,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "lsp")]
+            None,
+            sandbox,
+            None,
+            #[cfg(feature = "mcp")]
+            None,
+            #[cfg(feature = "semantic")]
+            None,
+            &cli,
+            &cfg,
+        )
+        .await;
+
+        for mutating in ["write", "edit", "bash", "apply_patch"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name() == mutating)
+                .unwrap_or_else(|| panic!("{mutating} missing from registry"));
+            assert_eq!(
+                tool.execution_mode(),
+                Some(ToolExecutionMode::Sequential),
+                "{mutating} should be Sequential",
+            );
+        }
+    }
+
+    /// Read-only tools (read/grep/list_dir/...) leave
+    /// execution_mode at None so they pick up the loop config's
+    /// Parallel default. Batches of all-read-only tools dispatch
+    /// concurrently per phase 3.
+    #[tokio::test]
+    async fn build_loop_tools_read_only_tools_are_parallel_capable() {
+        let cli = Cli::parse_from::<_, &str>(["dirge"]);
+        let cfg = Config::default();
+        let cache = ToolCache::new();
+        let sandbox = Sandbox::new(false);
+        let tools = build_loop_tools(
+            cache,
+            None,
+            None,
+            None,
+            None,
+            None,
+            #[cfg(feature = "lsp")]
+            None,
+            sandbox,
+            None,
+            #[cfg(feature = "mcp")]
+            None,
+            #[cfg(feature = "semantic")]
+            None,
+            &cli,
+            &cfg,
+        )
+        .await;
+
+        for read_only in ["read", "grep", "list_dir", "find_files"] {
+            let tool = tools
+                .iter()
+                .find(|t| t.name() == read_only)
+                .unwrap_or_else(|| panic!("{read_only} missing from registry"));
+            assert!(
+                tool.execution_mode().is_none(),
+                "{read_only} should leave execution_mode at None (Parallel-capable)",
+            );
         }
     }
 }
