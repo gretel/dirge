@@ -107,6 +107,52 @@ const HARNESS_INIT: &str = r#"
 (defn harness/set-next-model [model-name]
   (when (string? model-name) (set harness-next-model model-name)))
 
+# ============================================================
+# Phase 5 — pi-loop hook surface for plugins
+# ============================================================
+# These slots are polled by the new agent_loop path between
+# turns. Plugins set them from `on-tool-end` / `on-prompt` /
+# `prepare-next-run` to influence the next turn without
+# restarting the whole run.
+
+# Next turn's thinking level. Plugins call
+# (harness/set-next-thinking-level "high") inside on-tool-end
+# to bump reasoning on the next assistant turn. Valid values:
+# "off" "minimal" "low" "medium" "high" "xhigh". Other strings
+# are ignored.
+(var harness-next-thinking-level nil)
+(defn harness/set-next-thinking-level [level]
+  (when (string? level)
+    (set harness-next-thinking-level level)))
+
+# Stop-after-turn flag. Plugins call
+# (harness/request-stop-after-turn) to ask the loop to end
+# gracefully after the current turn finishes. Drained per turn
+# by the host.
+(var harness-stop-after-turn nil)
+(defn harness/request-stop-after-turn []
+  (set harness-stop-after-turn true))
+
+# Steering message queue (mid-run). Plugins call
+# (harness/add-steering "wait, also do X") to inject a user
+# turn between assistant turns. Drained per turn-boundary by
+# the host. Stored as a `msg\n` blob (newline-separated) so the
+# read side is a single string roundtrip.
+(var harness-steering-messages "")
+(defn harness/add-steering [content]
+  (when (string? content)
+    (set harness-steering-messages
+         (string harness-steering-messages content "\n"))))
+
+# Follow-up message queue (outer-loop boundary). Plugins call
+# (harness/add-followup "do this next") to add a turn AFTER the
+# loop would otherwise stop. Same blob shape as steering.
+(var harness-followup-messages "")
+(defn harness/add-followup [content]
+  (when (string? content)
+    (set harness-followup-messages
+         (string harness-followup-messages content "\n"))))
+
 # Slash-command registry. Plugins register at load time;
 # the host reads the list once after all plugins load and
 # dispatches matching /cmd input back to the named handler.

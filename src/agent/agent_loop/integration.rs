@@ -384,11 +384,37 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
     #[cfg(feature = "plugin")]
     {
         if let Some(pm) = cfg.plugin_mgr {
+            // Phase 4.5d: before/after tool call hooks.
             loop_config.before_tool_call = Some(
                 super::plugin_hooks::before_hook_from_plugin_manager(pm.clone()),
             );
-            loop_config.after_tool_call =
-                Some(super::plugin_hooks::after_hook_from_plugin_manager(pm));
+            loop_config.after_tool_call = Some(
+                super::plugin_hooks::after_hook_from_plugin_manager(pm.clone()),
+            );
+            // Phase 5: pi-loop hook surface for plugins.
+            // Each polls a dedicated Janet slot the plugin sets
+            // via harness/* helpers. Hooks fire at the right
+            // loop points (prepareNextTurn between turns;
+            // shouldStopAfterTurn after every turn;
+            // getSteeringMessages per turn boundary;
+            // getFollowUpMessages at outer-loop boundary).
+            loop_config.prepare_next_turn = Some(
+                super::plugin_hooks::prepare_next_turn_from_plugin_manager(pm.clone()),
+            );
+            loop_config.should_stop_after_turn =
+                Some(super::plugin_hooks::should_stop_after_turn_from_plugin_manager(pm.clone()));
+            // Compose with caller-provided steering queue: if
+            // BOTH are present, prefer the plugin one (plugin
+            // hooks compose at runtime; the explicit
+            // steering_queue was for legacy / test usage). Real
+            // production wires one or the other.
+            if loop_config.get_steering_messages.is_none() {
+                loop_config.get_steering_messages = Some(
+                    super::plugin_hooks::get_steering_messages_from_plugin_manager(pm.clone()),
+                );
+            }
+            loop_config.get_followup_messages =
+                Some(super::plugin_hooks::get_followup_messages_from_plugin_manager(pm));
         }
     }
 

@@ -34,9 +34,12 @@ use crate::plugin::{PluginManager, escape_janet_string};
 
 use super::hooks::{
     AfterToolCallContext, AfterToolCallFn, BeforeToolCallContext, BeforeToolCallFn,
-    BeforeToolCallReturn,
+    BeforeToolCallReturn, GetFollowupMessagesFn, GetSteeringMessagesFn, PrepareNextTurnFn,
+    ShouldStopAfterTurnFn,
 };
+use super::message::{LoopMessage, UserMessage};
 use super::result::{AfterToolCallResult, BeforeToolCallResult};
+use super::types::{ThinkingLevel, TurnUpdate};
 
 /// Build a `BeforeToolCallFn` that dispatches `on-tool-start`
 /// through the shared `PluginManager`.
@@ -222,6 +225,127 @@ fn flatten_text(content: &[serde_json::Value]) -> String {
         }
     }
     out
+}
+
+// ============================================================
+// Phase 5 — pi-loop hook factories
+// ============================================================
+
+/// Build a `PrepareNextTurnFn` that reads the
+/// `harness-next-thinking-level` slot (and `harness-next-model`)
+/// from the plugin manager. Plugins set these slots via
+/// `harness/set-next-thinking-level` / `harness/set-next-model`
+/// inside `on-tool-end` (or any hook firing between turns).
+///
+/// Returns `Some(TurnUpdate)` with the requested fields when any
+/// slot was set; `None` otherwise. Context is never mutated by
+/// this factory — separate hooks compose if a plugin wants to
+/// rewrite the transcript.
+///
+/// Locking pattern matches before/after_hook_from_plugin_manager:
+/// acquire-read-release synchronously per call.
+pub fn prepare_next_turn_from_plugin_manager(pm: Arc<Mutex<PluginManager>>) -> PrepareNextTurnFn {
+    Arc::new(move |_ctx| {
+        let pm = pm.clone();
+        Box::pin(async move {
+            let (thinking, model) = {
+                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                let t = mgr.take_pending_next_thinking_level();
+                let m = mgr.take_pending_next_model();
+                (t, m)
+            };
+            let thinking_level = thinking.and_then(parse_thinking_level);
+            if thinking_level.is_none() && model.is_none() {
+                return None;
+            }
+            Some(TurnUpdate {
+                context: None,
+                model,
+                thinking_level,
+            })
+        })
+    })
+}
+
+/// Build a `ShouldStopAfterTurnFn` that reads the
+/// `harness-stop-after-turn` flag. Plugins call
+/// `harness/request-stop-after-turn` from any per-turn hook
+/// (`on-tool-end`, etc.) to ask the loop to exit gracefully
+/// after the current turn.
+///
+/// Returns `true` once per slot-set; the slot is cleared on
+/// read so subsequent turns see the default (don't stop).
+pub fn should_stop_after_turn_from_plugin_manager(
+    pm: Arc<Mutex<PluginManager>>,
+) -> ShouldStopAfterTurnFn {
+    Arc::new(move |_ctx| {
+        let pm = pm.clone();
+        Box::pin(async move {
+            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+            mgr.take_pending_stop_after_turn()
+        })
+    })
+}
+
+/// Build a `GetSteeringMessagesFn` that drains the plugin's
+/// `harness-steering-messages` queue. Plugins call
+/// `harness/add-steering` to inject mid-run user turns.
+///
+/// Returns a (possibly empty) Vec of `LoopMessage::User`s.
+pub fn get_steering_messages_from_plugin_manager(
+    pm: Arc<Mutex<PluginManager>>,
+) -> GetSteeringMessagesFn {
+    Arc::new(move || {
+        let pm = pm.clone();
+        Box::pin(async move {
+            let drained: Vec<String> = {
+                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                mgr.drain_steering_messages()
+            };
+            drained
+                .into_iter()
+                .map(|content| LoopMessage::User(UserMessage { content }))
+                .collect()
+        })
+    })
+}
+
+/// Build a `GetFollowupMessagesFn` that drains the plugin's
+/// `harness-followup-messages` queue. Plugins call
+/// `harness/add-followup` to add post-stop user turns; the
+/// outer loop re-enters with them as the next pending batch.
+pub fn get_followup_messages_from_plugin_manager(
+    pm: Arc<Mutex<PluginManager>>,
+) -> GetFollowupMessagesFn {
+    Arc::new(move || {
+        let pm = pm.clone();
+        Box::pin(async move {
+            let drained: Vec<String> = {
+                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                mgr.drain_followup_messages()
+            };
+            drained
+                .into_iter()
+                .map(|content| LoopMessage::User(UserMessage { content }))
+                .collect()
+        })
+    })
+}
+
+/// Parse a Janet-side level string into `ThinkingLevel`. Pi
+/// values: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`,
+/// `"xhigh"`. Unknown values produce None (plugin's typo is
+/// silently ignored rather than crashing the run).
+fn parse_thinking_level(s: String) -> Option<ThinkingLevel> {
+    match s.as_str() {
+        "off" => Some(ThinkingLevel::Off),
+        "minimal" => Some(ThinkingLevel::Minimal),
+        "low" => Some(ThinkingLevel::Low),
+        "medium" => Some(ThinkingLevel::Medium),
+        "high" => Some(ThinkingLevel::High),
+        "xhigh" => Some(ThinkingLevel::Xhigh),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -449,5 +573,145 @@ mod tests {
         let blocks = vec![json!({"type": "image", "url": "x.png"})];
         let out = flatten_text(&blocks);
         assert!(out.contains("image"));
+    }
+
+    // ============================================================
+    // Phase 5 — pi-loop hook factory tests
+    // ============================================================
+
+    use crate::agent::agent_loop::hooks::TurnHookContext;
+    use crate::agent::agent_loop::message::AssistantMessage as AM;
+
+    fn turn_ctx() -> TurnHookContext {
+        TurnHookContext {
+            message: AM::new(vec![], super::super::message::StopReason::Stop),
+            tool_results: Vec::new(),
+            context: crate::agent::agent_loop::types::Context::default(),
+            new_messages: Vec::new(),
+        }
+    }
+
+    /// prepareNextTurn returns Some(TurnUpdate) with the
+    /// requested thinking_level when a plugin set the slot.
+    #[tokio::test]
+    async fn prepare_next_turn_reads_thinking_level() {
+        let Some(pm) = try_pm() else { return };
+        {
+            let mut mgr = pm.lock().unwrap();
+            mgr.eval(r#"(defn bump [_ctx] (harness/set-next-thinking-level "high"))"#)
+                .unwrap();
+            mgr.register("on-tool-end", "bump");
+            // Fire on-tool-end so the slot gets set.
+            mgr.dispatch_tool_hook("on-tool-end", "@{:tool \"t\" :output \"x\"}")
+                .unwrap();
+        }
+        let hook = prepare_next_turn_from_plugin_manager(pm);
+        let out = hook(turn_ctx()).await;
+        assert!(out.is_some(), "expected TurnUpdate");
+        let upd = out.unwrap();
+        assert_eq!(upd.thinking_level, Some(ThinkingLevel::High));
+        assert!(upd.model.is_none());
+    }
+
+    /// prepareNextTurn returns None when no slot was set.
+    #[tokio::test]
+    async fn prepare_next_turn_returns_none_when_no_slot_set() {
+        let Some(pm) = try_pm() else { return };
+        let hook = prepare_next_turn_from_plugin_manager(pm);
+        assert!(hook(turn_ctx()).await.is_none());
+    }
+
+    /// shouldStopAfterTurn returns true once after a plugin
+    /// calls request-stop-after-turn, then false on subsequent
+    /// reads (slot drained).
+    #[tokio::test]
+    async fn should_stop_after_turn_drains_slot() {
+        let Some(pm) = try_pm() else { return };
+        {
+            let mut mgr = pm.lock().unwrap();
+            mgr.eval(r#"(defn stop [_ctx] (harness/request-stop-after-turn))"#)
+                .unwrap();
+            mgr.register("on-tool-end", "stop");
+            mgr.dispatch_tool_hook("on-tool-end", "@{:tool \"t\" :output \"x\"}")
+                .unwrap();
+        }
+        let hook = should_stop_after_turn_from_plugin_manager(pm);
+        assert!(hook(turn_ctx()).await, "first read should return true");
+        assert!(
+            !hook(turn_ctx()).await,
+            "second read should be false (slot drained)"
+        );
+    }
+
+    /// getSteeringMessages drains the slot — each
+    /// harness/add-steering call appears as a LoopMessage::User
+    /// once; subsequent polls see only newly-added messages.
+    #[tokio::test]
+    async fn get_steering_messages_drains_queue() {
+        let Some(pm) = try_pm() else { return };
+        {
+            let mut mgr = pm.lock().unwrap();
+            mgr.eval(
+                r#"(defn add [_ctx] (harness/add-steering "first") (harness/add-steering "second"))"#,
+            )
+            .unwrap();
+            mgr.register("on-tool-end", "add");
+            mgr.dispatch_tool_hook("on-tool-end", "@{:tool \"t\" :output \"x\"}")
+                .unwrap();
+        }
+        let hook = get_steering_messages_from_plugin_manager(pm.clone());
+        let messages = hook().await;
+        assert_eq!(messages.len(), 2);
+        let texts: Vec<String> = messages
+            .iter()
+            .filter_map(|m| match m {
+                LoopMessage::User(u) => Some(u.content.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, vec!["first", "second"]);
+        // Second poll: empty (drained).
+        assert!(hook().await.is_empty());
+    }
+
+    /// getFollowupMessages mirrors steering but reads its own
+    /// independent slot.
+    #[tokio::test]
+    async fn get_followup_messages_drains_queue() {
+        let Some(pm) = try_pm() else { return };
+        {
+            let mut mgr = pm.lock().unwrap();
+            mgr.eval(r#"(defn add [_ctx] (harness/add-followup "next turn"))"#)
+                .unwrap();
+            mgr.register("on-tool-end", "add");
+            mgr.dispatch_tool_hook("on-tool-end", "@{:tool \"t\" :output \"x\"}")
+                .unwrap();
+        }
+        let hook = get_followup_messages_from_plugin_manager(pm);
+        let messages = hook().await;
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            LoopMessage::User(u) => assert_eq!(u.content, "next turn"),
+            _ => panic!("expected User"),
+        }
+    }
+
+    /// Unknown thinking-level strings get filtered out — a
+    /// plugin typo doesn't crash the run.
+    #[tokio::test]
+    async fn prepare_next_turn_ignores_unknown_thinking_level() {
+        let Some(pm) = try_pm() else { return };
+        {
+            let mut mgr = pm.lock().unwrap();
+            mgr.eval(r#"(defn bad [_ctx] (harness/set-next-thinking-level "supercritical"))"#)
+                .unwrap();
+            mgr.register("on-tool-end", "bad");
+            mgr.dispatch_tool_hook("on-tool-end", "@{:tool \"t\" :output \"x\"}")
+                .unwrap();
+        }
+        let hook = prepare_next_turn_from_plugin_manager(pm);
+        // "supercritical" doesn't parse → thinking_level None
+        // → no model set either → None overall.
+        assert!(hook(turn_ctx()).await.is_none());
     }
 }

@@ -2010,6 +2010,71 @@ impl PluginManager {
         self.take_string_slot("harness-next-model")
     }
 
+    // ============================================================
+    // Phase 5 — pi-loop hook slots
+    // ============================================================
+
+    /// Read and clear the `harness-next-thinking-level` slot.
+    /// Set by plugins via `harness/set-next-thinking-level` to
+    /// request a reasoning-level change for the next turn. The
+    /// new agent_loop path consults this from its
+    /// `prepareNextTurn` hook.
+    ///
+    /// Returns the raw string ("low" | "medium" | "high" |
+    /// "xhigh" | "off" | "minimal"); the caller maps it to
+    /// `ThinkingLevel`.
+    pub fn take_pending_next_thinking_level(&mut self) -> Option<String> {
+        self.take_string_slot("harness-next-thinking-level")
+    }
+
+    /// Read and clear the `harness-stop-after-turn` flag. Set
+    /// by plugins via `harness/request-stop-after-turn` to ask
+    /// the loop to exit gracefully after the current turn.
+    /// Polled by the agent_loop `shouldStopAfterTurn` hook.
+    pub fn take_pending_stop_after_turn(&mut self) -> bool {
+        // The slot is `nil` initially and `true` once set. Eval
+        // returns "true" or "false" as text.
+        let was_set = self
+            .worker
+            .eval("(if harness-stop-after-turn true false)")
+            .map(|s| s == "true")
+            .unwrap_or(false);
+        if was_set {
+            let _ = self.worker.eval("(set harness-stop-after-turn nil)");
+        }
+        was_set
+    }
+
+    /// Drain the `harness-steering-messages` blob — a newline-
+    /// separated list of strings each plugins added via
+    /// `harness/add-steering`. Returns one entry per message;
+    /// empty Vec if no plugin added any.
+    pub fn drain_steering_messages(&mut self) -> Vec<String> {
+        self.drain_newline_blob("harness-steering-messages")
+    }
+
+    /// Drain the `harness-followup-messages` blob. Same shape
+    /// as steering; read at the outer-loop boundary by the new
+    /// loop's `getFollowUpMessages` hook.
+    pub fn drain_followup_messages(&mut self) -> Vec<String> {
+        self.drain_newline_blob("harness-followup-messages")
+    }
+
+    /// Shared body for `drain_*_messages` — read the slot's
+    /// string contents, split on newline, filter empty entries,
+    /// clear the slot to `""`.
+    fn drain_newline_blob(&mut self, var: &str) -> Vec<String> {
+        let raw = self
+            .worker
+            .eval(&format!("(if (string? {var}) {var} \"\")"))
+            .unwrap_or_default();
+        let _ = self.worker.eval(&format!("(set {var} \"\")"));
+        raw.lines()
+            .map(|s| s.to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
     /// Read and clear the `harness-prompt-replace` slot. Set by plugins
     /// from `on-prompt` to rewrite the user turn before the agent runs.
     /// Distinct from `take_pending_prompt`, which carries the
