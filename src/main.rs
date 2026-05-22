@@ -122,6 +122,22 @@ fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
 
     let mode = resolve_mode(cli, cfg);
     let checker = PermissionChecker::new(&perm_config, mode, None);
+    // Audit H11: Yolo mode unconditionally returns Allowed BEFORE rule
+    // lookup, so any explicit Deny rule the user configured (for
+    // `rm -rf /`, `aws *`, an `external_directory` deny, etc.) is
+    // silently inert. Warn once at startup so the user understands
+    // the implication of their config; we don't change the behavior
+    // (Yolo is documented as "all rules off") but the warning makes
+    // the gap visible instead of hidden.
+    if mode == SecurityMode::Yolo {
+        let n = checker.deny_rule_count();
+        if n > 0 {
+            eprintln!(
+                "warning: Yolo mode is active and your config has {} deny rule(s) — those rules will be IGNORED. Yolo allows every tool call unconditionally. Remove --yolo (or `yolo = true` in config) to honor deny rules.",
+                n,
+            );
+        }
+    }
     let perm: PermCheck = std::sync::Arc::new(std::sync::Mutex::new(checker));
 
     let (ask_tx, ask_rx) = tokio::sync::mpsc::channel(64);

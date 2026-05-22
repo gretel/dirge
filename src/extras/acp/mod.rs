@@ -160,6 +160,14 @@ async fn run_prompt(
     let (permission, ask_tx) = build_acp_permission(state);
     let sandbox = Sandbox::new(state.cli.resolve_sandbox(&state.cfg));
 
+    // Audit H16: ACP path used to pass `None` for `bg_store`, so the
+    // `task` tool's `background=true` path silently degraded — the
+    // store insert was skipped, the spawned subagent ran but had
+    // nowhere to deposit its result for the next turn. Provide a
+    // real store. No UI sink (ACP renders via its own protocol),
+    // so the lifecycle events drop on the floor; the LLM-side
+    // pending-notification mechanism still works.
+    let bg_store = crate::agent::tools::background::BackgroundStore::new();
     let agent = crate::provider::build_agent(
         model,
         &state.cli,
@@ -169,7 +177,7 @@ async fn run_prompt(
         ask_tx,
         None,
         None,
-        None,
+        Some(bg_store),
         #[cfg(feature = "lsp")]
         None,
         sandbox,

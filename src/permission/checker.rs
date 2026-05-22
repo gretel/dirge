@@ -267,9 +267,25 @@ impl PermissionChecker {
             .map(|(a, _)| *a)
             .unwrap_or(self.default_action);
         let last_pat = matched.last().map(|(_, p)| p.clone());
+
+        // Audit H9: `external_directory` rules used to fire only in
+        // `SecurityMode::Accept`. A user who configured
+        // `external_directory = { "/external/safe/**" = "allow" }`
+        // saw the rule silently ignored under Standard/Restrictive.
+        // Pre-compute the overlay so each mode can opt into it
+        // uniformly.
+        let is_external = self.is_external_path(&abs_path);
+        let ext_dir_action = if is_external {
+            self.match_ext_dir(&abs_path)
+        } else {
+            None
+        };
+
         let action = match self.mode {
             SecurityMode::Restrictive => {
-                if matched.is_empty() && self.default_action == Action::Allow {
+                if let Some(a) = ext_dir_action {
+                    a
+                } else if matched.is_empty() && self.default_action == Action::Allow {
                     Action::Ask
                 } else {
                     base
@@ -277,20 +293,31 @@ impl PermissionChecker {
             }
             SecurityMode::Accept => match base {
                 Action::Ask => {
-                    if self.is_external_path(&abs_path) {
-                        self.match_ext_dir(&abs_path).unwrap_or(Action::Ask)
+                    if is_external {
+                        ext_dir_action.unwrap_or(Action::Ask)
                     } else {
                         Action::Allow
                     }
                 }
                 other => other,
             },
-            SecurityMode::Standard => base,
+            SecurityMode::Standard => {
+                // Explicit ext_dir rule overrides the base for external
+                // paths. For non-external paths (or external paths
+                // without a matching ext_dir rule) keep the prior
+                // base-action behavior — the catch-all below will
+                // demote unmatched external Allows to Ask.
+                if let Some(a) = ext_dir_action {
+                    a
+                } else {
+                    base
+                }
+            }
             SecurityMode::Yolo => unreachable!(),
         };
 
         let action =
-            if matched.is_empty() && action == Action::Allow && self.is_external_path(&abs_path) {
+            if matched.is_empty() && action == Action::Allow && is_external && ext_dir_action.is_none() {
                 Action::Ask
             } else {
                 action
@@ -385,6 +412,35 @@ impl PermissionChecker {
 
     pub fn set_mode(&mut self, mode: SecurityMode) {
         self.mode = mode;
+    }
+
+    /// Resolve a possibly-relative, possibly-symlinked path to its
+    /// canonical form using the checker's own working_dir.
+    /// Exposes `resolve_absolute` to callers that need the same
+    /// canonical path the check ran against (audit H12 — pass this
+    /// to `File::open` instead of the raw `args.path` to close the
+    /// symlink-swap TOCTOU between check and open).
+    pub fn resolve_path_for_tool(&self, path: &str) -> String {
+        resolve_absolute(path, &self.working_dir)
+    }
+
+    /// Count of explicit `Deny` rules across all tools + the
+    /// external-directory ruleset. Used by the host to warn the user
+    /// when Yolo mode is active alongside non-empty deny rules —
+    /// Yolo unconditionally returns `Allowed` before any rule
+    /// lookup, so those deny rules are silently inert (audit H11).
+    pub fn deny_rule_count(&self) -> usize {
+        let in_tool_rules: usize = self
+            .rules
+            .values()
+            .map(|v| v.iter().filter(|(_, a)| *a == Action::Deny).count())
+            .sum();
+        let in_ext_dir = self
+            .ext_dir_rules
+            .iter()
+            .filter(|(_, a)| *a == Action::Deny)
+            .count();
+        in_tool_rules + in_ext_dir
     }
 
     pub fn mode(&self) -> SecurityMode {

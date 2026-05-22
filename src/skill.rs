@@ -21,15 +21,24 @@ pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
         ]
     });
 
-    let project_dirs = find_project_ancestor_dirs(cwd)
-        .into_iter()
-        .flat_map(|ancestor| {
-            [
-                ancestor.join(".claude").join("skills"),
-                ancestor.join(".opencode").join("skills"),
-                ancestor.join(".dirge").join("skills"),
-            ]
-        });
+    // `find_project_ancestor_dirs` returns cwd first, then parents
+    // (inner → outer). The map insert below is last-write-wins, so
+    // iterating in that natural order makes OUTER repos overwrite
+    // INNER — the opposite of opencode's "more specific wins". For
+    // a monorepo where both `monorepo/.dirge/skills/foo` and
+    // `monorepo/svc/.dirge/skills/foo` exist, the svc-level skill
+    // is the one a developer working in svc would expect. Reverse
+    // so OUTER repos are visited first (and overwritten by INNER).
+    // Audit H13.
+    let mut project_ancestors = find_project_ancestor_dirs(cwd);
+    project_ancestors.reverse();
+    let project_dirs = project_ancestors.into_iter().flat_map(|ancestor| {
+        [
+            ancestor.join(".claude").join("skills"),
+            ancestor.join(".opencode").join("skills"),
+            ancestor.join(".dirge").join("skills"),
+        ]
+    });
 
     for dir in global_dirs.chain(project_dirs) {
         if let Ok(entries) = std::fs::read_dir(&dir) {

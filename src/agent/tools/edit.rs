@@ -7,7 +7,7 @@ use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{
-    AskSender, EditArgs, PermCheck, ToolError, check_perm_path, is_plan_file,
+    AskSender, EditArgs, PermCheck, ToolError, check_perm_path_resolve, is_plan_file,
 };
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
@@ -139,7 +139,10 @@ impl Tool for EditTool {
             ));
         }
 
-        check_perm_path(&self.permission, &self.ask_tx, "edit", &args.path).await?;
+        // Audit H12: pin file operations to the canonical path the
+        // permission check resolved.
+        let resolved_path =
+            check_perm_path_resolve(&self.permission, &self.ask_tx, "edit", &args.path).await?;
 
         if let Some(plan) = &self.plan_file {
             if !is_plan_file(plan, &args.path) {
@@ -155,7 +158,7 @@ impl Tool for EditTool {
         // pointing it at a gigabyte log file fails fast rather
         // than OOM-ing the process. Matches the apply_patch cap.
         const MAX_EDIT_BYTES: u64 = 100 * 1024 * 1024;
-        if let Ok(meta) = tokio::fs::metadata(&args.path).await
+        if let Ok(meta) = tokio::fs::metadata(&resolved_path).await
             && meta.len() > MAX_EDIT_BYTES
         {
             return Err(ToolError::Msg(format!(
@@ -164,7 +167,7 @@ impl Tool for EditTool {
                 MAX_EDIT_BYTES,
             )));
         }
-        let bytes = tokio::fs::read(&args.path).await?;
+        let bytes = tokio::fs::read(&resolved_path).await?;
         let has_crlf = bytes.windows(2).any(|w| w == b"\r\n");
         let content = String::from_utf8_lossy(&bytes).replace("\r\n", "\n");
         let normalized_old = args.old_text.replace("\r\n", "\n");
@@ -248,8 +251,8 @@ impl Tool for EditTool {
 
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
-        tokio::fs::write(&args.path, &output).await?;
-        crate::agent::tools::modified::mark_modified(std::path::Path::new(&args.path));
+        tokio::fs::write(&resolved_path, &output).await?;
+        crate::agent::tools::modified::mark_modified(std::path::Path::new(&resolved_path));
         // File mutated → invalidate cached reads/greps/listings for this turn.
         if let Some(ref cache) = self.cache {
             cache.clear();
@@ -300,7 +303,7 @@ impl Tool for EditTool {
 
         #[cfg(feature = "lsp")]
         {
-            let path = std::path::Path::new(&args.path);
+            let path = std::path::Path::new(&resolved_path);
             result.push_str(
                 &crate::agent::tools::write::append_lsp_block(
                     self.lsp_manager.as_ref(),

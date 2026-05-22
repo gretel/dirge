@@ -2732,6 +2732,34 @@ pub async fn run_interactive(
                 let was_denied = matches!(decision, UserDecision::Deny);
                 let _ = ask_req.reply.send(decision);
 
+                // Audit H10: cascading reject. When the user denies
+                // one tool, any other tool requests already queued
+                // in `ask_rx` belong to the same agent run and the
+                // user almost certainly doesn't want to be asked
+                // about them serially. Drain whatever's already
+                // enqueued and auto-deny each. New requests that
+                // arrive after this drain still go through the
+                // normal alert flow on the next iteration.
+                if was_denied
+                    && let Some(rx) = ask_rx.as_mut()
+                {
+                    let mut cascaded = 0usize;
+                    while let Ok(stale) = rx.try_recv() {
+                        let _ = stale.reply.send(UserDecision::Deny);
+                        cascaded += 1;
+                    }
+                    if cascaded > 0 {
+                        renderer.write_line(
+                            &format!(
+                                "  ↳ also denied {} queued tool request{}",
+                                cascaded,
+                                if cascaded == 1 { "" } else { "s" },
+                            ),
+                            theme::dim(),
+                        )?;
+                    }
+                }
+
                 // Reopen / mark the chamber depending on outcome:
                 //
                 // - **Allow**: write a fresh chamber TOP banner so

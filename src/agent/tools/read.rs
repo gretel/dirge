@@ -5,7 +5,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, PermCheck, ReadArgs, ToolError, check_perm_path};
+use crate::agent::tools::{AskSender, PermCheck, ReadArgs, ToolError, check_perm_path_resolve};
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::{LspManager, TouchMode};
 
@@ -154,7 +154,12 @@ impl Tool for ReadTool {
     }
 
     async fn call(&self, args: ReadArgs) -> Result<String, ToolError> {
-        check_perm_path(&self.permission, &self.ask_tx, "read", &args.path).await?;
+        // Audit H12: pin the path we'll actually open to the same
+        // canonical form the permission check ran against, so a
+        // symlink swap between check and open can't land us on a
+        // different file than the user authorized.
+        let resolved_path =
+            check_perm_path_resolve(&self.permission, &self.ask_tx, "read", &args.path).await?;
 
         let cache_key = format!(
             "read:{}:{}:{}",
@@ -184,7 +189,7 @@ impl Tool for ReadTool {
         const MAX_LINE_BYTES: usize = 16 * 1024;
         const TRUNC_MARKER: &str = " …[line truncated]";
 
-        let metadata = tokio::fs::metadata(&args.path).await?;
+        let metadata = tokio::fs::metadata(&resolved_path).await?;
         let file_size = metadata.len();
         if file_size > MAX_FILE_BYTES {
             return Err(ToolError::Msg(format!(
@@ -212,7 +217,7 @@ impl Tool for ReadTool {
             )));
         }
         {
-            let mut sniffer = tokio::fs::File::open(&args.path).await?;
+            let mut sniffer = tokio::fs::File::open(&resolved_path).await?;
             let mut sample = vec![0u8; 4096];
             let n = sniffer.read(&mut sample).await?;
             sample.truncate(n);
@@ -224,7 +229,7 @@ impl Tool for ReadTool {
             }
         }
 
-        let file = tokio::fs::File::open(&args.path).await?;
+        let file = tokio::fs::File::open(&resolved_path).await?;
         let reader = tokio::io::BufReader::new(file);
         let mut lines = reader.lines();
         let mut total_lines = 0usize;
@@ -310,7 +315,7 @@ impl Tool for ReadTool {
         // quickly). No diagnostic surfacing on read.
         #[cfg(feature = "lsp")]
         if let Some(manager) = self.lsp_manager.clone() {
-            let path = std::path::PathBuf::from(&args.path);
+            let path = std::path::PathBuf::from(&resolved_path);
             tokio::spawn(async move {
                 manager.touch_file(&path, TouchMode::Notify).await;
             });
