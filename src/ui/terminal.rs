@@ -109,7 +109,7 @@ impl Drop for TerminalGuard {
         // for very-slow / non-responsive terminals (raw write to
         // /dev/null or similar).
         #[cfg(unix)]
-        sync_and_drain_via_cpr(&mut stdout, Duration::from_millis(500));
+        sync_and_drain_via_sentinel(&mut stdout, Duration::from_millis(500));
 
         // === Phase 3: tear down raw mode ===
         // By here the synchronization sentinel has fired and the
@@ -138,19 +138,34 @@ fn wait_for_reader_exit(budget: Duration) {
     }
 }
 
-/// Send a CPR query (`\x1b[6n`) and read stdin until the terminal's
-/// reply (`\x1b[<row>;<col>R`) appears, discarding every byte along
-/// the way. Terminals process queries in FIFO order, so seeing our
-/// CPR reply guarantees every PRIOR unsolicited reply
-/// (alt-screen-exit chatter from iTerm2 / kitty / foot, OSC 11
-/// bg-color, primary DA) has already been drained. This is the
-/// xterm "sync" trick — used by vim, neovim, and most modern TUIs.
+/// Send a DSR-OS query (`\x1b[5n`) and read stdin until the
+/// terminal's reply (`\x1b[0n`) appears, discarding every byte
+/// along the way. Terminals process queries in FIFO order, so
+/// seeing our DSR-OS reply guarantees every PRIOR reply
+/// (alt-screen-exit chatter from iTerm2 / kitty / foot — OSC 11
+/// bg-color, primary DA, AND iTerm2's own SPONTANEOUS CPR
+/// `\x1b[…R`) has already been delivered and discarded by this
+/// loop.
 ///
-/// Bounded by `budget` as a fallback for terminals that don't reply
-/// at all (rare; mostly headless / pipe contexts where the guard
-/// shouldn't be active anyway).
+/// Why DSR-OS instead of CPR (`\x1b[6n`):
+/// CPR replies are sent SPONTANEOUSLY by iTerm2 on alt-screen
+/// transitions. A previous attempt used CPR as the sentinel; it
+/// matched on the spontaneous reply, exited early, and let the
+/// reply to OUR sentinel leak after raw mode flipped off. DSR-OS
+/// (`\x1b[0n`) is essentially never sent unsolicited — its only
+/// purpose is to reply to `\x1b[5n` ("are you OK?"). The exact
+/// 4-byte reply `ESC [ 0 n` is uniquely tied to our query.
+///
+/// `tcflush(STDIN_FILENO, TCIFLUSH)` runs after the read loop as
+/// a belt-and-braces dump of anything still queued at the OS
+/// level (stragglers from a slow terminal). Bytes that arrive
+/// AFTER tcflush would still leak, but the sentinel reply
+/// already proves the bulk of the chatter has been delivered.
+///
+/// Bounded by `budget` as a fallback for terminals that don't
+/// reply (rare; mostly headless / pipe contexts).
 #[cfg(unix)]
-fn sync_and_drain_via_cpr(stdout: &mut std::io::Stdout, budget: Duration) {
+fn sync_and_drain_via_sentinel(stdout: &mut std::io::Stdout, budget: Duration) {
     let fd_in: libc::c_int = 0; // stdin
 
     // Save the current stdin flags so we can restore blocking
@@ -164,67 +179,61 @@ fn sync_and_drain_via_cpr(stdout: &mut std::io::Stdout, budget: Duration) {
         return;
     }
 
-    // Emit the sentinel query. If write fails (broken pipe, e.g.
-    // stdout redirected to a file), bail — we can't sync.
-    if stdout.write_all(b"\x1b[6n").is_err() {
+    // Emit DSR-OS. If write fails (broken pipe, e.g. stdout
+    // redirected), bail — we can't sync.
+    if stdout.write_all(b"\x1b[5n").is_err() {
         let _ = unsafe { libc::fcntl(fd_in, libc::F_SETFL, original_flags) };
         return;
     }
     let _ = stdout.flush();
 
+    // State machine matches the EXACT 4-byte reply `ESC [ 0 n`.
+    // Any other escape sequence (OSC, CPR ending in `R`, DA1
+    // ending in `c`, SS3) walks past without triggering — only
+    // the `\x1b[0n` reply (which only our DSR-OS query elicits)
+    // sets `got_reply`. A stray ESC mid-sequence restarts the
+    // matcher so an unsolicited OSC can't desync us.
     let deadline = std::time::Instant::now() + budget;
     let mut buf = [0u8; 1024];
-    // State machine: scan accumulated bytes for any `\x1b[…R`
-    // sequence. CPR is the only `R`-terminated CSI that comes back
-    // unsolicited at this stage; we're not strict about row/col
-    // values, just looking for the terminator.
-    let mut in_csi = false;
-    let mut got_cpr = false;
-    while !got_cpr && std::time::Instant::now() < deadline {
+    // 0 = waiting for ESC, 1 = saw ESC, 2 = saw ESC[, 3 = saw ESC[0
+    let mut match_state: u8 = 0;
+    let mut got_reply = false;
+    while !got_reply && std::time::Instant::now() < deadline {
         let n = unsafe { libc::read(fd_in, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
         if n > 0 {
-            // Scan the freshly-read chunk for `\x1b[…R`. Carries
-            // state across reads via `in_csi` so a CSI split
-            // across read boundaries still triggers correctly.
             for &b in &buf[..n as usize] {
-                if !in_csi {
-                    if b == 0x1b {
-                        // Start of an escape; the next byte should
-                        // be `[` for CSI, but we don't gate on
-                        // it — the scanner is tolerant to OSC
-                        // (`\x1b]…`) and SS3 (`\x1bO…`) by simply
-                        // not matching `R` until they're consumed.
-                        in_csi = true;
+                match (match_state, b) {
+                    (0, 0x1b) => match_state = 1,
+                    (1, b'[') => match_state = 2,
+                    (2, b'0') => match_state = 3,
+                    (3, b'n') => {
+                        got_reply = true;
+                        break;
                     }
-                } else if b == b'R' {
-                    got_cpr = true;
-                    break;
-                } else if b == 0x1b {
-                    // New escape started without the previous one
-                    // closing — could happen on garbage input.
-                    // Reset and continue.
-                    in_csi = true;
+                    (_, 0x1b) => match_state = 1,
+                    _ => match_state = 0,
                 }
             }
             continue;
         }
         if n == 0 {
-            // EOF — stdin closed. Nothing more to drain.
             break;
         }
         let err = std::io::Error::last_os_error().raw_os_error();
         match err {
             Some(e) if e == libc::EAGAIN || e == libc::EWOULDBLOCK => {
-                // Nothing pending right now; sleep briefly and
-                // poll again. 4ms is small enough that even fast
-                // terminals exit within ~8-12ms total (CPR
-                // round-trip + slack); a slow SSH link gets the
-                // full 500ms budget.
                 std::thread::sleep(Duration::from_millis(4));
             }
             Some(libc::EINTR) => continue,
             _ => break,
         }
+    }
+
+    // Belt-and-braces: dump anything still queued at the OS level.
+    // `TCIFLUSH` discards all unread input. Catches stragglers
+    // that arrived between the last successful read and now.
+    unsafe {
+        libc::tcflush(fd_in, libc::TCIFLUSH);
     }
 
     // Restore blocking semantics for the shell.
