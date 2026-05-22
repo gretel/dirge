@@ -1132,7 +1132,19 @@ pub async fn run_interactive(
                                         if dropped == 1 { "" } else { "s" },
                                     ));
                                 }
-                                renderer.write_line(&msg, c_error())?;
+                                // Ctrl+C interrupt during an
+                                // in-flight tool: close the chamber
+                                // passively (no "tool denied"
+                                // label — interrupt isn't a permission
+                                // event) and surface the interrupt
+                                // message outside.
+                                write_outside_chamber(
+                                    &mut renderer,
+                                    &mut last_tool_name,
+                                    &mut tool_chamber_open,
+                                    &msg,
+                                    c_error(),
+                                )?;
                                 renderer.draw_bottom(
                                     &input,
                                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -1147,7 +1159,13 @@ pub async fn run_interactive(
                         if renderer.selection_active && key.code == KeyCode::Char('y') {
                             if let Some(text) = renderer.selected_text() {
                                 copy_to_clipboard(&text);
-                                renderer.write_line("copied selection", Color::Green)?;
+                                write_outside_chamber(
+                                    &mut renderer,
+                                    &mut last_tool_name,
+                                    &mut tool_chamber_open,
+                                    "copied selection",
+                                    Color::Green,
+                                )?;
                             }
                             renderer.clear_selection();
                             renderer.render_viewport()?;
@@ -1165,7 +1183,10 @@ pub async fn run_interactive(
                             && key.modifiers.contains(KeyModifiers::CONTROL);
                         if ctrl_x && !interjection_queue.is_empty() {
                             interjection_queue.pop_back();
-                            renderer.write_line(
+                            write_outside_chamber(
+                                &mut renderer,
+                                &mut last_tool_name,
+                                &mut tool_chamber_open,
                                 &format!(
                                     "dropped 1 queued message ({} remaining)",
                                     interjection_queue.len()
@@ -1509,7 +1530,13 @@ pub async fn run_interactive(
                             }
                             if let Some(prefix) = shell::parse_shell_prefix(&text) {
                                 if is_running {
-                                    renderer.write_line("agent is busy, wait or interrupt first", c_error())?;
+                                    write_outside_chamber(
+                                        &mut renderer,
+                                        &mut last_tool_name,
+                                        &mut tool_chamber_open,
+                                        "agent is busy, wait or interrupt first",
+                                        c_error(),
+                                    )?;
                                     renderer.draw_bottom(
                                         &input,
                                         &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -1568,7 +1595,13 @@ pub async fn run_interactive(
                                     text.split_whitespace().next().unwrap_or(""),
                                     "/quit" | "/help" | "/reasoning"
                                 ) {
-                                    renderer.write_line("agent is busy — wait, interrupt (Ctrl+C), or use /quit", c_error())?;
+                                    write_outside_chamber(
+                                        &mut renderer,
+                                        &mut last_tool_name,
+                                        &mut tool_chamber_open,
+                                        "agent is busy — wait, interrupt (Ctrl+C), or use /quit",
+                                        c_error(),
+                                    )?;
                                     renderer.draw_bottom(
                                         &input,
                                         &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -3429,7 +3462,7 @@ pub async fn run_interactive(
                 // ANSI into the chat.
                 use crate::ui::notifications::Notification;
                 let policy = crate::ui::ansi::StripPolicy::KEEP_NEWLINE;
-                let (text, color) = match notif {
+                let (raw_text, color) = match notif {
                     Notification::McpLog { server, line } => {
                         let safe_server = crate::ui::ansi::strip_controls(&server, policy);
                         let safe_line = crate::ui::ansi::strip_controls(&line, policy);
@@ -3444,6 +3477,29 @@ pub async fn run_interactive(
                     Notification::Error(line) => {
                         (crate::ui::ansi::strip_controls(&line, policy), c_error())
                     }
+                };
+                // Review #12: cap per-notification line count. A
+                // malicious / buggy producer can ship a single
+                // notification carrying thousands of `\n` chars
+                // ((bounded channel limits NOTIFICATIONS but not
+                // ROWS per notification → amplification path).
+                // After 200 lines we truncate + emit a `[…N more
+                // suppressed]` marker so the chat doesn't get
+                // flooded.
+                const MAX_LINES_PER_NOTIF: usize = 200;
+                let line_count = raw_text.matches('\n').count() + 1;
+                let text = if line_count > MAX_LINES_PER_NOTIF {
+                    let truncated: String = raw_text
+                        .split_inclusive('\n')
+                        .take(MAX_LINES_PER_NOTIF)
+                        .collect();
+                    format!(
+                        "{}… [{} more lines suppressed]",
+                        truncated,
+                        line_count - MAX_LINES_PER_NOTIF,
+                    )
+                } else {
+                    raw_text
                 };
                 write_outside_chamber(
                     &mut renderer,
@@ -3536,10 +3592,23 @@ pub async fn run_interactive(
                 }
             } => {
                 was_reasoning = false;
+                // Single chokepoint: close any open tool chamber
+                // (and clear the agent-line state) before painting
+                // the question prompt. Without this, a `question`
+                // tool whose chamber was already open would have
+                // the prompt header land INSIDE the chamber — same
+                // X-inside-chamber bug class fixed for lifecycle /
+                // notifications.
                 if agent_line_started {
-                    renderer.write_line("", Color::White)?;
                     agent_line_started = false;
                 }
+                write_outside_chamber(
+                    &mut renderer,
+                    &mut last_tool_name,
+                    &mut tool_chamber_open,
+                    "",
+                    Color::White,
+                )?;
 
                 let mut answers: Vec<Vec<String>> = Vec::new();
                 let mut rejected = false;
@@ -3814,9 +3883,16 @@ pub async fn run_interactive(
                 // user_rx after the dialog ends. Without this, a paste or
                 // unrelated key during a confirm dialog would be lost.
                 let mut deferred: Vec<UserEvent> = Vec::new();
+                // Close any open tool chamber FIRST. A plugin hook
+                // can fire from inside on-tool-start which runs
+                // while a tool chamber is open — without this the
+                // confirm/select dialog renders INSIDE the chamber.
                 match dialog_req {
                     DialogRequest::Confirm { title, question, reply } => {
-                        renderer.write_line(
+                        write_outside_chamber(
+                            &mut renderer,
+                            &mut last_tool_name,
+                            &mut tool_chamber_open,
                             &format!("[plugin {}] {}", title, question),
                             c_perm(),
                         )?;
@@ -3863,7 +3939,10 @@ pub async fn run_interactive(
                         )?;
                     }
                     DialogRequest::Select { title, options, reply } => {
-                        renderer.write_line(
+                        write_outside_chamber(
+                            &mut renderer,
+                            &mut last_tool_name,
+                            &mut tool_chamber_open,
                             &format!("[plugin {}] pick one:", title),
                             c_perm(),
                         )?;
@@ -3931,17 +4010,20 @@ pub async fn run_interactive(
                 }
             } => {
                 was_reasoning = false;
-                if agent_line_started {
-                    renderer.write_line("", Color::White)?;
-                    agent_line_started = false;
-                }
+                agent_line_started = false;
 
                 let (label, prompt_name) = match plan_req.action {
                     PlanAction::Enter => ("plan mode", "plan"),
                     PlanAction::Exit => ("implementation mode", "code"),
                 };
 
-                renderer.write_line(
+                // Single chokepoint: close any open tool chamber
+                // before painting the plan-switch prompt so it
+                // doesn't land inside an in-flight tool's chamber.
+                write_outside_chamber(
+                    &mut renderer,
+                    &mut last_tool_name,
+                    &mut tool_chamber_open,
                     &format!("[plan] switch to {}? (y/n)", label),
                     c_perm(),
                 )?;
@@ -4152,36 +4234,34 @@ pub(crate) fn write_outside_chamber(
     text: &str,
     color: Color,
 ) -> anyhow::Result<()> {
-    close_tool_chamber_if_open(renderer, last_tool_name, tool_chamber_open)?;
-    renderer.write_line(text, color)?;
+    // Passive close — just terminate the visual frame. The tool
+    // isn't being denied; we're moving on. Active denial paths
+    // (permission deny, agent error, interjection) call
+    // `close_tool_chamber_abort` themselves so they get the
+    // "⚠ tool denied" wording.
+    //
+    // Defense-in-depth (review #7): sanitize control bytes here
+    // so a future caller that forgets to sanitize can't smuggle
+    // ANSI escapes into chat. KEEP_NEWLINE preserves intentional
+    // multi-line content; `renderer.write_line` handles the
+    // per-line splits + per-row caps.
+    close_tool_chamber_passive(renderer, last_tool_name, tool_chamber_open)?;
+    let safe = crate::ui::ansi::strip_controls(text, crate::ui::ansi::StripPolicy::KEEP_NEWLINE);
+    renderer.write_line(&safe, color)?;
     Ok(())
 }
 
-/// Close the in-flight tool chamber if one is open. Used at every
-/// site that fires without going through `render_tool_output` (which
-/// closes the chamber itself): permission alerts, agent errors,
-/// interjections, fresh `ToolCall` events when the previous chamber
-/// wasn't terminated by a `ToolResult`. Idempotent — calling twice
-/// emits one bottom border at most.
-///
-/// Prefer `write_outside_chamber` for the common case of "close
-/// chamber, then write one line"; that helper bundles both steps
-/// so the close can't be forgotten.
-fn close_tool_chamber_if_open(
+/// Close an in-flight chamber WITH an abort/denied row painted
+/// inside. Use this when the chamber is closing because the tool
+/// was actively rejected — permission deny, agent error,
+/// interjection. The user needs to see WHY no result is coming.
+fn close_tool_chamber_abort(
     renderer: &mut Renderer,
     last_tool_name: &mut Option<String>,
     tool_chamber_open: &mut bool,
 ) -> anyhow::Result<()> {
-    // Close ANY of: a name-tracked open chamber OR a flag-tracked one.
-    // The two can disagree (see comment on `tool_chamber_open` at its
-    // declaration). Either signal alone is enough to mean "there's an
-    // unclosed `╭─` on screen", and we close it idempotently.
     if last_tool_name.is_some() || *tool_chamber_open {
         let (frame_w, inner) = chamber_widths(renderer);
-        // Abnormal close: this helper is only called when the tool's
-        // chamber is closing without a `ToolResult` (permission
-        // denied, interjected mid-execution, agent error, fresh tool
-        // call before the previous one finished).
         renderer.write_line(
             &chamber_row_centered("⚠ tool denied · aborted · no result", inner),
             theme::perm(),
@@ -4191,6 +4271,46 @@ fn close_tool_chamber_if_open(
         *tool_chamber_open = false;
     }
     Ok(())
+}
+
+/// Close an in-flight chamber WITHOUT painting an abort row —
+/// just emit the chamber bottom and clear state. Use this when
+/// the chamber is being closed because something ELSE (notification,
+/// lifecycle event, question prompt, plan switch, plugin dialog)
+/// wants to print outside the chamber. The tool itself isn't
+/// denied; we just need to terminate the visual frame so the new
+/// content doesn't land inside.
+///
+/// Reviewer-caught regression: the previous "structural fix"
+/// reused `close_tool_chamber_if_open` (always painted "⚠ tool
+/// denied"). Wiring that under `write_outside_chamber` meant every
+/// notification arriving mid-chamber would falsely brand the tool
+/// as denied. The split lets each caller pick the right wording.
+fn close_tool_chamber_passive(
+    renderer: &mut Renderer,
+    last_tool_name: &mut Option<String>,
+    tool_chamber_open: &mut bool,
+) -> anyhow::Result<()> {
+    if last_tool_name.is_some() || *tool_chamber_open {
+        let (frame_w, _inner) = chamber_widths(renderer);
+        renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+        *last_tool_name = None;
+        *tool_chamber_open = false;
+    }
+    Ok(())
+}
+
+/// Back-compat alias for the abort variant. Every existing
+/// caller of `close_tool_chamber_if_open` was in an
+/// abort-shaped context (permission deny / error / interjection /
+/// fresh tool over stale chamber), so the aliasing preserves
+/// their behavior. New code should pick the variant explicitly.
+fn close_tool_chamber_if_open(
+    renderer: &mut Renderer,
+    last_tool_name: &mut Option<String>,
+    tool_chamber_open: &mut bool,
+) -> anyhow::Result<()> {
+    close_tool_chamber_abort(renderer, last_tool_name, tool_chamber_open)
 }
 
 /// `│   <content centered to inner>   │` — pad text on both sides so
@@ -4867,6 +4987,53 @@ mod tests {
         write_outside_chamber(&mut renderer, &mut name, &mut open, "plain", Color::White).unwrap();
         // No assertion on state — just verifying it doesn't panic
         // / error.
+    }
+
+    /// Reviewer-caught regression: previously `write_outside_chamber`
+    /// reused `close_tool_chamber_if_open` which ALWAYS painted
+    /// "⚠ tool denied · aborted · no result" — meaning every
+    /// notification arriving mid-chamber would falsely brand the
+    /// in-flight tool as denied. After the abort/passive split,
+    /// the helper uses the passive close which only emits the
+    /// chamber bottom + clears state.
+    #[test]
+    fn close_passive_does_not_paint_abort_row() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let initial_buffer_len = renderer.buffer_len();
+        let mut name: Option<String> = None;
+        let mut open = true;
+        close_tool_chamber_passive(&mut renderer, &mut name, &mut open).unwrap();
+        let after = renderer.buffer_len();
+        // Exactly ONE row appended (the bottom border). The abort
+        // variant would have appended TWO (centered abort row +
+        // bottom border).
+        assert_eq!(
+            after - initial_buffer_len,
+            1,
+            "passive close should emit exactly one row (chamber bottom)",
+        );
+        assert!(!open);
+        assert!(name.is_none());
+    }
+
+    /// Abort variant still emits two rows (warning + bottom) so
+    /// permission-deny / error / interjection paths keep their
+    /// existing wording.
+    #[test]
+    fn close_abort_paints_warning_and_bottom() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let initial_buffer_len = renderer.buffer_len();
+        let mut name: Option<String> = None;
+        let mut open = true;
+        close_tool_chamber_abort(&mut renderer, &mut name, &mut open).unwrap();
+        let after = renderer.buffer_len();
+        assert_eq!(
+            after - initial_buffer_len,
+            2,
+            "abort close should emit warning row + bottom border",
+        );
+        assert!(!open);
+        assert!(name.is_none());
     }
 
     /// Tool-result body collapse: long output truncates at
