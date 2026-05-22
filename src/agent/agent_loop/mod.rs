@@ -42,7 +42,8 @@ pub use result::{AfterToolCallResult, BeforeToolCallResult, LoopToolResult};
 pub use stream::{LlmContext, StreamFn, stream_assistant_response};
 pub use tool::LoopTool;
 pub use tools::{
-    ExecutedToolCallBatch, ToolCall, execute_tool_calls_sequential, extract_tool_calls,
+    ExecutedToolCallBatch, ToolCall, execute_tool_calls, execute_tool_calls_parallel,
+    execute_tool_calls_sequential, extract_tool_calls,
 };
 pub use types::{
     Context, ConvertToLlmFn, GetApiKeyFn, LoopConfig, QueueMode, ThinkingLevel, ToolExecutionMode,

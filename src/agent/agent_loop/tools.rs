@@ -440,6 +440,197 @@ async fn emit_tool_result_message(msg: &ToolResultMessage, emit: &mpsc::Sender<L
         .await;
 }
 
+/// Execute a batch of tool calls IN PARALLEL. Faithful port of
+/// pi `executeToolCallsParallel` (agent-loop.ts:451-516).
+///
+/// Key invariants pi enforces and this port preserves:
+///
+/// 1. **Preflight is sequential** — `prepare_tool_call` runs
+///    in source order for every call. Pi tests beforeToolCall
+///    hook ordering at line 469.
+///
+/// 2. **Immediate outcomes finalize sync** — errors from
+///    prepare (tool not found / blocked / aborted) skip the
+///    parallel-execute machinery entirely. They emit
+///    `tool_execution_end` IMMEDIATELY (before any prepared
+///    lambda runs).
+///
+/// 3. **Prepared outcomes become async lambdas** — each
+///    lambda's `tool_execution_end` event fires AT COMPLETION
+///    (inside the lambda), so end events arrive in COMPLETION
+///    order, not source order.
+///
+/// 4. **`tool_execution_end` events: completion order** — this is
+///    what pi:452 verifies. A slow tool at source position 1 +
+///    a fast tool at source position 2 produces end events
+///    `[tool-2, tool-1]`.
+///
+/// 5. **Tool-result `message_start`/`message_end` events: source
+///    order** — emitted AFTER all lambdas resolve via
+///    `Promise.all` (pi line 502, `orderedFinalizedCalls`). Pi
+///    iterates THAT array (source-ordered) to emit messages.
+///    pi:452 also verifies this — tool-result message_end IDs
+///    `[tool-1, tool-2]`.
+///
+/// 6. **Signal abort short-circuits the prepare loop** but
+///    leaves already-queued lambdas to complete (pi lines
+///    478-480, 497-499 — the `break` is after pushing).
+pub async fn execute_tool_calls_parallel(
+    context: &Context,
+    assistant_message: &AssistantMessage,
+    tool_calls: &[ToolCall],
+    config: &LoopConfig,
+    signal: &AbortSignal,
+    emit: &mpsc::Sender<LoopEvent>,
+) -> ExecutedToolCallBatch {
+    use futures::future::join_all;
+    use std::pin::Pin;
+
+    type ResolveFuture = Pin<Box<dyn Future<Output = FinalizedOutcome> + Send>>;
+
+    let mut entries: Vec<ResolveFuture> = Vec::with_capacity(tool_calls.len());
+
+    // Phase 1: preflight — sequentially prepare each call.
+    for tool_call in tool_calls {
+        // 1. Emit tool_execution_start. Pi line 462.
+        let _ = emit
+            .send(LoopEvent::ToolExecutionStart {
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                args: tool_call.arguments.clone(),
+            })
+            .await;
+
+        let prepared =
+            prepare_tool_call(context, assistant_message, tool_call, config, signal).await;
+
+        match prepared {
+            PrepareOutcome::Immediate { result, is_error } => {
+                // Pi line 470-481: immediate finalize, emit end NOW,
+                // push the finalized value (not a future).
+                let finalized = FinalizedOutcome {
+                    tool_call: tool_call.clone(),
+                    result,
+                    is_error,
+                };
+                emit_tool_execution_end(&finalized, emit).await;
+                entries.push(Box::pin(futures::future::ready(finalized)));
+                if signal.is_cancelled() {
+                    break;
+                }
+            }
+            PrepareOutcome::Prepared { tool, args } => {
+                // Pi lines 484-496: push an async lambda that
+                // executes, finalizes, AND emits its
+                // tool_execution_end at the end. The
+                // tool_execution_end ordering THEREFORE matches
+                // completion order, not source order.
+                let tool_call_clone = tool_call.clone();
+                let assistant_clone = assistant_message.clone();
+                let config_clone = config.clone();
+                let context_clone = context.clone();
+                let signal_clone = signal.clone();
+                let emit_clone = emit.clone();
+                entries.push(Box::pin(async move {
+                    let executed = execute_prepared_tool_call(
+                        &tool,
+                        &tool_call_clone,
+                        &args,
+                        &signal_clone,
+                        &emit_clone,
+                    )
+                    .await;
+                    let finalized = finalize_executed_tool_call(
+                        &context_clone,
+                        &assistant_clone,
+                        &tool_call_clone,
+                        &args,
+                        executed,
+                        &config_clone,
+                    )
+                    .await;
+                    // Emit end AT COMPLETION. This is the key
+                    // difference from sequential (which emits
+                    // end immediately after each call).
+                    emit_tool_execution_end(&finalized, &emit_clone).await;
+                    finalized
+                }));
+                if signal.is_cancelled() {
+                    break;
+                }
+            }
+        }
+    }
+
+    // Phase 2: await all lambdas concurrently. `join_all`
+    // preserves input ORDER — the resulting Vec is in source
+    // order even though completion order may differ. Pi uses
+    // `Promise.all` with the same semantics.
+    let finalized: Vec<FinalizedOutcome> = join_all(entries).await;
+
+    // Phase 3: emit tool-result message_start + message_end IN
+    // SOURCE ORDER. Pi lines 502-510 — iterate the
+    // source-ordered array.
+    let mut messages: Vec<ToolResultMessage> = Vec::with_capacity(finalized.len());
+    for f in &finalized {
+        let msg = create_tool_result_message(f);
+        emit_tool_result_message(&msg, emit).await;
+        messages.push(msg);
+    }
+
+    ExecutedToolCallBatch {
+        messages,
+        terminate: should_terminate_tool_batch(&finalized),
+    }
+}
+
+/// Umbrella dispatcher. Picks sequential vs parallel based on:
+///   - `config.tool_execution == Sequential` → sequential
+///   - ANY tool in the batch has `execution_mode == Sequential` →
+///     sequential (forces the WHOLE batch sequential — pi at
+///     line 381 `hasSequentialToolCall`)
+///   - otherwise → parallel
+///
+/// Faithful port of pi `executeToolCalls` (agent-loop.ts:370-388).
+pub async fn execute_tool_calls(
+    context: &Context,
+    assistant_message: &AssistantMessage,
+    config: &LoopConfig,
+    signal: &AbortSignal,
+    emit: &mpsc::Sender<LoopEvent>,
+) -> ExecutedToolCallBatch {
+    let tool_calls = extract_tool_calls(assistant_message);
+    let has_sequential = tool_calls.iter().any(|tc| {
+        context
+            .tools
+            .iter()
+            .find(|t| t.name() == tc.name)
+            .and_then(|t| t.execution_mode())
+            == Some(super::types::ToolExecutionMode::Sequential)
+    });
+    if config.tool_execution == super::types::ToolExecutionMode::Sequential || has_sequential {
+        execute_tool_calls_sequential(
+            context,
+            assistant_message,
+            &tool_calls,
+            config,
+            signal,
+            emit,
+        )
+        .await
+    } else {
+        execute_tool_calls_parallel(
+            context,
+            assistant_message,
+            &tool_calls,
+            config,
+            signal,
+            emit,
+        )
+        .await
+    }
+}
+
 /// Extract `ToolCall`s from an assistant message's content. Port
 /// of pi line 380 `message.content.filter((c) => c.type ===
 /// "toolCall")` adapted to our typed enum.
@@ -482,7 +673,9 @@ mod tests {
         /// Set by tests to control whether `prepare_arguments`
         /// mutates the input shape (pi test 372).
         prepare_arguments_fn: Option<Box<dyn Fn(Value) -> Value + Send + Sync>>,
-        /// Set by tests to override `execution_mode`.
+        /// Set by tests to override `execution_mode`. Phase 3
+        /// uses this to force-sequential individual tools in a
+        /// parallel-by-default batch (pi tests 653, 736).
         execution_mode: Option<ToolExecutionMode>,
         /// Set by tests to inject `terminate: true` into every
         /// result (pi test 1067).
@@ -490,6 +683,28 @@ mod tests {
         /// Recorded args passed to `execute` (so tests can
         /// assert mutations from beforeToolCall took effect).
         executed_args: Arc<Mutex<Vec<Value>>>,
+        /// Phase 3: artificial delay before returning. Used to
+        /// make one tool slower than another so completion-order
+        /// vs source-order is observable. Pi test 452 uses a
+        /// `firstDone` promise; we use sleep for simplicity (the
+        /// extra wall time is fine in a test).
+        delay_ms: Option<u64>,
+        /// Phase 3: per-call args-driven delay. Pi test 452 has
+        /// the slow tool gated on `args.value === "first"`. We
+        /// match: if `args.value == "first"`, sleep for
+        /// `delay_first_ms`; if `args.value == "second"`, return
+        /// immediately AND record whether the first was still
+        /// running.
+        delay_first_ms: Option<u64>,
+        /// Phase 3: concurrency observer. Tracks (currently
+        /// inside execute, max ever seen concurrently). The
+        /// "parallel runs concurrent" test asserts max > 1 (pi
+        /// test 823).
+        concurrency: Arc<Mutex<(u32, u32)>>,
+        /// Phase 3: set true when a "second" call sees a "first"
+        /// call still in flight. Pi test 452 calls this
+        /// `parallelObserved` at line 472.
+        parallel_observed: Arc<Mutex<bool>>,
     }
 
     impl std::fmt::Debug for EchoTool {
@@ -510,6 +725,10 @@ mod tests {
                 execution_mode: None,
                 terminate: false,
                 executed_args: Arc::new(Mutex::new(Vec::new())),
+                delay_ms: None,
+                delay_first_ms: None,
+                concurrency: Arc::new(Mutex::new((0, 0))),
+                parallel_observed: Arc::new(Mutex::new(false)),
             }
         }
         fn with_prepare(mut self, f: impl Fn(Value) -> Value + Send + Sync + 'static) -> Self {
@@ -519,6 +738,28 @@ mod tests {
         fn with_terminate(mut self) -> Self {
             self.terminate = true;
             self
+        }
+        fn with_execution_mode(mut self, mode: ToolExecutionMode) -> Self {
+            self.execution_mode = Some(mode);
+            self
+        }
+        fn with_delay_ms(mut self, ms: u64) -> Self {
+            self.delay_ms = Some(ms);
+            self
+        }
+        /// Phase 3 test 452: gate the delay on
+        /// `args.value == "first"`. Other values return
+        /// immediately.
+        fn with_delay_first_ms(mut self, ms: u64) -> Self {
+            self.delay_first_ms = Some(ms);
+            self
+        }
+        /// Snapshot of the (current, max) concurrency counter.
+        fn concurrency_snapshot(&self) -> (u32, u32) {
+            *self.concurrency.lock().unwrap()
+        }
+        fn parallel_was_observed(&self) -> bool {
+            *self.parallel_observed.lock().unwrap()
         }
     }
 
@@ -556,8 +797,50 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>> {
             let recorded = self.executed_args.clone();
             let terminate = self.terminate;
+            let delay_ms = self.delay_ms;
+            let delay_first_ms = self.delay_first_ms;
+            let concurrency = self.concurrency.clone();
+            let parallel_observed = self.parallel_observed.clone();
             Box::pin(async move {
+                // Phase 3: track concurrency on entry.
+                {
+                    let mut c = concurrency.lock().unwrap();
+                    c.0 += 1;
+                    if c.0 > c.1 {
+                        c.1 = c.0;
+                    }
+                }
+                // Phase 3 pi:452: per-call delay gated on
+                // args.value. The "second" tool checks whether
+                // "first" is still running and records the
+                // parallel observation.
+                let value_str = args
+                    .get("value")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(ms) = delay_first_ms
+                    && value_str == "first"
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+                if delay_first_ms.is_some() && value_str == "second" {
+                    // Pi:472 — record that first was still in
+                    // flight when second ran.
+                    let c = concurrency.lock().unwrap();
+                    if c.0 > 1 {
+                        *parallel_observed.lock().unwrap() = true;
+                    }
+                }
+                if let Some(ms) = delay_ms {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
                 recorded.lock().unwrap().push(args.clone());
+                // Phase 3: decrement concurrency on exit.
+                {
+                    let mut c = concurrency.lock().unwrap();
+                    c.0 -= 1;
+                }
                 let text = format!("echoed: {}", args);
                 Ok(LoopToolResult {
                     content: vec![serde_json::json!({"type": "text", "text": text})],
@@ -979,5 +1262,325 @@ mod tests {
             make(Some(true)),
             make(Some(true)),
         ]));
+    }
+
+    // =================================================================
+    // Phase 3 tests — parallel dispatcher + per-tool sequential override
+    // =================================================================
+
+    /// Helper: build two ToolCalls for echo with "first" / "second"
+    /// values matching pi:452's setup.
+    fn two_echo_calls() -> Vec<ToolCall> {
+        vec![
+            ToolCall {
+                id: "tool-1".to_string(),
+                name: "echo".to_string(),
+                arguments: serde_json::json!({"value": "first"}),
+            },
+            ToolCall {
+                id: "tool-2".to_string(),
+                name: "echo".to_string(),
+                arguments: serde_json::json!({"value": "second"}),
+            },
+        ]
+    }
+
+    fn assistant_with_calls(calls: &[ToolCall]) -> AssistantMessage {
+        let content = calls
+            .iter()
+            .map(|c| ContentBlock::ToolCall {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                arguments: c.arguments.clone(),
+            })
+            .collect();
+        AssistantMessage::new(content, StopReason::ToolUse)
+    }
+
+    /// Port of pi test "should emit tool_execution_end in
+    /// completion order but persist tool results in source order"
+    /// (agent-loop.test.ts:452). THE key parallel-correctness
+    /// test:
+    ///   - tool-1 ("first") sleeps 50ms
+    ///   - tool-2 ("second") returns immediately
+    ///   → tool_execution_end events in COMPLETION order:
+    ///     [tool-2, tool-1]
+    ///   → message_end events for tool-results in SOURCE order:
+    ///     [tool-1, tool-2]
+    ///   → parallel_observed = true (second saw first in flight)
+    #[tokio::test]
+    async fn test_tool_execution_end_completion_order_results_source_order() {
+        let echo = Arc::new(EchoTool::new("echo").with_delay_first_ms(50));
+        let context = build_context(echo.clone());
+        let calls = two_echo_calls();
+        let assistant = assistant_with_calls(&calls);
+
+        let mut config = build_config();
+        config.tool_execution = ToolExecutionMode::Parallel;
+
+        let (tx, mut rx) = mpsc::channel::<LoopEvent>(128);
+        let signal = AbortSignal::new();
+        let _batch =
+            execute_tool_calls_parallel(&context, &assistant, &calls, &config, &signal, &tx).await;
+        drop(tx);
+
+        // Drain events; collect ordering observations.
+        let mut tool_execution_end_ids: Vec<String> = Vec::new();
+        let mut tool_result_message_end_ids: Vec<String> = Vec::new();
+        while let Some(e) = rx.recv().await {
+            match &e {
+                LoopEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                    tool_execution_end_ids.push(tool_call_id.clone());
+                }
+                LoopEvent::MessageEnd { message } => {
+                    if let LoopMessage::ToolResult(t) = message {
+                        tool_result_message_end_ids.push(t.tool_call_id.clone());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Completion order: tool-2 (fast) finishes before tool-1
+        // (slow).
+        assert_eq!(
+            tool_execution_end_ids,
+            vec!["tool-2".to_string(), "tool-1".to_string()],
+            "tool_execution_end should be in completion order"
+        );
+        // Source order: tool-1 then tool-2.
+        assert_eq!(
+            tool_result_message_end_ids,
+            vec!["tool-1".to_string(), "tool-2".to_string()],
+            "tool-result message_end should be in source order"
+        );
+        // Concurrency observed: tool-2 saw tool-1 still running.
+        assert!(
+            echo.parallel_was_observed(),
+            "second tool should have observed first still in flight"
+        );
+    }
+
+    /// Port of pi test "should force sequential execution when a
+    /// tool has executionMode=sequential even with default
+    /// parallel config" (agent-loop.test.ts:653).
+    ///
+    /// Setup: one tool, executionMode=Sequential. Config defaults
+    /// to Parallel. Even though only ONE tool is in the batch,
+    /// the umbrella dispatcher should route through the
+    /// sequential path because the tool ITSELF declares sequential.
+    ///
+    /// We verify by introspecting the EchoTool's concurrency
+    /// counter — sequential dispatch never exceeds 1 in flight.
+    #[tokio::test]
+    async fn test_per_tool_sequential_forces_sequential_route() {
+        let echo = Arc::new(
+            EchoTool::new("echo")
+                .with_execution_mode(ToolExecutionMode::Sequential)
+                .with_delay_first_ms(20),
+        );
+        let context = build_context(echo.clone());
+        let calls = two_echo_calls();
+        let assistant = assistant_with_calls(&calls);
+
+        let mut config = build_config();
+        // Config default is Parallel; per-tool override should
+        // win.
+        config.tool_execution = ToolExecutionMode::Parallel;
+
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+        let signal = AbortSignal::new();
+        let batch = execute_tool_calls(&context, &assistant, &config, &signal, &tx).await;
+        drop(tx);
+
+        // Sequential dispatch: max concurrency == 1.
+        let (_current, max) = echo.concurrency_snapshot();
+        assert_eq!(
+            max, 1,
+            "per-tool Sequential should force max concurrency = 1, got {max}"
+        );
+        assert_eq!(batch.messages.len(), 2);
+    }
+
+    /// Port of pi test "should force sequential execution when
+    /// one of multiple tools has executionMode=sequential"
+    /// (agent-loop.test.ts:736).
+    ///
+    /// Setup: two DIFFERENT tools, one marked Sequential. Even
+    /// though the OTHER tool defaults to Parallel, the batch
+    /// runs sequentially because ANY tool with Sequential forces
+    /// the whole batch.
+    #[tokio::test]
+    async fn test_one_sequential_among_many_forces_sequential() {
+        let echo_seq = Arc::new(
+            EchoTool::new("echo_seq")
+                .with_execution_mode(ToolExecutionMode::Sequential)
+                .with_delay_ms(10),
+        );
+        let echo_par = Arc::new(EchoTool::new("echo_par").with_delay_ms(10));
+
+        // Tool registry has BOTH tools — dispatcher resolves by
+        // name.
+        let context = Context {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: vec![echo_seq.clone(), echo_par.clone()],
+        };
+
+        let calls = vec![
+            ToolCall {
+                id: "tool-1".into(),
+                name: "echo_par".into(),
+                arguments: serde_json::json!({"v": 1}),
+            },
+            ToolCall {
+                id: "tool-2".into(),
+                name: "echo_seq".into(),
+                arguments: serde_json::json!({"v": 2}),
+            },
+        ];
+        let assistant = assistant_with_calls(&calls);
+
+        let mut config = build_config();
+        config.tool_execution = ToolExecutionMode::Parallel;
+
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+        let signal = AbortSignal::new();
+        let _ = execute_tool_calls(&context, &assistant, &config, &signal, &tx).await;
+        drop(tx);
+
+        // Neither tool ever saw concurrency > 1.
+        let (_, max_seq) = echo_seq.concurrency_snapshot();
+        let (_, max_par) = echo_par.concurrency_snapshot();
+        assert_eq!(max_seq, 1, "echo_seq max should be 1");
+        assert_eq!(max_par, 1, "echo_par max should be 1");
+    }
+
+    /// Port of pi test "should allow parallel execution when all
+    /// tools have executionMode=parallel" (agent-loop.test.ts:823).
+    ///
+    /// All tools allow parallel + config is Parallel → dispatcher
+    /// routes through parallel path → max concurrency should
+    /// exceed 1 when there's more than one tool call.
+    #[tokio::test]
+    async fn test_all_parallel_runs_concurrent() {
+        let echo = Arc::new(EchoTool::new("echo").with_delay_first_ms(30));
+        let context = build_context(echo.clone());
+        let calls = two_echo_calls();
+        let assistant = assistant_with_calls(&calls);
+
+        let mut config = build_config();
+        config.tool_execution = ToolExecutionMode::Parallel;
+
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+        let signal = AbortSignal::new();
+        let _ = execute_tool_calls(&context, &assistant, &config, &signal, &tx).await;
+        drop(tx);
+
+        let (_current, max) = echo.concurrency_snapshot();
+        assert!(
+            max >= 2,
+            "parallel dispatch should run >=2 tools concurrently, got {max}"
+        );
+    }
+
+    /// Phase-3 scope of pi test "should continue after parallel
+    /// tool calls when not all tool results terminate"
+    /// (agent-loop.test.ts:1119). Pi's test asserts the LOOP
+    /// continues to a second LLM call. Phase 3 verifies the
+    /// DISPATCHER returns `terminate: false` when not every
+    /// result has terminate=true. Loop-continue verification
+    /// lands in phase 4.
+    #[tokio::test]
+    async fn test_parallel_batch_not_terminating_when_mixed() {
+        // Two tools: one terminating, one not. Result: batch
+        // terminate = false (pi line 544: ALL must terminate).
+        let echo_term = Arc::new(EchoTool::new("term").with_terminate());
+        let echo_norm = Arc::new(EchoTool::new("norm"));
+        let context = Context {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: vec![echo_term, echo_norm],
+        };
+        let calls = vec![
+            ToolCall {
+                id: "tool-1".into(),
+                name: "term".into(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "tool-2".into(),
+                name: "norm".into(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let assistant = assistant_with_calls(&calls);
+
+        let mut config = build_config();
+        config.tool_execution = ToolExecutionMode::Parallel;
+
+        let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+        let signal = AbortSignal::new();
+        let batch = execute_tool_calls(&context, &assistant, &config, &signal, &tx).await;
+        drop(tx);
+
+        assert!(
+            !batch.terminate,
+            "batch should NOT terminate when only some results have terminate=true"
+        );
+        assert_eq!(batch.messages.len(), 2);
+    }
+
+    /// Defensive: parallel dispatch where the prepare phase
+    /// short-circuits (tool not found) for one call still
+    /// returns batch with that call as an error. The OTHER call
+    /// (prepared) runs concurrently. Verifies immediate + async
+    /// entries coexist in the parallel path.
+    #[tokio::test]
+    async fn test_parallel_mixes_immediate_and_async() {
+        let echo = Arc::new(EchoTool::new("echo").with_delay_first_ms(20));
+        let context = build_context(echo);
+        let calls = vec![
+            ToolCall {
+                id: "tool-1".into(),
+                name: "nonexistent".into(), // → immediate error
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "tool-2".into(),
+                name: "echo".into(),
+                arguments: serde_json::json!({"value": "first"}),
+            },
+        ];
+        let assistant = assistant_with_calls(&calls);
+
+        let mut config = build_config();
+        config.tool_execution = ToolExecutionMode::Parallel;
+
+        let (tx, mut rx) = mpsc::channel::<LoopEvent>(128);
+        let signal = AbortSignal::new();
+        let batch =
+            execute_tool_calls_parallel(&context, &assistant, &calls, &config, &signal, &tx).await;
+        drop(tx);
+
+        // First result is an error (tool not found); second is ok.
+        assert_eq!(batch.messages.len(), 2);
+        assert!(batch.messages[0].is_error);
+        assert!(!batch.messages[1].is_error);
+
+        // Tool-result message_end events still in source order.
+        let mut tool_result_ids: Vec<String> = Vec::new();
+        while let Some(e) = rx.recv().await {
+            if let LoopEvent::MessageEnd {
+                message: LoopMessage::ToolResult(t),
+            } = e
+            {
+                tool_result_ids.push(t.tool_call_id);
+            }
+        }
+        assert_eq!(
+            tool_result_ids,
+            vec!["tool-1".to_string(), "tool-2".to_string()]
+        );
     }
 }
