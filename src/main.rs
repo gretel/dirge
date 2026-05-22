@@ -271,9 +271,10 @@ async fn main() -> anyhow::Result<()> {
     let mut context = context::load(cli.resolve_no_context_files(&cfg));
 
     let default_prompt = cfg.default_prompt.as_deref().unwrap_or("code");
-    if let Some(content) = context.prompts.get(default_prompt) {
-        context.current_prompt = Some(content.clone());
+    if let Some(p) = context.prompts.get(default_prompt) {
+        context.current_prompt = Some(p.body.clone());
         context.current_prompt_name = Some(default_prompt.to_string());
+        context.current_prompt_deny_tools = p.deny_tools.clone();
     }
 
     let provider = cli.resolve_provider(&cfg);
@@ -356,9 +357,10 @@ async fn main() -> anyhow::Result<()> {
     // prompt), warn so the silent fallback doesn't surprise them.
     if let Some(name) = session.current_prompt_name.clone() {
         match context.prompts.get(&name) {
-            Some(content) => {
-                context.current_prompt = Some(content.clone());
+            Some(p) => {
+                context.current_prompt = Some(p.body.clone());
                 context.current_prompt_name = Some(name);
+                context.current_prompt_deny_tools = p.deny_tools.clone();
             }
             None => {
                 eprintln!(
@@ -577,6 +579,12 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or_else(|e| e.into_inner())
             .load_session_allowlist(&allowlist);
     }
+    // Push the active prompt's `deny_tools` into the freshly-built
+    // checker. `context.current_prompt_deny_tools` was populated by
+    // the default-prompt + session-restore blocks above; this is the
+    // first opportunity to wire it into the now-existing checker
+    // (the checker is built inside `build_channels`).
+    crate::permission::apply_prompt_deny(&permission, &context.current_prompt_deny_tools);
 
     let completion_model = client.completion_model(model.to_string());
 

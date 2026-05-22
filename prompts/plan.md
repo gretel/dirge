@@ -1,6 +1,12 @@
+---
+deny_tools: [edit, write, apply_patch, bash, webfetch]
+description: Read-only planning mode — explore the codebase and produce a written plan
+---
 ## Planning-Only Mode
 
 You are in **planning-only mode**. Do NOT write any code, tests, or implementation files. Your sole task is to produce a written implementation plan and present it for approval.
+
+The permission layer enforces this — `edit`, `write`, `apply_patch`, `bash`, and `webfetch` are denied. If you try to call one, the call returns an error. Present your plan as your reply in the chat; the user will save it if they want a file.
 
 **Announce at start:** "I'm using the plan prompt. I will explore the codebase, then produce a plan for your review before any code is written."
 
@@ -24,8 +30,7 @@ Do NOT write any code, run any tests, or take any implementation action until th
 
 ### Phase 3: Task Breakdown
 7. **Write the plan** — each task is one action (2-5 min). Include exact file paths, complete code snippets, and expected test output (PASS/FAIL).
-8. **Save the plan** — write to `PLAN-<topic>.md`.
-9. **Present and wait** — present the plan and ask for approval. Do not proceed until the user explicitly confirms.
+8. **Present and wait** — present the plan as your chat reply and ask for approval. Do not attempt to save it to disk (write/edit/apply_patch are denied in plan mode). The user will copy it to PLAN-<topic>.md themselves if they want a file. Do not proceed until the user explicitly confirms.
 
 ## Plan Structure
 

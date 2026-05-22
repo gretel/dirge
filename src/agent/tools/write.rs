@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(feature = "lsp")]
 use std::sync::Arc;
 #[cfg(feature = "lsp")]
@@ -8,9 +8,7 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{
-    AskSender, PermCheck, ToolError, WriteArgs, check_perm_path_resolve, is_plan_file,
-};
+use crate::agent::tools::{AskSender, PermCheck, ToolError, WriteArgs, check_perm_path_resolve};
 #[cfg(feature = "lsp")]
 use crate::lsp::diagnostic;
 #[cfg(feature = "lsp")]
@@ -25,7 +23,6 @@ const DIAGNOSTIC_WAIT: Duration = Duration::from_secs(10);
 pub struct WriteTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
-    plan_file: Option<PathBuf>,
     cache: Option<ToolCache>,
     /// When set, the tool touches the file on the LSP server after writing
     /// and appends any resulting diagnostic block to its output. `None`
@@ -36,15 +33,10 @@ pub struct WriteTool {
 
 impl WriteTool {
     #[allow(dead_code)]
-    pub fn new(
-        permission: Option<PermCheck>,
-        ask_tx: Option<AskSender>,
-        plan_file: Option<PathBuf>,
-    ) -> Self {
+    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
         WriteTool {
             permission,
             ask_tx,
-            plan_file,
             cache: None,
             #[cfg(feature = "lsp")]
             lsp_manager: None,
@@ -54,14 +46,12 @@ impl WriteTool {
     pub fn with_cache(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
-        plan_file: Option<PathBuf>,
         cache: ToolCache,
         #[cfg(feature = "lsp")] lsp_manager: Option<Arc<LspManager>>,
     ) -> Self {
         WriteTool {
             permission,
             ask_tx,
-            plan_file,
             cache: Some(cache),
             #[cfg(feature = "lsp")]
             lsp_manager,
@@ -97,15 +87,6 @@ impl Tool for WriteTool {
         // redirect the write to an unauthorized target.
         let resolved_path =
             check_perm_path_resolve(&self.permission, &self.ask_tx, "write", &args.path).await?;
-
-        if let Some(plan) = &self.plan_file {
-            if !is_plan_file(plan, &args.path) {
-                return Err(ToolError::Msg(
-                    "Plan mode: writes restricted to PLAN.md only. Use /prompt default to exit plan mode."
-                        .to_string(),
-                ));
-            }
-        }
 
         let path = Path::new(&resolved_path);
         if let Some(parent) = path.parent() {
@@ -177,6 +158,7 @@ mod tests {
     use crate::lsp::manager::LspManager;
     use crate::lsp::spawn::{Spawned, Spawner};
     use futures::future::BoxFuture;
+    use std::path::PathBuf;
 
     fn tempfile_in(dir: &Path, name: &str) -> PathBuf {
         dir.join(name)
@@ -204,7 +186,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&dir);
         let path = tempfile_in(&dir, "no-mgr.txt");
 
-        let tool = WriteTool::with_cache(None, None, None, ToolCache::new(), None);
+        let tool = WriteTool::with_cache(None, None, ToolCache::new(), None);
         let out = tool
             .call(WriteArgs {
                 path: path.to_string_lossy().into_owned(),
@@ -233,7 +215,7 @@ mod tests {
         let path = tempfile_in(&dir, "with-mgr.unknown_ext");
 
         let manager = Arc::new(LspManager::new(Arc::new(NopSpawner), dir.clone()));
-        let tool = WriteTool::with_cache(None, None, None, ToolCache::new(), Some(manager));
+        let tool = WriteTool::with_cache(None, None, ToolCache::new(), Some(manager));
 
         let out = tool
             .call(WriteArgs {

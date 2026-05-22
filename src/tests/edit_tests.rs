@@ -26,7 +26,7 @@ impl Drop for TempFile {
 
 #[tokio::test]
 async fn test_rejects_empty_old_text() {
-    let tool = EditTool::new(None, None, None);
+    let tool = EditTool::new(None, None);
     let args = EditArgs {
         path: "/tmp/test.txt".to_string(),
         old_text: String::new(),
@@ -50,7 +50,7 @@ async fn test_rejects_empty_old_text() {
 async fn test_old_text_not_found() {
     let tmp = TempFile::new("notfound.txt");
     std::fs::write(tmp.path(), "hello world").unwrap();
-    let tool = EditTool::new(None, None, None);
+    let tool = EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
@@ -68,7 +68,7 @@ async fn test_old_text_not_found() {
 async fn test_single_replacement() {
     let tmp = TempFile::new("single.txt");
     std::fs::write(tmp.path(), "before after done\n").unwrap();
-    let tool = EditTool::new(None, None, None);
+    let tool = EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
@@ -87,7 +87,7 @@ async fn test_single_replacement() {
 async fn test_replace_all() {
     let tmp = TempFile::new("replace_all.txt");
     std::fs::write(tmp.path(), "a a a\n").unwrap();
-    let tool = EditTool::new(None, None, None);
+    let tool = EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
@@ -111,7 +111,7 @@ async fn test_replace_all_reports_file_delta_not_per_replacement() {
     let tmp = TempFile::new("replace_all_delta.txt");
     // 3 single-line occurrences; each replacement adds 1 line.
     std::fs::write(tmp.path(), "x\nx\nx\n").unwrap();
-    let tool = EditTool::new(None, None, None);
+    let tool = EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
@@ -132,7 +132,7 @@ async fn test_replace_all_reports_file_delta_not_per_replacement() {
 async fn test_multi_match_without_replace_all_returns_error() {
     let tmp = TempFile::new("multi.txt");
     std::fs::write(tmp.path(), "hello world, hello there\n").unwrap();
-    let tool = EditTool::new(None, None, None);
+    let tool = EditTool::new(None, None);
     let result = tool
         .call(EditArgs {
             path: tmp.path().into(),
@@ -151,7 +151,7 @@ async fn test_multi_match_without_replace_all_returns_error() {
 async fn test_preserves_crlf_line_endings() {
     let tmp = TempFile::new("crlf.txt");
     std::fs::write(tmp.path(), "line1\r\nline2\r\nline3\r\n").unwrap();
-    let tool = EditTool::new(None, None, None);
+    let tool = EditTool::new(None, None);
     tool.call(EditArgs {
         path: tmp.path().into(),
         old_text: "line2".into(),

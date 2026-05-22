@@ -3691,10 +3691,17 @@ pub async fn run_interactive(
                 };
 
                 if accepted {
-                    // Update context with the new prompt
-                    if let Some(content) = context.prompts.get(prompt_name) {
-                        context.current_prompt = Some(content.clone());
+                    // Update context with the new prompt + push its
+                    // deny-list to the perm checker so any prompt-
+                    // level tool restrictions kick in immediately.
+                    if let Some(p) = context.prompts.get(prompt_name) {
+                        context.current_prompt = Some(p.body.clone());
                         context.current_prompt_name = Some(prompt_name.to_string());
+                        context.current_prompt_deny_tools = p.deny_tools.clone();
+                        crate::permission::apply_prompt_deny(
+                            &permission,
+                            &context.current_prompt_deny_tools,
+                        );
                     }
 
                     // Rebuild agent with new prompt mode

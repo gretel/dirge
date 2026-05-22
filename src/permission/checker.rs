@@ -31,6 +31,20 @@ pub struct PermissionChecker {
     session_allowlist: Vec<(String, Pattern)>,
     recent_calls: VecDeque<(String, String)>,
     mode: SecurityMode,
+    /// Tools denied by the currently-active prompt's frontmatter
+    /// `deny_tools` list. Enforced at the top of every `check` /
+    /// `check_path` call — even before Yolo mode's blanket allow.
+    /// This is the permission-layer enforcement of plan/review/etc.
+    /// modes; previously plan mode relied on prose ("don't write
+    /// code") + inline `is_plan_file` gates in edit/write/apply_patch,
+    /// which an adversarial / confused LLM could route around via
+    /// `bash` or by bypassing the gate name-check.
+    ///
+    /// Updated by `set_prompt_deny_tools` whenever the active prompt
+    /// changes (slash `/prompt <name>`, session load, startup). Empty
+    /// when no prompt is active or the active prompt has no
+    /// frontmatter.
+    prompt_deny_tools: Vec<String>,
 }
 
 /// Tool names where the input is a filesystem path. For these, `*` keeps
@@ -155,10 +169,40 @@ impl PermissionChecker {
             session_allowlist: Vec::new(),
             recent_calls: VecDeque::with_capacity(16),
             mode,
+            prompt_deny_tools: Vec::new(),
         }
     }
 
+    /// Install the current prompt's deny-list. Called when the
+    /// active prompt changes (startup, session load, `/prompt
+    /// <name>`); pass an empty vec to clear.
+    pub fn set_prompt_deny_tools(&mut self, denied: Vec<String>) {
+        self.prompt_deny_tools = denied;
+    }
+
+    /// Returns true when `tool` is in the active prompt's
+    /// `deny_tools` frontmatter list. Internal helper so both
+    /// `check` and `check_path` share the same gate.
+    fn is_prompt_denied(&self, tool: &str) -> bool {
+        self.prompt_deny_tools.iter().any(|t| t == tool)
+    }
+
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {
+        // Prompt-level deny list runs BEFORE every other gate,
+        // including Yolo mode's blanket allow. This is the
+        // permission-layer enforcement of plan/review/etc. modes:
+        // the prompt's frontmatter declares which tools that mode
+        // CANNOT use (e.g. plan mode denies edit/write/apply_patch/
+        // bash), and the LLM gets a hard refusal instead of relying
+        // on the prompt prose to dissuade it from calling. Yolo is
+        // still "no rule-set, all calls allowed" but a prompt's
+        // deny-list is a stronger contract — the user opted into
+        // this mode, so we honor it even under Yolo.
+        if self.is_prompt_denied(tool) {
+            return CheckResult::Denied(format!(
+                "Tool {tool:?} is denied by the active prompt's `deny_tools` frontmatter. Switch with `/prompt <other>` to use it."
+            ));
+        }
         if self.mode == SecurityMode::Yolo {
             return CheckResult::Allowed;
         }
@@ -244,6 +288,12 @@ impl PermissionChecker {
     }
 
     pub fn check_path(&mut self, tool: &str, path: &str) -> CheckResult {
+        // Prompt deny-list runs first, same reasoning as `check`.
+        if self.is_prompt_denied(tool) {
+            return CheckResult::Denied(format!(
+                "Tool {tool:?} is denied by the active prompt's `deny_tools` frontmatter. Switch with `/prompt <other>` to use it."
+            ));
+        }
         if self.mode == SecurityMode::Yolo {
             return CheckResult::Allowed;
         }
@@ -625,6 +675,61 @@ mod tests {
             SecurityMode::Standard,
             Some(std::path::PathBuf::from("/tmp")),
         )
+    }
+
+    /// Prompt-level deny list refuses the named tool before any
+    /// rule matching, in every security mode. This is the
+    /// permission-layer enforcement of plan/review modes
+    /// (replaces the prompt-text-only "don't write code"
+    /// restriction). Even Yolo respects the deny list — the user
+    /// opted into the mode, that's a stronger contract than the
+    /// security mode's blanket allow.
+    #[test]
+    fn prompt_deny_tools_refuses_listed_tool_in_every_mode() {
+        for mode in [
+            SecurityMode::Standard,
+            SecurityMode::Accept,
+            SecurityMode::Restrictive,
+            SecurityMode::Yolo,
+        ] {
+            let mut checker = PermissionChecker::new(
+                &PermissionConfig::default(),
+                mode,
+                Some(std::path::PathBuf::from("/tmp")),
+            );
+            checker.set_prompt_deny_tools(vec!["edit".to_string(), "write".to_string()]);
+            assert!(
+                matches!(checker.check("edit", "/tmp/foo"), CheckResult::Denied(_)),
+                "edit must be denied in mode {:?} when prompt deny-list includes it",
+                mode,
+            );
+            assert!(
+                matches!(checker.check("write", "/tmp/foo"), CheckResult::Denied(_)),
+                "write must be denied in mode {:?} when prompt deny-list includes it",
+                mode,
+            );
+            // Unrelated tools still flow through normal rule eval.
+            // `read` isn't in the deny list, so Yolo allows it
+            // (other modes might Ask, that's mode-specific).
+            if mode == SecurityMode::Yolo {
+                assert!(matches!(
+                    checker.check("read", "/tmp/foo"),
+                    CheckResult::Allowed
+                ));
+            }
+        }
+    }
+
+    /// Empty deny list is a no-op — back to normal rule eval.
+    #[test]
+    fn prompt_deny_empty_is_noop() {
+        let mut checker = fresh_checker();
+        checker.set_prompt_deny_tools(Vec::new());
+        // Under default rules in Standard mode, `read` is allowed.
+        assert!(matches!(
+            checker.check("read", "/tmp/foo"),
+            CheckResult::Allowed
+        ));
     }
 
     /// F7: `resolve_absolute` must follow symlinks so a symlink

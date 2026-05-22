@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 #[cfg(feature = "lsp")]
 use std::sync::Arc;
 
@@ -6,16 +5,13 @@ use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{
-    AskSender, EditArgs, PermCheck, ToolError, check_perm_path_resolve, is_plan_file,
-};
+use crate::agent::tools::{AskSender, EditArgs, PermCheck, ToolError, check_perm_path_resolve};
 #[cfg(feature = "lsp")]
 use crate::lsp::manager::LspManager;
 
 pub struct EditTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
-    plan_file: Option<PathBuf>,
     cache: Option<ToolCache>,
     /// When set, the tool touches the edited file on the LSP server and
     /// appends any diagnostic block to its output. `None` reproduces the
@@ -26,15 +22,10 @@ pub struct EditTool {
 
 impl EditTool {
     #[allow(dead_code)]
-    pub fn new(
-        permission: Option<PermCheck>,
-        ask_tx: Option<AskSender>,
-        plan_file: Option<PathBuf>,
-    ) -> Self {
+    pub fn new(permission: Option<PermCheck>, ask_tx: Option<AskSender>) -> Self {
         EditTool {
             permission,
             ask_tx,
-            plan_file,
             cache: None,
             #[cfg(feature = "lsp")]
             lsp_manager: None,
@@ -44,14 +35,12 @@ impl EditTool {
     pub fn with_cache(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
-        plan_file: Option<PathBuf>,
         cache: ToolCache,
         #[cfg(feature = "lsp")] lsp_manager: Option<Arc<LspManager>>,
     ) -> Self {
         EditTool {
             permission,
             ask_tx,
-            plan_file,
             cache: Some(cache),
             #[cfg(feature = "lsp")]
             lsp_manager,
@@ -143,15 +132,6 @@ impl Tool for EditTool {
         // permission check resolved.
         let resolved_path =
             check_perm_path_resolve(&self.permission, &self.ask_tx, "edit", &args.path).await?;
-
-        if let Some(plan) = &self.plan_file {
-            if !is_plan_file(plan, &args.path) {
-                return Err(ToolError::Msg(
-                    "Plan mode: edits restricted to PLAN.md only. Use /prompt default to exit plan mode."
-                        .to_string(),
-                ));
-            }
-        }
 
         // Pre-check size before reading. The edit tool isn't meant
         // for huge generated artifacts; cap at 100 MiB so an LLM

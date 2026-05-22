@@ -2,7 +2,6 @@ use compact_str::CompactString;
 use rig::agent::{Agent, AgentBuilder};
 use rig::completion::CompletionModel;
 use rig::providers::openrouter;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::agent::prompt::{SYSTEM_PROMPT, TODO_TOOLS_PROMPT};
@@ -68,16 +67,12 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             .unwrap_or_default(),
     );
 
-    let plan_prompts: &[&str] = &["plan", "review", "review-security"];
-    let plan_file: Option<PathBuf> = context
-        .current_prompt_name
-        .as_deref()
-        .filter(|name| plan_prompts.contains(name))
-        .map(|_| {
-            std::env::current_dir()
-                .unwrap_or_else(|_| ".".into())
-                .join("PLAN.md")
-        });
+    // The `plan_file`-keyed gate on edit/write/apply_patch was
+    // removed: prompt-level tool restrictions now live in the
+    // prompt file's frontmatter (`deny_tools: [...]`), enforced
+    // at the permission-checker layer. Plan / review modes deny
+    // edit/write/apply_patch/bash entirely, so the file-name gate
+    // is unnecessary.
     let mut preamble = SYSTEM_PROMPT.to_string();
     preamble.push('\n');
     preamble.push_str(TODO_TOOLS_PROMPT);
@@ -195,7 +190,6 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             Box::new(tools::WriteTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
-                plan_file.clone(),
                 cache.clone(),
                 #[cfg(feature = "lsp")]
                 lsp_manager.clone(),
@@ -203,7 +197,6 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             Box::new(tools::EditTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
-                plan_file.clone(),
                 cache.clone(),
                 #[cfg(feature = "lsp")]
                 lsp_manager.clone(),
@@ -247,7 +240,6 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             Box::new(tools::ApplyPatchTool::with_cache(
                 permission.clone(),
                 ask_tx.clone(),
-                plan_file.clone(),
                 cache.clone(),
             )),
         ];

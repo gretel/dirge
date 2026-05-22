@@ -2,6 +2,18 @@ pub mod ask;
 pub mod checker;
 pub mod pattern;
 
+/// Push the active prompt's `deny_tools` list into the permission
+/// checker so subsequent tool calls observe the new restriction.
+/// Best-effort: a poisoned mutex falls through to `into_inner`,
+/// matching the recovery pattern used elsewhere on the checker.
+/// `None` perm (e.g. `--no-tools` builds) is a no-op.
+pub fn apply_prompt_deny(perm: &Option<checker::PermCheck>, deny: &[String]) {
+    if let Some(p) = perm {
+        let mut guard = p.lock().unwrap_or_else(|e| e.into_inner());
+        guard.set_prompt_deny_tools(deny.to_vec());
+    }
+}
+
 use serde::Deserialize;
 use std::collections::HashMap;
 

@@ -1,7 +1,7 @@
 use rig::completion::ToolDefinition;
 use rig::tool::Tool;
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::agent::tools::cache::ToolCache;
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm_path};
@@ -30,12 +30,6 @@ pub struct ApplyPatchTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
     cache: Option<ToolCache>,
-    /// When active prompt is `plan`/`review`/`review-security`, writes
-    /// are restricted to this single file (typically `PLAN.md`). Any
-    /// op targeting another path is refused. Mirrors the gate on
-    /// `WriteTool` / `EditTool` so a planning-mode session can't
-    /// sneak filesystem changes through `apply_patch`.
-    plan_file: Option<PathBuf>,
 }
 
 impl ApplyPatchTool {
@@ -45,21 +39,18 @@ impl ApplyPatchTool {
             permission,
             ask_tx,
             cache: None,
-            plan_file: None,
         }
     }
 
     pub fn with_cache(
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
-        plan_file: Option<PathBuf>,
         cache: ToolCache,
     ) -> Self {
         Self {
             permission,
             ask_tx,
             cache: Some(cache),
-            plan_file,
         }
     }
 }
@@ -239,77 +230,12 @@ impl Tool for ApplyPatchTool {
         let mut results = Vec::new();
 
         for op in &args.operations {
-            // Plan-mode write restriction: when active prompt is
-            // plan/review/review-security, `plan_file` is set to
-            // PLAN.md and every op's target path must match it. This
-            // mirrors the gate on `WriteTool` + `EditTool` so plan
-            // mode actually means "no filesystem changes outside
-            // PLAN.md" — apply_patch previously bypassed it.
-            let paths_to_check: Vec<&str> = match op {
-                PatchOp::Create { path, .. }
-                | PatchOp::Update { path, .. }
-                | PatchOp::Delete { path } => vec![path.as_str()],
-                PatchOp::Rename { path, new_path } => {
-                    vec![path.as_str(), new_path.as_str()]
-                }
-            };
-            if let Some(plan) = self.plan_file.as_ref() {
-                // Build a parent+filename comparison so we can match
-                // PLAN.md by name even when the file doesn't exist
-                // yet (the very first `apply_patch create PLAN.md` op
-                // in a fresh plan-mode session). Pure `canonicalize`
-                // fails on non-existent paths and the fallback
-                // `to_path_buf` would compare relative vs absolute
-                // unequal — refusing a legitimate create. Compare:
-                //   1. canonicalized full paths (works once PLAN.md
-                //      exists, and for both create and update),
-                //   2. resolved parent + same filename (works for the
-                //      first-create case before PLAN.md exists).
-                let plan_canon = plan.canonicalize().ok();
-                let plan_parent = plan
-                    .parent()
-                    .and_then(|p| p.canonicalize().ok())
-                    .or_else(|| {
-                        std::env::current_dir()
-                            .ok()
-                            .map(|cwd| plan.parent().map(|p| cwd.join(p)).unwrap_or(cwd))
-                    });
-                let plan_name = plan.file_name();
-                for path in &paths_to_check {
-                    let target = Path::new(path);
-                    let target_canon = target.canonicalize().ok();
-                    let target_parent = target
-                        .parent()
-                        .and_then(|p| p.canonicalize().ok())
-                        .or_else(|| {
-                            std::env::current_dir().ok().map(|cwd| {
-                                target
-                                    .parent()
-                                    .filter(|p| !p.as_os_str().is_empty())
-                                    .map(|p| cwd.join(p))
-                                    .unwrap_or(cwd)
-                            })
-                        });
-                    let target_name = target.file_name();
+            // Plan-mode restriction is enforced at the permission-
+            // checker layer now (the active prompt's frontmatter
+            // `deny_tools: [apply_patch, ...]` blocks the tool
+            // entirely). The previous in-tool PLAN.md path gate is
+            // gone.
 
-                    let matches_canonical = match (&plan_canon, &target_canon) {
-                        (Some(p), Some(t)) => p == t,
-                        _ => false,
-                    };
-                    let matches_by_parent_and_name =
-                        match (&plan_parent, &target_parent, plan_name, target_name) {
-                            (Some(pp), Some(tp), Some(pn), Some(tn)) => pp == tp && pn == tn,
-                            _ => false,
-                        };
-                    if !matches_canonical && !matches_by_parent_and_name {
-                        return Err(ToolError::Msg(format!(
-                            "plan mode is active — apply_patch can only target {}; got {}",
-                            plan.display(),
-                            path,
-                        )));
-                    }
-                }
-            }
             // Permission check for the target path
             match op {
                 PatchOp::Create { path, .. }

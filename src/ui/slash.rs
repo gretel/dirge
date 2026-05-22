@@ -428,10 +428,15 @@ pub async fn handle_slash(
                         // so the new prompt actually takes effect.
                         let restored = session.current_prompt_name.clone();
                         if let Some(name) = restored.as_deref()
-                            && let Some(content) = context.prompts.get(name)
+                            && let Some(p) = context.prompts.get(name)
                         {
-                            context.current_prompt = Some(content.clone());
+                            context.current_prompt = Some(p.body.clone());
                             context.current_prompt_name = Some(name.to_string());
+                            context.current_prompt_deny_tools = p.deny_tools.clone();
+                            crate::permission::apply_prompt_deny(
+                                permission,
+                                &context.current_prompt_deny_tools,
+                            );
                             let model = client.completion_model(session.model.to_string());
                             *agent = crate::provider::build_agent(
                                 model,
@@ -789,6 +794,11 @@ pub async fn handle_slash(
                 } else {
                     context.current_prompt = None;
                     context.current_prompt_name = None;
+                    context.current_prompt_deny_tools.clear();
+                    crate::permission::apply_prompt_deny(
+                        permission,
+                        &context.current_prompt_deny_tools,
+                    );
                     // Mirror into session so `-c` / `/sessions <id>`
                     // resumes the same prompt state next time.
                     session.current_prompt_name = None;
@@ -815,9 +825,14 @@ pub async fn handle_slash(
                 }
             } else {
                 let name = parts[1].trim();
-                if let Some(content) = context.prompts.get(name) {
-                    context.current_prompt = Some(content.clone());
+                if let Some(p) = context.prompts.get(name) {
+                    context.current_prompt = Some(p.body.clone());
                     context.current_prompt_name = Some(name.to_string());
+                    context.current_prompt_deny_tools = p.deny_tools.clone();
+                    crate::permission::apply_prompt_deny(
+                        permission,
+                        &context.current_prompt_deny_tools,
+                    );
                     // Mirror into the session so resuming restores the
                     // same active prompt instead of defaulting to "code".
                     session.current_prompt_name = Some(name.to_string());
@@ -976,9 +991,14 @@ pub async fn handle_slash(
                 // so the new preamble takes effect on the next turn
                 // without the user having to `/prompt <name>` again.
                 if let Some(name) = context.current_prompt_name.clone()
-                    && let Some(content) = context.prompts.get(&name)
+                    && let Some(p) = context.prompts.get(&name)
                 {
-                    context.current_prompt = Some(content.clone());
+                    context.current_prompt = Some(p.body.clone());
+                    context.current_prompt_deny_tools = p.deny_tools.clone();
+                    crate::permission::apply_prompt_deny(
+                        permission,
+                        &context.current_prompt_deny_tools,
+                    );
                 }
                 let model = client.completion_model(session.model.to_string());
                 *agent = crate::provider::build_agent(

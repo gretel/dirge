@@ -9,9 +9,16 @@ pub mod prompts;
 
 pub struct ContextFiles {
     pub agents: Option<String>,
-    pub prompts: HashMap<String, String>,
+    pub prompts: HashMap<String, prompts::Prompt>,
     pub current_prompt: Option<String>,
     pub current_prompt_name: Option<String>,
+    /// Tools that are denied while `current_prompt_name` is active.
+    /// Populated from the active prompt's frontmatter at switch time;
+    /// consumed by the permission checker BEFORE rule matching so
+    /// prompt-level mode restrictions (e.g. plan mode forbidding
+    /// edit/write/apply_patch) are enforced at the security layer,
+    /// not just via prose in the system prompt.
+    pub current_prompt_deny_tools: Vec<String>,
 }
 
 impl ContextFiles {
@@ -20,7 +27,13 @@ impl ContextFiles {
         self.agents = load_agents();
         self.prompts = prompts::load();
         if let Some(name) = &self.current_prompt_name {
-            self.current_prompt = self.prompts.get(name).cloned();
+            if let Some(p) = self.prompts.get(name) {
+                self.current_prompt = Some(p.body.clone());
+                self.current_prompt_deny_tools = p.deny_tools.clone();
+            } else {
+                self.current_prompt = None;
+                self.current_prompt_deny_tools.clear();
+            }
         }
     }
 }
@@ -38,6 +51,7 @@ pub fn load(no_context_files: bool) -> ContextFiles {
         prompts: prompt_map,
         current_prompt: None,
         current_prompt_name: None,
+        current_prompt_deny_tools: Vec::new(),
     }
 }
 
