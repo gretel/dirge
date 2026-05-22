@@ -47,6 +47,14 @@ libc = "0.2"
 
 [dependencies]
 rig = { version = "0.37", features = ["rmcp"] }
+# Macros for emitting `Stream<Item = …>` from async generator-style
+# code blocks. Used by `agent_loop::rig_stream` to wrap rig's
+# `StreamingCompletionResponse` into our pi-style `StreamEvent`
+# stream — the alternative is hand-rolled `impl Stream` with manual
+# poll mechanics, which is verbose for multi-yield-per-input logic.
+# Already in our Cargo.lock transitively; this declares the
+# dependency explicitly so we can `use async_stream`.
+async-stream = "0.3"
 # Display-width-aware char counting for terminal layout. `chars().count()`
 # undercounts emoji (e.g. ✅ takes 2 cells in most terminals); markdown
 # tables misaligned the right border when cells contained them.

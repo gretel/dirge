@@ -2682,6 +2682,7 @@ version = "1.0.0"
 dependencies = [
  "agent-client-protocol",
  "anyhow",
+ "async-stream",
  "chrono",
  "clap",
  "compact_str",
