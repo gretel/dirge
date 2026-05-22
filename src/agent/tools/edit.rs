@@ -188,8 +188,21 @@ impl Tool for EditTool {
                 .chain(content.match_indices('\n').map(|(i, _)| i + 1))
                 .collect();
 
-            let mut match_info = Vec::new();
-            for &byte_idx in &match_positions {
+            // Cap the per-match preview list so a pattern matching
+            // thousands of lines doesn't return a thousand-line error
+            // blob to the LLM — which would blow the agent's context
+            // and crowd out the actual narrative. Show the first
+            // MAX_AMBIGUOUS_MATCHES, then a single "...and N more"
+            // line. 20 is enough to disambiguate any realistic case
+            // (functions named identically, repeated string lits) while
+            // keeping the error under a few KB.
+            const MAX_AMBIGUOUS_MATCHES: usize = 20;
+            let total_matches = match_positions.len();
+            let preview_positions: &[usize] =
+                &match_positions[..total_matches.min(MAX_AMBIGUOUS_MATCHES)];
+
+            let mut match_info = Vec::with_capacity(preview_positions.len() + 1);
+            for &byte_idx in preview_positions {
                 let line_num = match line_starts.binary_search(&byte_idx) {
                     Ok(i) => i + 1,
                     Err(i) => i,
@@ -203,10 +216,18 @@ impl Tool for EditTool {
                 let truncated: String = line_text.chars().take(100).collect();
                 match_info.push(format!("  Line {}: {}", line_num, truncated));
             }
+            if total_matches > MAX_AMBIGUOUS_MATCHES {
+                let remaining = total_matches - MAX_AMBIGUOUS_MATCHES;
+                match_info.push(format!(
+                    "  ... and {} more match{}",
+                    remaining,
+                    if remaining == 1 { "" } else { "es" },
+                ));
+            }
 
             return Err(ToolError::Msg(format!(
                 "old_text matched {} times in {}:\n{}\n\nUse replace_all: true to replace all occurrences, or provide more surrounding context in old_text to narrow the match.",
-                match_positions.len(),
+                total_matches,
                 args.path,
                 match_info.join("\n"),
             )));

@@ -20,6 +20,45 @@ pub(crate) struct InterleavedOutput {
     pub exit_code: i32,
 }
 
+/// On Unix, SIGKILL the bash process group on drop. Used to clean up
+/// grandchildren when the agent task is aborted (Ctrl+C) — tokio's
+/// `kill_on_drop` only signals the immediate child, leaving descendants
+/// orphaned. Disarmed via [`PgKillGuard::disarm`] on graceful paths
+/// (successful completion, timeout — which already calls killpg itself)
+/// so we don't double-signal.
+#[cfg(unix)]
+struct PgKillGuard {
+    pid: u32,
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl PgKillGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+#[cfg(unix)]
+impl Drop for PgKillGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // SAFETY: killpg with negative pid sends to the process
+        // group. SIGKILL is the same on every POSIX platform;
+        // libc::pid_t is i32 on every platform dirge supports. The
+        // pid was set by us via `process_group(0)` so we know this
+        // group exists and is bash + descendants.
+        unsafe {
+            let _ = libc::kill(-(self.pid as libc::pid_t), libc::SIGKILL);
+        }
+    }
+}
+
 /// Spawn `cmd` into its own process group and wait for it,
 /// capped at `secs`. On timeout, send SIGKILL to the process
 /// group so the whole subprocess tree dies — not just bash. On
@@ -50,6 +89,16 @@ async fn run_with_timeout(cmd: Command, secs: u64) -> Result<InterleavedOutput, 
         .spawn()
         .map_err(|e| ToolError::Msg(format!("failed to spawn: {}", e)))?;
     let pid = child.id();
+
+    // Drop guard: on Unix, `kill_on_drop(true)` SIGKILLs the immediate
+    // bash child when the future is dropped (e.g. user Ctrl+C aborts
+    // the agent task) but leaves bash's *descendants* running as
+    // grandchildren of pid 1. The timeout branch below already
+    // handles this by calling `killpg(-pid, SIGKILL)`; the same is
+    // needed for any other drop path. Holding a `PgKillGuard` for
+    // the lifetime of the future does that.
+    #[cfg(unix)]
+    let _pgguard = pid.map(PgKillGuard::new);
 
     // F12: drain stdout + stderr concurrently into a single buffer
     // so the order of lines reflects actual arrival time. The prior
@@ -111,21 +160,43 @@ async fn run_with_timeout(cmd: Command, secs: u64) -> Result<InterleavedOutput, 
         Ok::<_, std::io::Error>((merged, status))
     };
 
-    match tokio::time::timeout(Duration::from_secs(secs), wait).await {
-        Ok(Ok((merged, status))) => Ok(InterleavedOutput {
-            merged,
-            exit_code: status.code().unwrap_or(-1),
-        }),
+    let outcome = tokio::time::timeout(Duration::from_secs(secs), wait).await;
+    match outcome {
+        Ok(Ok((merged, status))) => {
+            // Graceful completion — process group is already gone.
+            // Disarm the guard so its Drop doesn't issue a useless
+            // SIGKILL against a reaped pgid (worst case: signal
+            // races into a PID re-used by the OS).
+            #[cfg(unix)]
+            {
+                let mut g = _pgguard;
+                if let Some(ref mut gg) = g {
+                    gg.disarm();
+                }
+            }
+            Ok(InterleavedOutput {
+                merged,
+                exit_code: status.code().unwrap_or(-1),
+            })
+        }
         Ok(Err(e)) => Err(ToolError::Msg(format!("wait failed: {}", e))),
         Err(_) => {
+            // Timeout path already issues the killpg below; disarm
+            // the drop guard so we don't double-signal.
             #[cfg(unix)]
-            if let Some(pid) = pid {
-                // SAFETY: killpg with negative pid sends to the
-                // process group. SIGKILL is the same on every
-                // POSIX platform; libc::pid_t is i32 on every
-                // platform dirge supports.
-                unsafe {
-                    let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            {
+                let mut g = _pgguard;
+                if let Some(ref mut gg) = g {
+                    gg.disarm();
+                }
+                if let Some(pid) = pid {
+                    // SAFETY: killpg with negative pid sends to the
+                    // process group. SIGKILL is the same on every
+                    // POSIX platform; libc::pid_t is i32 on every
+                    // platform dirge supports.
+                    unsafe {
+                        let _ = libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+                    }
                 }
             }
             let _ = pid;

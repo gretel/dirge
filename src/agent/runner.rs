@@ -336,6 +336,28 @@ where
                         output.push_str(&t.text);
                     }
                 }
+                // Final global cap on tool output, applied here at the
+                // single entry point so MCP tools, plugin tools, and
+                // any new built-in tool that forgets its own cap can't
+                // blow the agent's context. Per-tool caps still apply
+                // (bash 256 KiB, read per-line, grep/find_files/list_dir
+                // result count) — this is the belt-and-suspenders
+                // last line of defense. Matches opencode's tool.ts
+                // 100 KiB default.
+                const TOOL_OUTPUT_CAP_BYTES: usize = 100 * 1024;
+                if output.len() > TOOL_OUTPUT_CAP_BYTES {
+                    let original_len = output.len();
+                    // Truncate on a UTF-8 boundary at or before the cap.
+                    let mut cut = TOOL_OUTPUT_CAP_BYTES;
+                    while cut > 0 && !output.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    output.truncate(cut);
+                    output.push_str(&format!(
+                        "\n\n[…truncated by host: {} bytes original, {} bytes shown]",
+                        original_len, cut,
+                    ));
+                }
                 let _ = event_tx
                     .send(AgentEvent::ToolResult {
                         id: CompactString::from(tool_result.id),

@@ -278,13 +278,21 @@ impl Tool for GrepTool {
         } else {
             let output_lines = all_results.len();
             if output_lines >= MAX_GREP_RESULTS {
+                // `output_lines - MAX_GREP_RESULTS` is always 0 here
+                // because the walker breaks the moment `all_results`
+                // hits the cap — the old footer always read
+                // "...and 0 more". Use the actual match count vs.
+                // displayed lines, plus a hint that the walker may
+                // have stopped before finishing the corpus.
+                let hidden = match_count.saturating_sub(output_lines);
                 format!(
-                    "{} matches (showing first {} output lines, searched {} files):\n{}\n\n... and {} more",
+                    "{}+ matches (showing first {} output lines, searched {} files){}:\n{}\n\n... and {} more (output truncated; remaining files not scanned)",
                     match_count,
                     MAX_GREP_RESULTS,
                     file_count,
+                    "",
                     all_results.join("\n"),
-                    output_lines - MAX_GREP_RESULTS
+                    hidden,
                 )
             } else {
                 format!(
