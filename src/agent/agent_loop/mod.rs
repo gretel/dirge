@@ -25,6 +25,8 @@
 pub mod bridge;
 pub mod hooks;
 pub mod message;
+#[cfg(feature = "plugin")]
+pub mod plugin_hooks;
 pub mod result;
 pub mod rig_stream;
 pub mod rig_tool;
@@ -44,6 +46,8 @@ pub use message::{
     AssistantMessage, ContentBlock, DeltaPhase, LoopEvent, LoopMessage, StopReason, StreamEvent,
     ToolResultMessage, UserMessage,
 };
+#[cfg(feature = "plugin")]
+pub use plugin_hooks::{after_hook_from_plugin_manager, before_hook_from_plugin_manager};
 pub use result::{AfterToolCallResult, BeforeToolCallResult, LoopToolResult};
 pub use rig_stream::{wrap_rig_stream, wrap_streamed_assistant};
 pub use rig_tool::RigToolAdapter;

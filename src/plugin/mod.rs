@@ -921,6 +921,7 @@ mod tests {
                 provider_type: "openai".to_string(),
                 base_url: "http://plugin-test.invalid/v1".to_string(),
                 api_key_env: Some("PLUGIN_TEST_KEY".to_string()),
+                stream_chunk_timeout_secs: None,
             },
         );
         // Best-effort install — OnceLock may already be set from
@@ -958,6 +959,7 @@ mod tests {
                 provider_type: "openai".to_string(),
                 base_url: "http://from-config".to_string(),
                 api_key_env: None,
+                stream_chunk_timeout_secs: None,
             },
         );
         // Even if the plugin global also has "shadowed", config wins
