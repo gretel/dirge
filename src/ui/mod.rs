@@ -2329,19 +2329,24 @@ pub async fn run_interactive(
                             }
                             // Fire `prepare-next-run` so plugins can
                             // signal session-level state changes for
-                            // the next run. Currently the only
-                            // supported slot is `harness-next-model`
-                            // — if set, surface a notification so
-                            // the user can apply via `/model X`.
+                            // the next run. Closes the gap vs pi's
+                            // `prepareNextTurn` for the auto-apply
+                            // piece: when `harness-next-model` is
+                            // set, the agent is rebuilt with the new
+                            // model RIGHT HERE so the next user
+                            // prompt runs against it without
+                            // requiring `/model X`.
                             //
-                            // Auto-apply is deferred: the agent
-                            // rebuild path is non-trivial (touches
-                            // every cfg-feature combination of the
-                            // rig agent + the session model field +
-                            // context-window resolution) and the
-                            // existing `/model` slash already does it
-                            // correctly. Plugins propose, user
-                            // disposes.
+                            // Scope difference vs pi: pi fires
+                            // `prepareNextTurn` between TURNS within
+                            // a single agent run (and can swap model
+                            // mid-stream). dirge fires
+                            // `prepare-next-run` only between RUNS
+                            // (after Done). Mid-stream swap requires
+                            // breaking rig's multi-turn stream and
+                            // restarting with a new agent — that
+                            // would lose partial assistant state, so
+                            // we keep the swap at run boundaries.
                             match mgr.dispatch("prepare-next-run", "@{}") {
                                 Ok(_) => {}
                                 Err(e) => {
@@ -2352,13 +2357,54 @@ pub async fn run_interactive(
                                 }
                             }
                             if let Some(next_model) = mgr.take_pending_next_model() {
-                                renderer.write_line(
-                                    &format!(
-                                        "[plugin] requested model swap to '{}' — apply with /model {}",
-                                        next_model, next_model,
-                                    ),
-                                    c_perm(),
-                                )?;
+                                // Validate: empty string is a
+                                // misconfiguration. Don't replace the
+                                // active model with nothing.
+                                let trimmed = next_model.trim();
+                                if !trimmed.is_empty() && trimmed != session.model.as_str() {
+                                    let new_model_compact = CompactString::new(trimmed);
+                                    let model_obj =
+                                        client.completion_model(new_model_compact.to_string());
+                                    agent = crate::provider::build_agent(
+                                        model_obj,
+                                        cli,
+                                        cfg,
+                                        context,
+                                        permission.clone(),
+                                        ask_tx.clone(),
+                                        None,
+                                        None,
+                                        bg_store.clone(),
+                                        #[cfg(feature = "lsp")]
+                                        None,
+                                        sandbox.clone(),
+                                        #[cfg(feature = "mcp")]
+                                        mcp_manager,
+                                        #[cfg(feature = "semantic")]
+                                        semantic_manager,
+                                    )
+                                    .await;
+                                    let old_model = session.model.clone();
+                                    session.model = new_model_compact.clone();
+                                    session.provider = cli.resolve_provider(cfg);
+                                    // Re-resolve context window for
+                                    // the new model — mirrors the
+                                    // `/model` slash behavior so a
+                                    // 128k→1M jump (or vice versa)
+                                    // updates the status indicator.
+                                    let new_ctx =
+                                        cfg.resolve_context_window(new_model_compact.as_str());
+                                    if new_ctx != session.context_window {
+                                        session.context_window = new_ctx;
+                                    }
+                                    renderer.write_line(
+                                        &format!(
+                                            "[plugin] swapped model: {} → {}",
+                                            old_model, new_model_compact,
+                                        ),
+                                        c_agent(),
+                                    )?;
+                                }
                             }
                             // Clear `harness-response` so the next hook
                             // doesn't see stale text from this turn.
