@@ -24,6 +24,7 @@
 
 pub mod bridge;
 pub mod hooks;
+pub mod integration;
 pub mod message;
 #[cfg(feature = "plugin")]
 pub mod plugin_hooks;
@@ -43,6 +44,7 @@ pub use hooks::{
     BeforeToolCallReturn, GetFollowupMessagesFn, GetSteeringMessagesFn, PrepareNextTurnFn,
     ShouldStopAfterTurnFn, TurnHookContext,
 };
+pub use integration::{LoopRunner, LoopSpawnConfig, spawn_loop_runner};
 pub use message::{
     AssistantMessage, ContentBlock, DeltaPhase, LoopEvent, LoopMessage, StopReason, StreamEvent,
     ToolResultMessage, UserMessage,
