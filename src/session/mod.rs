@@ -280,6 +280,15 @@ pub struct Session {
     /// `None` for backward compat with pre-feature session files.
     #[serde(default)]
     pub current_prompt_name: Option<String>,
+    /// Batch2-3 (audit fix): file mtime at load time. Used by
+    /// `save_session` to detect concurrent writes — if the on-disk
+    /// file has a newer mtime than this when we go to save, a
+    /// second dirge instance wrote to the same session. We then
+    /// divert our write to a `<id>.conflict-<ts>.json` sibling so
+    /// neither side loses data. `None` on fresh sessions (no file
+    /// on disk yet) — save always wins in that case.
+    #[serde(skip)]
+    pub loaded_mtime: Option<std::time::SystemTime>,
 }
 
 impl Session {
@@ -361,6 +370,7 @@ impl Session {
             message_store: HashMap::new(),
             branch_summaries: Vec::new(),
             current_prompt_name: None,
+            loaded_mtime: None,
         }
     }
 

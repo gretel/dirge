@@ -58,6 +58,32 @@ pub fn save_session(session: &Session) -> anyhow::Result<()> {
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.json", session.id));
     let json = serde_json::to_string_pretty(session)?;
+
+    // Batch2-3 (audit fix): concurrent-writer detection. If another
+    // dirge instance saved to this file since we loaded it (i.e. the
+    // on-disk mtime is newer than `session.loaded_mtime`), writing
+    // verbatim would clobber the other instance's work. Divert to a
+    // `<id>.conflict-<unix_ts>.json` sibling so neither side loses
+    // data, and surface a clear error so the UI's "save failed"
+    // warning explains the situation.
+    if let Some(loaded_mtime) = session.loaded_mtime
+        && let Ok(meta) = std::fs::metadata(&path)
+        && let Ok(disk_mtime) = meta.modified()
+        && disk_mtime > loaded_mtime
+    {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let conflict_path = dir.join(format!("{}.conflict-{}.json", session.id, ts));
+        crate::fs_atomic::atomic_write_sync(&conflict_path, json.as_bytes())?;
+        anyhow::bail!(
+            "session {} was modified by another dirge instance; your changes saved to {} so neither copy is lost. Reload the session to see the other instance's state.",
+            session.id,
+            conflict_path.display()
+        );
+    }
+
     // Atomic write — write to a sibling `.tmp.<nonce>` file,
     // fsync, then rename over the target. A crash mid-write leaves
     // the temp behind but never a truncated `.json`. POSIX
@@ -77,6 +103,17 @@ pub fn load_session(id: &str) -> anyhow::Result<Session> {
     validate_session_id(id)?;
     let dir = session_dir();
     let path = dir.join(format!("{}.json", id));
+    // Batch2-3 (audit fix): record file mtime BEFORE reading so the
+    // conflict check in save_session compares against the version
+    // we actually loaded, not whatever has happened to the file
+    // since. There's still a tiny window between metadata() and
+    // read_to_string() — but the rename-based atomic_write makes
+    // it impossible to see a torn read; if a concurrent writer
+    // landed in that window we'll just detect THEIR version's
+    // mtime, and our next save_session will conflict-divert.
+    let loaded_mtime = std::fs::metadata(&path)
+        .ok()
+        .and_then(|m| m.modified().ok());
     let json = std::fs::read_to_string(&path)?;
 
     // F8: schema-version handling. Pre-F8 session files have no
@@ -92,6 +129,7 @@ pub fn load_session(id: &str) -> anyhow::Result<Session> {
         // restoring from a backup or deleting.
         anyhow::anyhow!("failed to parse {}: {e}", path.display())
     })?;
+    session.loaded_mtime = loaded_mtime;
 
     if session.schema_version < crate::session::SCHEMA_VERSION {
         migrate_session(&mut session);
@@ -281,6 +319,82 @@ mod tests {
         // Null bytes, newlines, spaces — anything non-id-shaped.
         assert!(validate_session_id("foo bar").is_err());
         assert!(validate_session_id("foo\nbar").is_err());
+    }
+
+    /// Batch2-3: when another writer's mtime is newer than ours
+    /// at save time, the save diverts to a `.conflict-<ts>.json`
+    /// sibling and returns an error so the UI surfaces a warning.
+    /// The original on-disk file is preserved (so the other
+    /// instance doesn't lose its work).
+    #[test]
+    fn save_session_diverts_to_conflict_on_concurrent_write() {
+        use crate::session::Session;
+
+        // Use a deterministic test id so cleanup is easy + tests
+        // can run in parallel without colliding (each test thread
+        // picks a unique id).
+        let id = format!(
+            "test-conflict-{}",
+            std::process::id() as u64 * 1000
+                + std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos() as u64
+        );
+        let mut sess = Session::new("openrouter", "test-model", 128_000);
+        sess.id = compact_str::CompactString::from(id.clone());
+
+        // First write — establishes the on-disk file with mtime T0.
+        save_session(&sess).expect("first save");
+
+        // Simulate "loaded earlier": set loaded_mtime to T0 - 1s so
+        // the on-disk mtime is necessarily newer. (We could also
+        // sleep + re-save to advance the on-disk mtime; the sub-
+        // second approach keeps the test fast.)
+        sess.loaded_mtime = Some(std::time::SystemTime::now() - std::time::Duration::from_secs(60));
+
+        // Second save with stale loaded_mtime — should detect the
+        // newer on-disk file and divert.
+        let result = save_session(&sess);
+        assert!(result.is_err(), "expected conflict error");
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("modified by another"), "got: {err_msg}");
+        assert!(err_msg.contains(".conflict-"), "got: {err_msg}");
+
+        // Cleanup: remove both the original + conflict files.
+        let dir = session_dir();
+        let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(&format!("{id}.conflict-")))
+                .unwrap_or(false)
+            {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+
+    /// Fresh save (loaded_mtime = None) doesn't trigger the
+    /// conflict check — first-write case must succeed.
+    #[test]
+    fn save_session_fresh_no_conflict_check() {
+        use crate::session::Session;
+        let id = format!(
+            "test-fresh-{}",
+            std::process::id() as u64 * 1000
+                + std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .subsec_nanos() as u64
+        );
+        let mut sess = Session::new("openrouter", "test-model", 128_000);
+        sess.id = compact_str::CompactString::from(id.clone());
+        assert!(sess.loaded_mtime.is_none());
+        save_session(&sess).expect("fresh save must succeed");
+        let dir = session_dir();
+        let _ = std::fs::remove_file(dir.join(format!("{id}.json")));
     }
 }
 

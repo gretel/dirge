@@ -1939,6 +1939,59 @@ pub async fn run_interactive(
                                     text.to_string()
                                 };
 
+                                // Batch2-1 (audit fix): preemptive
+                                // compaction check. Estimate the new
+                                // prompt's token cost; if
+                                // projected_total > 85% of the budget,
+                                // compact BEFORE sending so we don't
+                                // pay an extra round-trip + provider
+                                // ContextOverflow error on the way to
+                                // reactive auto-compact. Reactive
+                                // recovery still lives at the
+                                // ContextOverflow arm in case our
+                                // estimate undershoots.
+                                let reserve_for_check = cfg.resolve_reserve_tokens();
+                                let max_tokens_for_check =
+                                    session.context_window.saturating_sub(reserve_for_check);
+                                let preemptive_threshold = max_tokens_for_check * 85 / 100;
+                                let est_new_tokens =
+                                    crate::session::Session::estimate_tokens(&prompt);
+                                let preemptive_fired = session
+                                    .total_estimated_tokens
+                                    .saturating_add(est_new_tokens)
+                                    > preemptive_threshold
+                                    && session.total_estimated_tokens > 0;
+                                let history = if preemptive_fired {
+                                    renderer.write_line(
+                                        "▒░ preemptive compaction (context near limit) ░▒",
+                                        theme::accent(),
+                                    )?;
+                                    let compact_result = handle_compress(
+                                        None,
+                                        &mut agent, &client, &mut renderer, session, cli, cfg, context,
+                                        &permission, &ask_tx, &bg_store, &sandbox,
+                                        #[cfg(feature = "mcp")] mcp_manager,
+                                        #[cfg(feature = "semantic")] semantic_manager,
+                                        #[cfg(feature = "lsp")] lsp_manager.as_ref(),
+                                    ).await;
+                                    if let Err(e) = compact_result {
+                                        // Compact failed — log + proceed
+                                        // anyway. The reactive path will
+                                        // catch a real overflow.
+                                        renderer.write_line(
+                                            &format!(
+                                                "preemptive compaction failed (will retry reactively if needed): {e}"
+                                            ),
+                                            c_error(),
+                                        )?;
+                                    }
+                                    // Session was mutated — rebuild
+                                    // history from the new state.
+                                    crate::agent::runner::convert_history(session)
+                                } else {
+                                    history
+                                };
+
                                 let runner = agent.clone().spawn_runner(
                                     crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref()),
                                     history,

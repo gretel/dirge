@@ -87,9 +87,24 @@ fn load_agents() -> Option<String> {
         parts.push(format!("# Global AGENTS.md\n{}", content));
     }
 
+    // Batch2-2 (audit fix): cap the ancestor walk. Previously this
+    // walked to / (typically 6-10 stat+open calls per startup on a
+    // nested project) and would pick up any AGENTS.md/CLAUDE.md
+    // under $HOME or /Users that the user didn't intend to apply
+    // globally. opencode caps at the git root + $HOME — same here:
+    //   1. Stop at the first ancestor that contains `.git/` (the
+    //      project root for non-trivial cases).
+    //   2. Stop at the user's $HOME if no git root found earlier.
+    //   3. Hard cap at 16 levels as a defensive cliff.
+    // The dedicated global path under `~/.config/dirge/agent/`
+    // still loads independently above; that's the "global fallback"
+    // the README documents.
     let cwd = std::env::current_dir().ok();
     if let Some(cwd) = cwd {
+        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let mut current = Some(cwd.as_path());
+        let mut depth = 0usize;
+        const MAX_DEPTH: usize = 16;
         while let Some(dir) = current {
             for name in &["AGENTS.md", "CLAUDE.md"] {
                 let path = dir.join(name);
@@ -98,6 +113,25 @@ fn load_agents() -> Option<String> {
                 {
                     parts.push(format!("# {} ({})\n{}", name, dir.display(), content));
                 }
+            }
+
+            // Stop if THIS dir is the git root — project boundary.
+            // Checked AFTER loading so the project's own AGENTS.md
+            // is included.
+            if dir.join(".git").exists() {
+                break;
+            }
+            // Stop if we're at the user's HOME — anything above that
+            // is system territory and shouldn't bleed into the
+            // agent's context.
+            if let Some(ref h) = home
+                && dir == h.as_path()
+            {
+                break;
+            }
+            depth += 1;
+            if depth >= MAX_DEPTH {
+                break;
             }
             current = dir.parent();
         }
