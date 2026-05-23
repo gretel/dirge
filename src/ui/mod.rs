@@ -409,12 +409,6 @@ fn build_panel_data(
 ) -> crate::ui::renderer::PanelData {
     use std::path::Path;
 
-    let cwd_str = Path::new(session.working_dir.as_str())
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(session.working_dir.as_str())
-        .to_string();
-
     #[cfg(feature = "mcp")]
     let mcp: Vec<(String, bool)> = mcp_manager
         .map(|m| {
@@ -486,7 +480,6 @@ fn build_panel_data(
     let modified = panel_modified_cached(&cwd_path);
 
     crate::ui::renderer::PanelData {
-        cwd: cwd_str,
         mcp,
         lsp,
         todos,

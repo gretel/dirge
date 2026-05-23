@@ -60,8 +60,6 @@ pub enum PanelMode {
 /// is mutated by the agent and we don't want stale reads.
 #[derive(Default, Clone)]
 pub struct PanelData {
-    /// Short directory name to show at the top of the panel.
-    pub cwd: String,
     /// (server name, connected) — connected currently always true because the
     /// MCP manager drops failed connections at connect time; future health
     /// tracking can flip this to false.
@@ -2914,7 +2912,6 @@ mod tests {
         let mut r = Renderer::new().expect("renderer");
         let entries: Vec<String> = (0..100).map(|i| format!("file_{i}.rs")).collect();
         r.set_panel_data(PanelData {
-            cwd: "test".into(),
             mcp: Vec::new(),
             lsp: Vec::new(),
             todos: Vec::new(),
@@ -2952,7 +2949,6 @@ mod tests {
         use super::PanelData;
         let mut r = Renderer::new().expect("renderer");
         r.set_panel_data(PanelData {
-            cwd: "test".into(),
             mcp: Vec::new(),
             lsp: Vec::new(),
             todos: Vec::new(),
@@ -2974,7 +2970,6 @@ mod tests {
         use super::PanelData;
         let mut r = Renderer::new().expect("renderer");
         r.set_panel_data(PanelData {
-            cwd: "test".into(),
             mcp: vec![("a".into(), true), ("b".into(), true)],
             lsp: vec![("rust".into(), "/r".into(), true)],
             todos: vec![("[~]".into(), "t".into())],
