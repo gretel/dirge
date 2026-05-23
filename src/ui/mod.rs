@@ -104,6 +104,46 @@ fn with_queue(s: String, n: usize) -> String {
 /// uses `MessageV2.fromError(..., aborted: true)` to annotate the
 /// message; dirge appends the trailer as plain text since
 /// `SessionMessage` is content-only.
+/// Single rendering pipeline for the agent chat — Reasoning AND Token
+/// streams BOTH route through this helper. Markdown is parsed every
+/// chunk so bold / italics / inline code / headings / code blocks /
+/// blockquotes stay styled as text accumulates. The `base_color`
+/// parameter sets the body / paragraph color so each stream picks
+/// its own register (e.g. DarkMagenta for reasoning, theme::agent()
+/// for content tokens) while highlights (headings, code, accent,
+/// dim) follow the active theme.
+///
+/// `buf` is the accumulated stream text; `start_line` anchors the
+/// region of the renderer's buffer that this stream owns so each
+/// new chunk replaces-in-place. First call (when `*start_line ==
+/// None`) captures the current buffer length as the anchor.
+fn render_agent_stream(
+    buf: &str,
+    start_line: &mut Option<usize>,
+    base_color: Color,
+    renderer: &mut crate::ui::renderer::Renderer,
+) -> anyhow::Result<()> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    // 8-col "<dirge> " handle + 1-col space — the per-line prefix the
+    // first styled entry will carry.
+    let max_width = renderer.content_width().saturating_sub(9);
+    let mut styled = crate::ui::markdown::markdown_to_styled(buf, max_width, base_color);
+    if !styled.is_empty() {
+        styled[0].text = CompactString::from(format!("<dirge> {}", styled[0].text));
+    }
+    if let Some(start) = *start_line {
+        renderer.replace_from(start, styled);
+    } else {
+        let start = renderer.buffer_len();
+        *start_line = Some(start);
+        renderer.replace_from(start, styled);
+    }
+    renderer.render_viewport()?;
+    Ok(())
+}
+
 fn capture_partial_on_abort(
     response_buf: &mut String,
     session: &mut crate::session::Session,
@@ -2066,51 +2106,21 @@ pub async fn run_interactive(
                         if !show_reasoning {
                             continue;
                         }
-                        // dirge-ypg: route reasoning through the same
-                        // buffered path the Token handler uses.
-                        // Inline `renderer.write` was staircasing under
-                        // current LLM stream cadence; `replace_from +
-                        // render_viewport` paints every row at col=indent
-                        // via explicit `MoveTo(0, row)`, sidestepping
-                        // the raw-mode CR-less LF risk entirely.
                         let safe = sanitize_output(&text);
                         reasoning_buf.push_str(&safe);
-
-                        if reasoning_buf.is_empty() {
-                            was_reasoning = true;
-                            continue;
-                        }
-
-                        let max_width = renderer.content_width().saturating_sub(9);
-                        // Reasoning is plain text (no markdown — pi
-                        // historically renders it as a single
-                        // continuous paragraph with soft wrap). Use
-                        // `wrap::soft_wrap` directly to avoid the
-                        // markdown-parser overhead per chunk.
-                        let wrapped =
-                            crate::ui::wrap::soft_wrap(&reasoning_buf, max_width, "");
-                        let mut styled: Vec<LineEntry> = wrapped
-                            .into_iter()
-                            .map(|t| LineEntry {
-                                text: CompactString::from(t),
-                                color: Color::DarkMagenta,
-                            })
-                            .collect();
-                        if !styled.is_empty() {
-                            styled[0].text = CompactString::from(format!(
-                                "<dirge> {}",
-                                styled[0].text
-                            ));
-                        }
-
-                        if let Some(start) = reasoning_start_line {
-                            renderer.replace_from(start, styled);
-                        } else {
-                            let start = renderer.buffer_len();
-                            reasoning_start_line = Some(start);
-                            renderer.replace_from(start, styled);
-                        }
-                        renderer.render_viewport()?;
+                        // Shared pipeline with Token. DarkMagenta as
+                        // the base color signals "thinking" voice;
+                        // markdown highlights (bold / italic / inline
+                        // code / headings / blockquotes) still render
+                        // via theme accessors so the visual
+                        // hierarchy reads consistently across both
+                        // streams.
+                        render_agent_stream(
+                            &reasoning_buf,
+                            &mut reasoning_start_line,
+                            Color::DarkMagenta,
+                            &mut renderer,
+                        )?;
                         agent_line_started = true;
                         was_reasoning = true;
                     }
@@ -2118,18 +2128,18 @@ pub async fn run_interactive(
                         renderer.set_avatar_state(avatar::AvatarState::Speaking);
                         if was_reasoning {
                             renderer.write_line("", Color::White)?;
-                            agent_line_started = false;
                             was_reasoning = false;
                             response_buf.clear();
                             response_start_line = None;
-                            // dirge-ypg: end-of-reasoning marker. Keep
-                            // the reasoning rendered in the scroll
-                            // (already committed to buffer via the
-                            // Reasoning handler's render_viewport
-                            // pushes); just stop tracking it so the
-                            // next reasoning burst (if any) anchors
-                            // at a fresh buffer position below the
-                            // content that's about to stream.
+                            // End-of-reasoning marker. Keep the
+                            // reasoning rendered in the scroll
+                            // (committed via the Reasoning handler's
+                            // render_viewport); just stop tracking it
+                            // so the next reasoning burst (if any)
+                            // anchors at a fresh buffer position
+                            // below the content about to stream.
+                            // `agent_line_started` is reset to true
+                            // by `render_agent_stream` below.
                             reasoning_buf.clear();
                             reasoning_start_line = None;
                         }
@@ -2159,27 +2169,18 @@ pub async fn run_interactive(
                             }
                         }
 
-                        if response_buf.is_empty() {
-                            continue;
-                        }
-
-                        let max_width = renderer.content_width().saturating_sub(9); // 8-col handle + space
-                        let mut styled =
-                            crate::ui::markdown::markdown_to_styled(&response_buf, max_width);
-
-                        if !styled.is_empty() {
-                            styled[0].text =
-                                CompactString::from(format!("<dirge> {}", styled[0].text));
-                        }
-
-                        if let Some(start) = response_start_line {
-                            renderer.replace_from(start, styled);
-                        } else {
-                            let start = renderer.buffer_len();
-                            response_start_line = Some(start);
-                            renderer.replace_from(start, styled);
-                        }
-                        renderer.render_viewport()?;
+                        // Shared pipeline with Reasoning. theme::agent()
+                        // as the base color — switching themes shifts
+                        // the agent's voice in one place; markdown
+                        // highlights (headings, code, accent) ride on
+                        // their own theme accessors so they remain
+                        // visible against any chosen base.
+                        render_agent_stream(
+                            &response_buf,
+                            &mut response_start_line,
+                            c_agent(),
+                            &mut renderer,
+                        )?;
                         agent_line_started = true;
                     }
                     AgentEvent::ToolCall { id, name, args } => {
@@ -2715,6 +2716,7 @@ pub async fn run_interactive(
                             let mut styled = crate::ui::markdown::markdown_to_styled(
                                 &response_buf,
                                 max_width,
+                                c_agent(),
                             );
                             if !styled.is_empty() {
                                 styled[0].text =
@@ -3029,6 +3031,7 @@ pub async fn run_interactive(
                             let mut styled = crate::ui::markdown::markdown_to_styled(
                                 &response_buf,
                                 max_width,
+                                c_agent(),
                             );
                             if !styled.is_empty() {
                                 styled[0].text =

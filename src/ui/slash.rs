@@ -1301,7 +1301,11 @@ pub async fn handle_slash(
                     Ok(response) => {
                         renderer.write_line("", Color::White)?;
                         let max_width = renderer.line_width();
-                        let styled = crate::ui::markdown::markdown_to_styled(&response, max_width);
+                        let styled = crate::ui::markdown::markdown_to_styled(
+                            &response,
+                            max_width,
+                            c_agent(),
+                        );
                         for span in styled {
                             renderer.write(&span.text, span.color)?;
                         }

@@ -88,7 +88,7 @@ pub fn render_session(
             let max_width = renderer
                 .content_width()
                 .saturating_sub(handle.chars().count() + 1);
-            let mut styled = markdown::markdown_to_styled(&msg.content, max_width);
+            let mut styled = markdown::markdown_to_styled(&msg.content, max_width, line_color);
             for (i, entry) in styled.iter_mut().enumerate() {
                 if i == 0 {
                     entry.text = CompactString::from(format!("{} {}", handle, entry.text));

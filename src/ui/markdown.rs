@@ -144,6 +144,7 @@ fn render_table(
     header: &[String],
     rows: &[Vec<String>],
     max_width: usize,
+    base_color: Color,
     out: &mut Vec<LineEntry>,
 ) {
     use unicode_width::UnicodeWidthStr;
@@ -261,16 +262,28 @@ fn render_table(
     for row in rows {
         out.push(LineEntry {
             text: CompactString::new(&render_row(row, &widths)),
-            color: crate::ui::theme::agent(),
+            color: base_color,
         });
     }
     out.push(LineEntry {
         text: CompactString::new(""),
-        color: crate::ui::theme::agent(),
+        color: base_color,
     });
 }
 
-pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
+/// Render markdown text to styled line entries. `base_color` is the
+/// body / paragraph color — the agent's voice. Highlights (headings,
+/// code blocks, blockquotes, accents, dim/trailer text) still go
+/// through their dedicated `theme::*` accessors, so a single
+/// `base_color` swap shifts only the body text while keeping the
+/// inline emphasis hierarchy intact.
+///
+/// Streams that share the markdown engine (Token, Reasoning) pass
+/// their stream-specific base color here. Inline ANSI sequences for
+/// bold / italic / strikethrough / inline-code ride along inside
+/// each LineEntry's text, so visual hierarchy is preserved
+/// regardless of the chosen base color.
+pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Vec<LineEntry> {
     if text.is_empty() {
         return Vec::new();
     }
@@ -315,13 +328,13 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {}
                 Tag::Heading { level, .. } => {
-                    flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
+                    flush_acc(&acc, base_color, max_width, &mut result);
                     acc.clear();
                     in_heading = true;
                     heading_level = level as u32;
                 }
                 Tag::CodeBlock(kind) => {
-                    flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
+                    flush_acc(&acc, base_color, max_width, &mut result);
                     acc.clear();
                     in_code_block = true;
                     code_block_lang.clear();
@@ -330,7 +343,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     }
                 }
                 Tag::BlockQuote(_) => {
-                    flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
+                    flush_acc(&acc, base_color, max_width, &mut result);
                     acc.clear();
                     in_blockquote = true;
                 }
@@ -339,13 +352,13 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     list_item_count = 0;
                 }
                 Tag::Item => {
-                    flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
+                    flush_acc(&acc, base_color, max_width, &mut result);
                     acc.clear();
                     list_item_count += 1;
                 }
                 Tag::FootnoteDefinition(_) => {}
                 Tag::Table(_) => {
-                    flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
+                    flush_acc(&acc, base_color, max_width, &mut result);
                     acc.clear();
                     in_table = true;
                     table_header.clear();
@@ -402,7 +415,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     let color = if in_blockquote {
                         crate::ui::theme::dim()
                     } else {
-                        crate::ui::theme::agent()
+                        base_color
                     };
                     flush_acc(&acc, color, max_width, &mut result);
                     acc.clear();
@@ -428,7 +441,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     in_heading = false;
                     result.push(LineEntry {
                         text: CompactString::new(""),
-                        color: crate::ui::theme::agent(),
+                        color: base_color,
                     });
                 }
                 TagEnd::CodeBlock => {
@@ -467,7 +480,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     in_code_block = false;
                     result.push(LineEntry {
                         text: CompactString::new(""),
-                        color: crate::ui::theme::agent(),
+                        color: base_color,
                     });
                 }
                 TagEnd::BlockQuote(_) => {
@@ -500,14 +513,14 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     in_blockquote = false;
                     result.push(LineEntry {
                         text: CompactString::new(""),
-                        color: crate::ui::theme::agent(),
+                        color: base_color,
                     });
                 }
                 TagEnd::Item => {
                     let color = if in_blockquote {
                         crate::ui::theme::dim()
                     } else {
-                        crate::ui::theme::agent()
+                        base_color
                     };
                     let bullet = if ordered_list {
                         format!(" {}. ", list_item_count)
@@ -554,12 +567,18 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                     list_item_count = 0;
                     result.push(LineEntry {
                         text: CompactString::new(""),
-                        color: crate::ui::theme::agent(),
+                        color: base_color,
                     });
                 }
                 TagEnd::FootnoteDefinition => {}
                 TagEnd::Table => {
-                    render_table(&table_header, &table_rows, max_width, &mut result);
+                    render_table(
+                        &table_header,
+                        &table_rows,
+                        max_width,
+                        base_color,
+                        &mut result,
+                    );
                     in_table = false;
                 }
                 TagEnd::TableHead => {
@@ -648,7 +667,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                 }
             }
             Event::Rule => {
-                flush_acc(&acc, crate::ui::theme::agent(), max_width, &mut result);
+                flush_acc(&acc, base_color, max_width, &mut result);
                 acc.clear();
                 let rule: String = std::iter::repeat('─').take(max_width.min(40)).collect();
                 result.push(LineEntry {
@@ -657,7 +676,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
                 });
                 result.push(LineEntry {
                     text: CompactString::new(""),
-                    color: crate::ui::theme::agent(),
+                    color: base_color,
                 });
             }
             Event::Html(t) => {
@@ -688,7 +707,7 @@ pub fn markdown_to_styled(text: &str, max_width: usize) -> Vec<LineEntry> {
         } else if in_heading {
             crate::ui::theme::header()
         } else {
-            crate::ui::theme::agent()
+            base_color
         };
         flush_acc(&acc, color, max_width, &mut result);
     }
@@ -734,7 +753,7 @@ mod tests {
             vec!["c.rs".to_string(), "DELETE".to_string(), "❌".to_string()],
         ];
         let mut out = Vec::new();
-        render_table(&header, &rows, 80, &mut out);
+        render_table(&header, &rows, 80, crate::ui::theme::agent(), &mut out);
         // Drop the trailing empty line; everything else must align.
         let non_empty: Vec<&LineEntry> = out.iter().filter(|e| !e.text.is_empty()).collect();
         let owned: Vec<LineEntry> = non_empty.into_iter().cloned().collect();
@@ -750,7 +769,7 @@ mod tests {
             vec!["3".to_string(), "44".to_string()],
         ];
         let mut out = Vec::new();
-        render_table(&header, &rows, 80, &mut out);
+        render_table(&header, &rows, 80, crate::ui::theme::agent(), &mut out);
         let owned: Vec<LineEntry> = out.iter().filter(|e| !e.text.is_empty()).cloned().collect();
         assert_rows_same_width(&owned);
     }
@@ -765,7 +784,7 @@ mod tests {
             vec!["🚀 emoji-first".to_string(), "?".to_string()],
         ];
         let mut out = Vec::new();
-        render_table(&header, &rows, 80, &mut out);
+        render_table(&header, &rows, 80, crate::ui::theme::agent(), &mut out);
         let owned: Vec<LineEntry> = out.iter().filter(|e| !e.text.is_empty()).cloned().collect();
         assert_rows_same_width(&owned);
     }
@@ -788,7 +807,7 @@ mod tests {
     /// accumulator and `\x1b[22m` close on TagEnd::Strong.
     #[test]
     fn strong_emits_bold_ansi() {
-        let rendered = markdown_to_styled("the **fox** is quick", 80);
+        let rendered = markdown_to_styled("the **fox** is quick", 80, crate::ui::theme::agent());
         let blob: String = rendered
             .iter()
             .map(|e| e.text.as_str())
@@ -802,7 +821,7 @@ mod tests {
     /// Italic (`*x*`) maps to ANSI 3 / 23.
     #[test]
     fn emphasis_emits_italic_ansi() {
-        let rendered = markdown_to_styled("the *fox*", 80);
+        let rendered = markdown_to_styled("the *fox*", 80, crate::ui::theme::agent());
         let blob: String = rendered
             .iter()
             .map(|e| e.text.as_str())
@@ -816,7 +835,7 @@ mod tests {
     /// embeds the tool-color SGR around them.
     #[test]
     fn inline_code_paints_with_tool_color() {
-        let rendered = markdown_to_styled("call `fn_name`", 80);
+        let rendered = markdown_to_styled("call `fn_name`", 80, crate::ui::theme::agent());
         let blob: String = rendered
             .iter()
             .map(|e| e.text.as_str())
@@ -833,7 +852,8 @@ mod tests {
     /// coloring (verified by presence of an SGR sequence for `fn`).
     #[test]
     fn fenced_rust_block_gets_keyword_coloring() {
-        let rendered = markdown_to_styled("```rust\nfn main() {}\n```", 80);
+        let rendered =
+            markdown_to_styled("```rust\nfn main() {}\n```", 80, crate::ui::theme::agent());
         let blob: String = rendered
             .iter()
             .map(|e| e.text.as_str())
