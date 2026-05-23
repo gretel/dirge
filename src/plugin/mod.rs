@@ -963,7 +963,7 @@ mod tests {
         mgr.eval(r#"(defn echo-handler [args] (string "got:" args))"#)
             .unwrap();
         let out = mgr
-            .invoke_plugin_tool("echo-handler", r#"{"x":1}"#)
+            .invoke_plugin_tool("echo-handler", r#"{"x":1}"#, "test-tc-1")
             .unwrap();
         assert_eq!(out, r#"got:{"x":1}"#);
     }
@@ -976,7 +976,9 @@ mod tests {
         let mut mgr = PluginManager::try_new().unwrap();
         mgr.eval(r#"(defn boom-handler [args] (error "kaboom"))"#)
             .unwrap();
-        let err = mgr.invoke_plugin_tool("boom-handler", "{}").unwrap_err();
+        let err = mgr
+            .invoke_plugin_tool("boom-handler", "{}", "test-tc-2")
+            .unwrap_err();
         assert!(err.contains("kaboom"), "got: {err}");
     }
 
@@ -1016,7 +1018,7 @@ mod tests {
         // Tool dispatch round-trips: the LLM-supplied args reach
         // the Janet handler intact.
         let out = mgr
-            .invoke_plugin_tool("echo-tool-handler", r#"{"msg":"hi"}"#)
+            .invoke_plugin_tool("echo-tool-handler", r#"{"msg":"hi"}"#, "test-tc")
             .unwrap();
         assert_eq!(out, r#"echo received args: {"msg":"hi"}"#);
 
@@ -1075,6 +1077,73 @@ mod tests {
             "renderer output must include content; got: {}",
             resolved.body,
         );
+    }
+
+    // --- H2: tool_call_id slot + emit-tool-progress queue --------------
+
+    /// Inside an `invoke_plugin_tool` call, `harness/current-tool-call`
+    /// is set to the tool_call_id the host passed. After the call
+    /// returns, the slot resets to nil so a subsequent handler
+    /// observing nil knows no plugin tool is active.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn invoke_plugin_tool_sets_current_tool_call_slot() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(var --observed-tcid nil)
+               (defn capturer [args]
+                 (set --observed-tcid harness-current-tool-call)
+                 "ok")"#,
+        )
+        .unwrap();
+        mgr.invoke_plugin_tool("capturer", "{}", "tc-7").unwrap();
+        // During the call the slot held "tc-7".
+        let observed = mgr.eval("--observed-tcid").unwrap();
+        assert_eq!(observed, "tc-7");
+        // After the call the slot is cleared.
+        let post = mgr.eval("harness-current-tool-call").unwrap();
+        assert_eq!(post, "nil");
+    }
+
+    /// Even when the handler errors, the current-tool-call slot
+    /// resets to nil. Otherwise a stale id would leak into the next
+    /// invocation's progress events.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn invoke_plugin_tool_clears_slot_after_handler_error() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(r#"(defn bad [args] (error "kaboom"))"#).unwrap();
+        let _ = mgr.invoke_plugin_tool("bad", "{}", "tc-9");
+        let post = mgr.eval("harness-current-tool-call").unwrap();
+        assert_eq!(post, "nil");
+    }
+
+    /// `harness/emit-tool-progress` tags entries with the current
+    /// tool-call id; drain returns them in order. Calls made OUTSIDE
+    /// a tool invocation (current-tool-call nil) are silently dropped.
+    #[cfg(feature = "plugin")]
+    #[test]
+    fn emit_tool_progress_tags_entries_with_current_tool_call() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(defn worker [args]
+                 (harness/emit-tool-progress "step 1")
+                 (harness/emit-tool-progress "step 2")
+                 "done")"#,
+        )
+        .unwrap();
+        // Pre-invocation calls have nil current-tool-call → no-op.
+        mgr.eval(r#"(harness/emit-tool-progress "dropped")"#)
+            .unwrap();
+
+        mgr.invoke_plugin_tool("worker", "{}", "tc-prog").unwrap();
+        let drained = mgr.drain_tool_progress();
+        assert_eq!(drained.len(), 2, "got: {drained:?}");
+        assert_eq!(drained[0], ("tc-prog".to_string(), "step 1".to_string()));
+        assert_eq!(drained[1], ("tc-prog".to_string(), "step 2".to_string()));
+
+        // Drain clears the queue.
+        assert!(mgr.drain_tool_progress().is_empty());
     }
 
     // --- H3: register-tool prepare-arguments field ---------------------
@@ -3055,13 +3124,33 @@ impl PluginManager {
     /// return any value `(string ...)` can render. Returns the tool's
     /// stringified output, or `Err` carrying the Janet exception text
     /// when the handler raises.
-    pub fn invoke_plugin_tool(&mut self, handler: &str, args_json: &str) -> Result<String, String> {
-        let escaped = escape_janet_string(args_json);
+    pub fn invoke_plugin_tool(
+        &mut self,
+        handler: &str,
+        args_json: &str,
+        tool_call_id: &str,
+    ) -> Result<String, String> {
+        let escaped_args = escape_janet_string(args_json);
+        let escaped_id = escape_janet_string(tool_call_id);
+        // Set the current-tool-call slot BEFORE invoking the handler
+        // so `harness/emit-tool-progress` knows which call to tag.
+        // Wrap the whole sequence in a `try` so the slot is always
+        // cleared, even on handler error — `try`'s catch arm runs
+        // before the `do`'s tail returns. We use a top-level set
+        // afterwards rather than `defer` so the slot reliably resets
+        // for the next invocation.
         let code = format!(
-            r#"(try (let [r ({handler} "{args}")] (if (string? r) r (string r)))
-                   ([err fib] (string "DIRGE_TOOL_ERR:" err)))"#,
+            r#"(do
+                 (set harness-current-tool-call "{tcid}")
+                 (def result
+                   (try (let [r ({handler} "{args}")]
+                          (if (string? r) r (string r)))
+                        ([err fib] (string "DIRGE_TOOL_ERR:" err))))
+                 (set harness-current-tool-call nil)
+                 result)"#,
+            tcid = escaped_id,
             handler = handler,
-            args = escaped,
+            args = escaped_args,
         );
         let out = self.worker.eval(&code)?;
         if let Some(msg) = out.strip_prefix("DIRGE_TOOL_ERR:") {
@@ -3069,6 +3158,34 @@ impl PluginManager {
         } else {
             Ok(out)
         }
+    }
+
+    /// Drain pending `(harness/emit-tool-progress ...)` entries as
+    /// `(tool_call_id, text)` pairs (H2). The host forwards each to
+    /// the matching `LoopTool::execute` `on_update` callback. Called
+    /// at loop tick + after the plugin handler returns so streaming
+    /// updates surface ASAP.
+    pub fn drain_tool_progress(&mut self) -> Vec<(String, String)> {
+        let raw = match self.worker.eval("harness-tool-progress") {
+            Ok(s) => s,
+            Err(_) => return Vec::new(),
+        };
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let _ = self.worker.eval(r#"(set harness-tool-progress "")"#);
+        raw.lines()
+            .filter_map(|line| {
+                let mut parts = line.split('\t');
+                let id = unescape_harness_field(parts.next()?);
+                let text = unescape_harness_field(parts.next()?);
+                if id.is_empty() {
+                    None
+                } else {
+                    Some((id, text))
+                }
+            })
+            .collect()
     }
 
     /// Drain pending `(harness/notify ...)` entries as `(level, msg)`

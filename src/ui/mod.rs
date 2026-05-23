@@ -729,12 +729,17 @@ pub async fn run_interactive(
     let mut search_matches: Vec<usize> = Vec::new();
     let mut search_selected = 0usize;
 
-    // Snapshot plugin-registered shortcuts (P9c). Read once at UI
-    // startup; plugin reloads require a host restart for new bindings
-    // to take effect. Plugins that ship invalid key specs get a
-    // tracing::warn and the binding is dropped (see parse_shortcuts).
+    // Snapshot plugin-registered shortcuts (P9c). Seeded at UI
+    // startup; refreshed at the top of each event loop iteration
+    // (M2) so a plugin that registers a shortcut from a hook —
+    // e.g. on-prompt — gets the binding picked up by the next
+    // keystroke instead of needing a host restart. Cost is one
+    // Janet eval per iteration, same envelope as the existing
+    // drain_notifications / drain_entries calls at loop top.
+    // Plugins that ship invalid key specs get a tracing::warn and
+    // the binding is dropped (see parse_shortcuts).
     #[cfg(feature = "plugin")]
-    let plugin_shortcuts: Vec<crate::plugin::extension::ParsedShortcut> = {
+    let mut plugin_shortcuts: Vec<crate::plugin::extension::ParsedShortcut> = {
         let metas = crate::plugin::hook::global()
             .map(|pm| {
                 pm.lock()
@@ -888,6 +893,19 @@ pub async fn run_interactive(
             #[cfg(feature = "lsp")]
             lsp_manager.as_ref(),
         ));
+
+        // Re-snapshot plugin shortcuts (M2). A hook that called
+        // harness/register-shortcut on the previous turn is now
+        // visible to the next keystroke. One Janet eval; same
+        // cost envelope as drain_notifications below.
+        #[cfg(feature = "plugin")]
+        if let Some(pm_arc) = crate::plugin::hook::global() {
+            let metas = {
+                let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
+                mgr.list_shortcuts()
+            };
+            plugin_shortcuts = crate::plugin::extension::parse_shortcuts(metas);
+        }
 
         // Drain any pending plugin notifications and surface each as a
         // colored chat line. Done at loop top so notifications posted

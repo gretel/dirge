@@ -428,6 +428,28 @@ const HARNESS_INIT: &str = r#"
                    (harness/-escape handler) "\t"
                    (harness/-escape desc) "\n")))))
 
+# Per-invocation context slot set by the host before each plugin
+# tool handler runs (H2). Reads return the tool-call id the LLM
+# assigned to the current call — useful for correlating progress
+# updates, logging, or pairing related state. Cleared between
+# invocations so a handler observing nil knows no plugin tool is
+# active.
+(var harness-current-tool-call nil)
+
+# (harness/emit-tool-progress text) — push a streaming progress
+# update for the currently-running plugin tool (H2). Mirrors pi's
+# onUpdate callback (extensions/types.ts execute signature). No-op
+# when called outside a plugin tool handler (current-tool-call nil)
+# or with a non-string arg. The host drains the queue and forwards
+# each entry to the loop's per-tool on_update callback.
+(var harness-tool-progress "")
+(defn harness/emit-tool-progress [text]
+  (when (and (string? text) harness-current-tool-call)
+    (set harness-tool-progress
+         (string harness-tool-progress
+                 (harness/-escape harness-current-tool-call) "\t"
+                 (harness/-escape text) "\n"))))
+
 # Plugin-registered LLM-callable tools (P9a). Plugins call
 #   (harness/register-tool name description label parameters handler
 #                          &opt execution-mode prepare-arguments)

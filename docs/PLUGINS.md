@@ -391,6 +391,28 @@ built-in ones. Mirrors pi's `api.registerTool({...})`.
 
 See [`plugins/example_tool.janet`](../plugins/example_tool.janet).
 
+**Per-invocation context** (H2). Inside a tool handler:
+
+- `harness-current-tool-call` is bound to the tool-call id the LLM
+  assigned to the current call. Useful for correlating progress
+  updates, structured logging, or pairing related state. Reads
+  return `nil` outside a plugin tool handler.
+- `(harness/emit-tool-progress text)` pushes a streaming progress
+  update tagged with the current tool-call id. The host forwards
+  each call through the loop's per-tool `on_update` callback. Janet
+  is single-threaded so progress entries can't actually interleave
+  with handler work — they're batched and replayed after the
+  handler returns, before the final result reaches the LLM.
+
+```janet
+(defn slow-tool [args]
+  (harness/emit-tool-progress "starting…")
+  (some-long-step)
+  (harness/emit-tool-progress (string "id=" harness-current-tool-call " halfway"))
+  (some-final-step)
+  "done")
+```
+
 **Cancellation semantics.** Plugin tools run synchronously on the
 Janet worker thread, which can't be preempted mid-evaluation. When
 the user hits Ctrl+C/Esc:

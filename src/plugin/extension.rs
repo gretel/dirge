@@ -361,10 +361,10 @@ impl LoopTool for JanetLoopTool {
 
     fn execute<'a>(
         &'a self,
-        _tool_call_id: &'a str,
+        tool_call_id: &'a str,
         args: Value,
         signal: AbortSignal,
-        _on_update: LoopToolUpdate,
+        on_update: LoopToolUpdate,
     ) -> Pin<Box<dyn Future<Output = Result<LoopToolResult, String>> + Send + 'a>> {
         // Serialize args back to JSON. Janet doesn't have a JSON
         // decoder bundled, so we hand the handler the raw string and
@@ -373,6 +373,8 @@ impl LoopTool for JanetLoopTool {
         let args_json = args.to_string();
         let pm = self.pm.clone();
         let handler = self.handler.clone();
+        let tool_call_id_owned = tool_call_id.to_string();
+        let name_owned = self.name.clone();
         Box::pin(async move {
             // Cancellation pre-flight. The dispatcher (tools.rs)
             // races this whole future against `wait_for_cancel` so
@@ -387,26 +389,57 @@ impl LoopTool for JanetLoopTool {
                 return Err("plugin tool aborted before execution".to_string());
             }
             let signal_in = signal.clone();
-            let result = tokio::task::spawn_blocking(move || -> Result<String, String> {
-                // Re-check on the worker thread: the user may
-                // have hit Esc while we waited for the runtime to
-                // schedule the blocking task.
-                if signal_in.is_cancelled() {
-                    return Err("plugin tool aborted before mutex acquire".to_string());
-                }
-                let mut guard = pm
-                    .lock()
-                    .map_err(|_| "plugin manager mutex poisoned".to_string())?;
-                // Final check after the mutex unblocks us — a
-                // prior plugin tool may have held the lock for a
-                // while; user could have cancelled in that window.
-                if signal_in.is_cancelled() {
-                    return Err("plugin tool aborted while waiting for plugin manager".to_string());
-                }
-                guard.invoke_plugin_tool(&handler, &args_json)
-            })
+            let pm_for_blocking = pm.clone();
+            let tcid_for_blocking = tool_call_id_owned.clone();
+            let (result, progress_events) = tokio::task::spawn_blocking(
+                move || -> Result<(String, Vec<(String, String)>), String> {
+                    // Re-check on the worker thread: the user may
+                    // have hit Esc while we waited for the runtime to
+                    // schedule the blocking task.
+                    if signal_in.is_cancelled() {
+                        return Err("plugin tool aborted before mutex acquire".to_string());
+                    }
+                    let mut guard = pm_for_blocking
+                        .lock()
+                        .map_err(|_| "plugin manager mutex poisoned".to_string())?;
+                    // Final check after the mutex unblocks us — a
+                    // prior plugin tool may have held the lock for a
+                    // while; user could have cancelled in that window.
+                    if signal_in.is_cancelled() {
+                        return Err(
+                            "plugin tool aborted while waiting for plugin manager".to_string()
+                        );
+                    }
+                    let r = guard.invoke_plugin_tool(&handler, &args_json, &tcid_for_blocking)?;
+                    // H2: drain any harness/emit-tool-progress entries
+                    // the handler pushed during execution. We do this
+                    // under the same lock so a subsequent plugin tool
+                    // can't race in between and steal entries.
+                    let prog = guard
+                        .drain_tool_progress()
+                        .into_iter()
+                        .filter(|(id, _)| id == &tcid_for_blocking)
+                        .collect::<Vec<_>>();
+                    Ok((r, prog))
+                },
+            )
             .await
             .map_err(|e| format!("plugin tool task join error: {e}"))??;
+
+            // Replay progress entries against the on_update callback.
+            // These fire AFTER the handler completes (Janet is
+            // single-threaded; we couldn't interleave during execute).
+            // Plugin authors using emit-tool-progress get the events
+            // batched but in-order — same observable surface as a
+            // synchronous progress-emitting handler.
+            for (_id, text) in progress_events {
+                on_update(&LoopToolResult {
+                    content: vec![serde_json::json!({"type": "text", "text": text})],
+                    details: Value::Null,
+                    terminate: None,
+                });
+            }
+            let _ = name_owned;
             Ok(LoopToolResult {
                 content: vec![serde_json::json!({"type": "text", "text": result})],
                 details: Value::Null,
@@ -647,6 +680,61 @@ mod tests {
     }
 
     // --- back to JanetLoopTool tests --------------------------------
+
+    /// H2: a tool handler that calls `harness/emit-tool-progress` has
+    /// its updates forwarded through `JanetLoopTool::execute`'s
+    /// `on_update` callback. Updates are batched (Janet is
+    /// single-threaded so we can't interleave during execute) but
+    /// arrive after the handler returns, before the final result.
+    #[tokio::test]
+    async fn janet_loop_tool_execute_forwards_emit_tool_progress_to_on_update() {
+        let pm = {
+            let mut mgr = PluginManager::try_new().unwrap();
+            mgr.eval(
+                r#"(defn streamer [args]
+                     (harness/emit-tool-progress "halfway")
+                     (harness/emit-tool-progress "almost done")
+                     "complete")
+                   (harness/register-tool "streamer" "" "" "{}" "streamer")"#,
+            )
+            .unwrap();
+            Arc::new(Mutex::new(mgr))
+        };
+        let metas: Vec<PluginToolMeta> = pm.lock().unwrap().list_plugin_tools();
+        let tool = JanetLoopTool::from_meta(metas.into_iter().next().unwrap(), pm.clone()).unwrap();
+
+        let captured: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let captured_for_cb = captured.clone();
+        let on_update: LoopToolUpdate = Arc::new(move |r: &LoopToolResult| {
+            for c in &r.content {
+                if let Some(t) = c.get("text").and_then(|v| v.as_str()) {
+                    captured_for_cb.lock().unwrap().push(t.to_string());
+                }
+            }
+        });
+
+        let result = tool
+            .execute(
+                "stream-1",
+                Value::Object(Default::default()),
+                AbortSignal::new(),
+                on_update,
+            )
+            .await
+            .expect("execute should succeed");
+
+        let progress = captured.lock().unwrap().clone();
+        assert_eq!(progress, vec!["halfway", "almost done"]);
+
+        // Final result also reaches the caller.
+        let final_text = result
+            .content
+            .iter()
+            .filter_map(|b| b.get("text").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>()
+            .join("");
+        assert_eq!(final_text, "complete");
+    }
 
     /// H3: `prepare_arguments` calls the registered Janet handler
     /// and substitutes the returned JSON for the original args.
