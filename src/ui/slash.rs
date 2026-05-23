@@ -1145,15 +1145,19 @@ pub async fn handle_slash(
             *is_running = false;
             return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "quit").into());
         }
-        // dirge-ov2 Phase B: `/tasks` lists active chat windows and
-        // cycles to the next one. Equivalent to Ctrl-X / Ctrl-N for
-        // keyboard-shy users (or scripts that drive dirge via slash
-        // commands). When only the main chat exists, prints a hint.
+        // dirge-ov2 Phase C: `/tasks` LISTS chat windows but does not
+        // switch. Switching needs to save/load the UI loop's
+        // per-chat streaming state (response_buf, last_tool_name,
+        // etc.) which the slash handler doesn't have access to —
+        // switching from here would skip the save/load and corrupt
+        // the active chat's mid-stream context. Users switch via
+        // Ctrl-N / Ctrl-P / Ctrl-X (which DO go through the save/
+        // load path in the UI loop).
         "/tasks" => {
             let names = renderer.chat_names();
             if names.len() <= 1 {
                 renderer.write_line(
-                    "no subagent chats — spawn one via the `task` tool or wait for the agent to dispatch a subagent.",
+                    "no subagent chats yet — spawn one via the `task` tool.",
                     c_result(),
                 )?;
             } else {
@@ -1163,13 +1167,7 @@ pub async fn handle_slash(
                     let marker = if i == active { "→" } else { " " };
                     renderer.write_line(&format!("  {} [{}] {}", marker, i, name), c_result())?;
                 }
-                let next = (active + 1) % names.len();
-                renderer.switch_chat(next);
-                renderer.render_viewport()?;
-                renderer.write_line(
-                    &format!("→ switched to chat {} ({})", next, names[next]),
-                    c_result(),
-                )?;
+                renderer.write_line("  (Ctrl-N / Ctrl-P / Ctrl-X to switch)", theme::dim())?;
             }
         }
         "/clear" => {

@@ -104,6 +104,93 @@ fn with_queue(s: String, n: usize) -> String {
 /// uses `MessageV2.fromError(..., aborted: true)` to annotate the
 /// message; dirge appends the trailer as plain text since
 /// `SessionMessage` is content-only.
+/// dirge-ov2 Phase C: per-chat snapshot of the UI loop's streaming /
+/// chamber state. Saved when the user switches away from a chat;
+/// restored when they switch back. Hot-path event handlers continue
+/// to read/write the UI-loop locals directly — only chat-switch
+/// boundaries pay for the swap.
+#[derive(Default)]
+struct ChatUiState {
+    response_buf: String,
+    response_start_line: Option<usize>,
+    reasoning_buf: String,
+    reasoning_start_line: Option<usize>,
+    last_tool_name: Option<String>,
+    last_tool_call_id: Option<String>,
+    tool_chamber_open: bool,
+    agent_line_started: bool,
+    was_reasoning: bool,
+    tool_calls_buf: Vec<crate::session::ToolCallEntry>,
+    tool_calls_this_run: u32,
+}
+
+impl ChatUiState {
+    fn empty() -> Self {
+        Self::default()
+    }
+}
+
+/// dirge-ov2 Phase C: snapshot the UI loop's per-chat locals into the
+/// supplied state slot. Called before switching chats so each chat's
+/// streaming context survives the swap.
+#[allow(clippy::too_many_arguments)]
+fn save_chat_ui_state(
+    slot: &mut ChatUiState,
+    response_buf: &mut String,
+    response_start_line: &mut Option<usize>,
+    reasoning_buf: &mut String,
+    reasoning_start_line: &mut Option<usize>,
+    last_tool_name: &mut Option<String>,
+    last_tool_call_id: &mut Option<String>,
+    tool_chamber_open: &mut bool,
+    agent_line_started: &mut bool,
+    was_reasoning: &mut bool,
+    tool_calls_buf: &mut Vec<crate::session::ToolCallEntry>,
+    tool_calls_this_run: &mut u32,
+) {
+    slot.response_buf = std::mem::take(response_buf);
+    slot.response_start_line = response_start_line.take();
+    slot.reasoning_buf = std::mem::take(reasoning_buf);
+    slot.reasoning_start_line = reasoning_start_line.take();
+    slot.last_tool_name = last_tool_name.take();
+    slot.last_tool_call_id = last_tool_call_id.take();
+    slot.tool_chamber_open = *tool_chamber_open;
+    slot.agent_line_started = *agent_line_started;
+    slot.was_reasoning = *was_reasoning;
+    slot.tool_calls_buf = std::mem::take(tool_calls_buf);
+    slot.tool_calls_this_run = *tool_calls_this_run;
+}
+
+/// dirge-ov2 Phase C: inverse of `save_chat_ui_state`. Loads the
+/// supplied state slot into the UI loop's locals after a chat switch.
+#[allow(clippy::too_many_arguments)]
+fn load_chat_ui_state(
+    slot: &mut ChatUiState,
+    response_buf: &mut String,
+    response_start_line: &mut Option<usize>,
+    reasoning_buf: &mut String,
+    reasoning_start_line: &mut Option<usize>,
+    last_tool_name: &mut Option<String>,
+    last_tool_call_id: &mut Option<String>,
+    tool_chamber_open: &mut bool,
+    agent_line_started: &mut bool,
+    was_reasoning: &mut bool,
+    tool_calls_buf: &mut Vec<crate::session::ToolCallEntry>,
+    tool_calls_this_run: &mut u32,
+) {
+    *response_buf = std::mem::take(&mut slot.response_buf);
+    *response_start_line = slot.response_start_line.take();
+    *reasoning_buf = std::mem::take(&mut slot.reasoning_buf);
+    *reasoning_start_line = slot.reasoning_start_line.take();
+    *last_tool_name = slot.last_tool_name.take();
+    *last_tool_call_id = slot.last_tool_call_id.take();
+    *tool_chamber_open = slot.tool_chamber_open;
+    *agent_line_started = slot.agent_line_started;
+    *was_reasoning = slot.was_reasoning;
+    *tool_calls_buf = std::mem::take(&mut slot.tool_calls_buf);
+    *tool_calls_this_run = slot.tool_calls_this_run;
+}
+
 /// Single rendering pipeline for the agent chat — Reasoning AND Token
 /// streams BOTH route through this helper. Markdown is parsed every
 /// chunk so bold / italics / inline code / headings / code blocks /
@@ -785,6 +872,19 @@ pub async fn run_interactive(
     // than a fact about a name that has other clear sites.
     let mut tool_chamber_open: bool = false;
 
+    // dirge-ov2 Phase C: per-chat UI state. When the user switches
+    // chats (Ctrl-N/P/X, /tasks), the locals above (response_buf,
+    // reasoning_buf, last_tool_name, last_tool_call_id,
+    // tool_chamber_open, was_reasoning, agent_line_started,
+    // response_start_line, reasoning_start_line) get saved into
+    // `chat_ui_states[old_active]` and the new chat's state is
+    // loaded into them. Hot-path event handlers reference the locals
+    // unchanged; only the chat-switch boundary pays for the swap.
+    //
+    // `chat_ui_states[0]` mirrors the main chat from the start;
+    // subagent chats added later push new entries.
+    let mut chat_ui_states: Vec<ChatUiState> = vec![ChatUiState::empty()];
+
     // Last collapsed tool result, re-printable by Ctrl+O. Each
     // `render_tool_output` call that truncates the body stashes the
     // (tool, args-banner, full-output) tuple here; Ctrl+O reprints
@@ -1331,8 +1431,38 @@ pub async fn run_interactive(
                         let ctrl_n = key.code == KeyCode::Char('n')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
                         if ctrl_n && renderer.chat_count() > 1 {
-                            let next = (renderer.active_chat() + 1) % renderer.chat_count();
+                            let cur = renderer.active_chat();
+                            let next = (cur + 1) % renderer.chat_count();
+                            // dirge-ov2 Phase C: stash this chat's
+                            // streaming state, hop to the next chat,
+                            // load its state. Hot-path locals stay
+                            // pointing at the active chat throughout.
+                            save_chat_ui_state(
+                                &mut chat_ui_states[cur],
+                                &mut response_buf, &mut response_start_line,
+                                &mut reasoning_buf, &mut reasoning_start_line,
+                                &mut last_tool_name, &mut last_tool_call_id,
+                                &mut tool_chamber_open, &mut agent_line_started,
+                                &mut was_reasoning, &mut tool_calls_buf,
+                                &mut tool_calls_this_run,
+                            );
                             renderer.switch_chat(next);
+                            // Ensure chat_ui_states has a slot for
+                            // the target chat (subagent chats added
+                            // by Phase D push entries; defensive
+                            // here in case of ordering bugs).
+                            while chat_ui_states.len() < renderer.chat_count() {
+                                chat_ui_states.push(ChatUiState::empty());
+                            }
+                            load_chat_ui_state(
+                                &mut chat_ui_states[next],
+                                &mut response_buf, &mut response_start_line,
+                                &mut reasoning_buf, &mut reasoning_start_line,
+                                &mut last_tool_name, &mut last_tool_call_id,
+                                &mut tool_chamber_open, &mut agent_line_started,
+                                &mut was_reasoning, &mut tool_calls_buf,
+                                &mut tool_calls_this_run,
+                            );
                             renderer.render_viewport()?;
                             renderer.draw_bottom(
                                 &input,
@@ -1348,9 +1478,31 @@ pub async fn run_interactive(
                         let ctrl_p = key.code == KeyCode::Char('p')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
                         if ctrl_p && renderer.chat_count() > 1 {
+                            let cur = renderer.active_chat();
                             let count = renderer.chat_count();
-                            let prev = (renderer.active_chat() + count - 1) % count;
+                            let prev = (cur + count - 1) % count;
+                            save_chat_ui_state(
+                                &mut chat_ui_states[cur],
+                                &mut response_buf, &mut response_start_line,
+                                &mut reasoning_buf, &mut reasoning_start_line,
+                                &mut last_tool_name, &mut last_tool_call_id,
+                                &mut tool_chamber_open, &mut agent_line_started,
+                                &mut was_reasoning, &mut tool_calls_buf,
+                                &mut tool_calls_this_run,
+                            );
                             renderer.switch_chat(prev);
+                            while chat_ui_states.len() < renderer.chat_count() {
+                                chat_ui_states.push(ChatUiState::empty());
+                            }
+                            load_chat_ui_state(
+                                &mut chat_ui_states[prev],
+                                &mut response_buf, &mut response_start_line,
+                                &mut reasoning_buf, &mut reasoning_start_line,
+                                &mut last_tool_name, &mut last_tool_call_id,
+                                &mut tool_chamber_open, &mut agent_line_started,
+                                &mut was_reasoning, &mut tool_calls_buf,
+                                &mut tool_calls_this_run,
+                            );
                             renderer.render_viewport()?;
                             renderer.draw_bottom(
                                 &input,
@@ -1369,13 +1521,30 @@ pub async fn run_interactive(
                         let ctrl_x = key.code == KeyCode::Char('x')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
                         if ctrl_x && renderer.chat_count() > 1 {
-                            // Cycle through chats via Ctrl-N once a
-                            // proper picker UI lands in Phase B+.
-                            // For now, cycle forward — gives the
-                            // user a way to land on subagent chats
-                            // via a single key press.
-                            let next = (renderer.active_chat() + 1) % renderer.chat_count();
+                            let cur = renderer.active_chat();
+                            let next = (cur + 1) % renderer.chat_count();
+                            save_chat_ui_state(
+                                &mut chat_ui_states[cur],
+                                &mut response_buf, &mut response_start_line,
+                                &mut reasoning_buf, &mut reasoning_start_line,
+                                &mut last_tool_name, &mut last_tool_call_id,
+                                &mut tool_chamber_open, &mut agent_line_started,
+                                &mut was_reasoning, &mut tool_calls_buf,
+                                &mut tool_calls_this_run,
+                            );
                             renderer.switch_chat(next);
+                            while chat_ui_states.len() < renderer.chat_count() {
+                                chat_ui_states.push(ChatUiState::empty());
+                            }
+                            load_chat_ui_state(
+                                &mut chat_ui_states[next],
+                                &mut response_buf, &mut response_start_line,
+                                &mut reasoning_buf, &mut reasoning_start_line,
+                                &mut last_tool_name, &mut last_tool_call_id,
+                                &mut tool_chamber_open, &mut agent_line_started,
+                                &mut was_reasoning, &mut tool_calls_buf,
+                                &mut tool_calls_this_run,
+                            );
                             renderer.render_viewport()?;
                             renderer.draw_bottom(
                                 &input,
