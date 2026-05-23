@@ -1774,8 +1774,8 @@ pub async fn run_interactive(
                                                 context,
                                                 permission.clone(),
                                                 ask_tx.clone(),
-                                                None,
-                                                None,
+                                                question_tx.clone(),
+                                                plan_tx.clone(),
                                                 bg_store.clone(),
                                                                                                 #[cfg(feature = "lsp")]
                                                                                                 lsp_manager.clone(),
@@ -2120,7 +2120,21 @@ pub async fn run_interactive(
                         // it before opening the new one. Without this
                         // the new `╭─ NAME ─ args` lands inside the
                         // stale chamber.
-                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
+                        //
+                        // Use PASSIVE close, not abort. A new ToolCall
+                        // arriving over a stale chamber is chamber
+                        // turnover, not a denial event — the prior
+                        // tool may have finished cleanly and just
+                        // not flipped the flags yet (race, or a code
+                        // path that emitted ToolCall before the
+                        // previous ToolResult landed). Painting
+                        // "⚠ tool denied · aborted · no result" on it
+                        // would falsely brand a healthy tool call as
+                        // refused. The other three abort callers
+                        // (Error / Interjected / ContextOverflow) are
+                        // genuine denial-shaped events and stay on
+                        // `close_tool_chamber_if_open`.
+                        close_tool_chamber_passive(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
                         last_tool_name = Some(name.to_string());
                         if agent_line_started {
                             renderer.write_line("", Color::White)?;
@@ -2511,8 +2525,8 @@ pub async fn run_interactive(
                                         context,
                                         permission.clone(),
                                         ask_tx.clone(),
-                                        None,
-                                        None,
+                                        question_tx.clone(),
+                                        plan_tx.clone(),
                                         bg_store.clone(),
                                         #[cfg(feature = "lsp")]
                                         lsp_manager.clone(),
@@ -2768,8 +2782,8 @@ pub async fn run_interactive(
                                         context,
                                         permission.clone(),
                                         ask_tx.clone(),
-                                        None,
-                                        None,
+                                        question_tx.clone(),
+                                        plan_tx.clone(),
                                         bg_store.clone(),
                                                                                 #[cfg(feature = "lsp")]
                                                                                 lsp_manager.clone(),
