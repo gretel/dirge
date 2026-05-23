@@ -372,7 +372,7 @@ built-in ones. Mirrors pi's `api.registerTool({...})`.
 | `parameters` | JSON-schema string. Parsed once at startup; invalid JSON falls back to `{}` with a `tracing::warn`. |
 | `handler` | Janet function name. Called as `(handler args-json-string)`. Returns either a string (used directly) or any value `(string …)` can render. Errors surface to the LLM as tool failure. |
 | `execution-mode` | `:parallel` (default; read-only) or `:sequential` (mutating). One sequential tool forces the whole tool batch sequential. Pass `nil` here when you only want to set `prepare-arguments`. |
-| `prepare-arguments` | Optional 7th positional — name of a Janet function that runs BEFORE schema validation to normalize the LLM-supplied args. Receives the raw JSON args string; returns a JSON string the loop validates. Errors / invalid JSON / non-string returns fall back to the original args. Mirrors pi's `prepareArguments?` (extensions/types.ts:443). |
+| `prepare-arguments` | Optional 7th positional — name of a Janet function that runs BEFORE schema validation to normalize the LLM-supplied args. Receives the raw JSON args string; returns a JSON string the loop validates. Errors / invalid JSON / non-string returns fall back to the original args. Mirrors pi's `prepareArguments?` (extensions/types.ts:443). **Runs synchronously on the agent loop's executor thread** — keep handlers light (microsecond Janet eval is fine; heavy regex / large-payload mutation can stall the runtime). |
 
 ```janet
 # Optional: normalize args before the loop validates them.
@@ -508,9 +508,12 @@ pi `CustomMessage` in `core/messages.ts:46`):
 | `(harness/add-custom-message "status" "text")` | `"status"` | `"text"` | `true` |
 | `(harness/add-custom-message "status" "text" false)` | `"status"` | `"text"` | `false` |
 
-`display=false` keeps the message in the transcript (plugin handlers
-can observe it on subsequent turns) but suppresses the chat row. Use
-for telemetry or state markers you don't want to clutter the chat.
+`display=false` suppresses the chat row. **Caveat versus pi**: pi
+keeps the message in a plugin-observable transcript so handlers can
+read it on subsequent turns. Dirge has no equivalent plugin-readable
+transcript API yet — `display=false` is currently a UI-suppression
+flag only. The wire field is honored so future plugin-transcript
+work won't break existing plugins; for now treat it as "don't show".
 
 The renderer's `payload` argument is the **full wrapper JSON** —
 `{"role": "custom", "customType": ..., "content": ..., "display": ...}`

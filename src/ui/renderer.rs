@@ -266,7 +266,14 @@ impl Renderer {
     pub fn buffer_pos_at(&self, row: u16, col: u16) -> Option<(usize, usize)> {
         let line_idx = self.buffer_line_at_row(row)?;
         let entry = self.buffer.get(line_idx)?;
-        let line_len = entry.text.chars().count();
+        // L-R3: clamp to the VISIBLE char count (post ANSI strip),
+        // not the raw count which includes escape bytes. The column
+        // coming in is a display offset (terminal col − indent),
+        // and `selected_text` indexes the strip_ansi-ed line, so
+        // the two must agree on units. Pre-fix this was
+        // entry.text.chars().count() which over-permitted for
+        // styled lines (markdown-rendered text with embedded SGR).
+        let line_len = crate::ui::ansi::strip_ansi(&entry.text).chars().count();
         let indent = self.content_indent() as u16;
         let char_col = if col < indent {
             0
@@ -1855,6 +1862,27 @@ mod tests {
         // after saturating, idx = row).
         let pos = r.buffer_pos_at(0, 999);
         assert_eq!(pos, Some((0, 5)));
+    }
+
+    /// L-R3: buffer_pos_at clamps to VISIBLE char count (post ANSI
+    /// strip) not raw char count. Without this, a click far right
+    /// on a styled line would clamp past the visible-text length
+    /// and selected_text's slice would either return an empty
+    /// string or land in the middle of the escape bytes.
+    #[test]
+    fn buffer_pos_at_clamps_to_visible_chars_not_raw_bytes() {
+        let mut r = fresh_with_text(&[]);
+        r.buffer.clear();
+        // Visible: "hello red world" — 15 chars. Raw: 25 chars
+        // (including 10 chars of `\x1b[31m` + `\x1b[0m` escape).
+        r.buffer.push(LineEntry {
+            text: CompactString::from("hello \x1b[31mred\x1b[0m world"),
+            color: Color::Reset,
+        });
+        // Click well past the visible end. content_indent() is 0
+        // in the default test renderer, so col == char_col.
+        let pos = r.buffer_pos_at(0, 999).expect("must resolve");
+        assert_eq!(pos.1, 15, "clamp should hit visible length 15, not raw 25");
     }
 
     // --- wrap_input -------------------------------------------------------
