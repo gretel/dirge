@@ -743,9 +743,7 @@ async fn main() -> anyhow::Result<()> {
         // ui-redesign: spawn the system-load poller. The handle is
         // a cheap Arc; cloning into run_interactive lets the panel
         // painter read snapshots without crossing the channel.
-        let sysload = crate::ui::sysload::spawn_poller(
-            std::time::Duration::from_secs(2),
-        );
+        let sysload = crate::ui::sysload::spawn_poller(std::time::Duration::from_secs(2));
 
         ui::run_interactive(
             client,

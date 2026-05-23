@@ -1,7 +1,6 @@
 pub(crate) mod ansi;
 pub(crate) mod avatar;
 pub(crate) mod box_render;
-pub(crate) mod sysload;
 mod events;
 mod highlight;
 pub(crate) mod input;
@@ -15,6 +14,7 @@ mod slash;
 mod status;
 #[cfg(feature = "plugin")]
 mod streaming;
+pub(crate) mod sysload;
 mod terminal;
 pub(crate) mod theme;
 mod tree;
@@ -985,12 +985,7 @@ pub async fn run_interactive(
     // shows when no subagents are running; refreshed whenever the
     // user switches model via /model.
     let initial_left_info = crate::ui::renderer::LeftPanelInfo {
-        agent_id: session
-            .id
-            .as_str()
-            .chars()
-            .take(8)
-            .collect(),
+        agent_id: session.id.as_str().chars().take(8).collect(),
         model: session.model.to_string(),
         focus: context
             .current_prompt_name

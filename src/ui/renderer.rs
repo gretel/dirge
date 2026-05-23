@@ -19,6 +19,12 @@ pub struct LineEntry {
 /// the chat-history viewport would be unreasonably squashed.
 pub const MAX_INPUT_VISIBLE_LINES: usize = 8;
 
+/// ui-redesign Phase 4: a single-row decorative border above the
+/// input area, carrying an `[ALERT]` / `[INPUT]` title. The border
+/// row is reserved at the bottom of the chat viewport so chat + the
+/// border + input + status line all coexist without overlap.
+pub const ALERT_FRAME_ROWS: u16 = 1;
+
 /// Width of the optional right-hand info panel content area, in columns.
 /// Plus one column for the vertical divider gives `PANEL_RESERVE`.
 const PANEL_WIDTH: u16 = 32;
@@ -458,7 +464,7 @@ impl Renderer {
     /// Subtracts the input box (`input_rows`) and the status line (1 row).
     pub fn visible_lines(&self) -> usize {
         let (_, rows) = self.terminal_size();
-        rows.saturating_sub(self.input_rows + 1) as usize
+        rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS) as usize
     }
 
     /// The screen row index where the input box starts. Overlays that need
@@ -466,7 +472,7 @@ impl Renderer {
     /// this as their bottom limit.
     pub fn input_top_row(&self) -> u16 {
         let (_, rows) = self.terminal_size();
-        rows.saturating_sub(self.input_rows + 1)
+        rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS)
     }
 
     /// Map a screen `(row, col)` to a `(line_idx, char_col)` anchor for
@@ -497,7 +503,7 @@ impl Renderer {
 
     pub fn buffer_line_at_row(&self, row: u16) -> Option<usize> {
         let (_, rows) = self.terminal_size();
-        let visible = rows.saturating_sub(self.input_rows + 1) as usize;
+        let visible = rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS) as usize;
         let total = self.buffer.len();
         if total == 0 {
             return None;
@@ -707,7 +713,7 @@ impl Renderer {
     pub fn render_viewport(&mut self) -> io::Result<()> {
         let (_, rows) = self.terminal_size();
         let content_cols = self.content_cols();
-        let visible = rows.saturating_sub(self.input_rows + 1) as usize;
+        let visible = rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS) as usize;
         let total = self.buffer.len();
         let mut stdout = io::stdout();
         // Keep the cursor hidden while we paint many rows; draw_bottom is
@@ -885,7 +891,8 @@ impl Renderer {
         }
         // Leave the bottom 3 rows for the avatar.
         let avatar_reserve: u16 = 3;
-        let panel_bottom = rows.saturating_sub(self.input_rows + 1 + avatar_reserve);
+        let panel_bottom =
+            rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + avatar_reserve);
         if panel_bottom == 0 {
             return Ok(());
         }
@@ -999,7 +1006,13 @@ impl Renderer {
             (" D I R G E ", agent),
             ("           ", dim),
             ("  ( •_•_• ) ", dim),
-            (&format!("    {:>3}    ", info.agent_id.chars().take(3).collect::<String>())[..], dim),
+            (
+                &format!(
+                    "    {:>3}    ",
+                    info.agent_id.chars().take(3).collect::<String>()
+                )[..],
+                dim,
+            ),
             ("           ", dim),
         ];
         for (text, color) in &logo_lines {
@@ -1011,12 +1024,7 @@ impl Renderer {
             let dw = UnicodeWidthStr::width(*text);
             let leading = inner.saturating_sub(dw) / 2;
             let trailing = inner.saturating_sub(dw).saturating_sub(leading);
-            let line = format!(
-                "│{}{}{}│",
-                " ".repeat(leading),
-                text,
-                " ".repeat(trailing),
-            );
+            let line = format!("│{}{}{}│", " ".repeat(leading), text, " ".repeat(trailing),);
             stdout.execute(MoveTo(0, y))?;
             write!(stdout, "{}", wipe)?;
             stdout.execute(MoveTo(0, y))?;
@@ -1080,7 +1088,7 @@ impl Renderer {
         // Clear only the content band so the right-hand info panel keeps
         // its pixels when the chat viewport scrolls.
         let content_cols = self.content_cols();
-        let max_content = rows.saturating_sub(self.input_rows + 1);
+        let max_content = rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS);
         if self.lines >= max_content {
             let mut stdout = io::stdout();
             let _ = stdout.execute(ScrollUp(1));
@@ -1105,7 +1113,7 @@ impl Renderer {
             // streaming (until the next `draw_bottom` is called by
             // the UI loop on a significant event). Cheap: one
             // MoveTo + 5 chars at a known column.
-            let input_top = rows.saturating_sub(self.input_rows + 1);
+            let input_top = rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS);
             let _ = self.draw_avatar(&mut stdout, input_top);
             let _ = stdout.flush();
         }
@@ -1113,7 +1121,8 @@ impl Renderer {
 
     fn content_row(&self) -> u16 {
         let (_, rows) = self.terminal_size();
-        self.lines.min(rows.saturating_sub(self.input_rows + 2))
+        self.lines
+            .min(rows.saturating_sub(self.input_rows + 2 + ALERT_FRAME_ROWS))
     }
 
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {
@@ -1400,7 +1409,41 @@ impl Renderer {
         }
 
         let status_row = rows.saturating_sub(1);
-        let input_top = rows.saturating_sub(self.input_rows + 1);
+        let input_top = rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS);
+
+        // ui-redesign Phase 4: paint the [ALERT] frame ABOVE the
+        // input area. One-row border: `[──────[ALERT]──────]` style
+        // with brackets in the corners. The frame title is `[ALERT]`
+        // by default; alert handlers can swap it via a future
+        // `set_alert_frame_title` if they want to indicate state.
+        // Frame row sits at `input_top - 1` (the row freed by
+        // ALERT_FRAME_ROWS in the visible_lines math above).
+        if ALERT_FRAME_ROWS > 0 && input_top > 0 {
+            let frame_row = input_top - 1;
+            stdout.execute(MoveTo(0, frame_row))?;
+            // Wipe with spaces — clears any stale chat row that
+            // might have painted here before the layout
+            // recalculated.
+            write!(stdout, "{}", " ".repeat(cols as usize))?;
+            stdout.execute(MoveTo(0, frame_row))?;
+            let dim = self.color(crate::ui::theme::dim());
+            write!(stdout, "{}", SetForegroundColor(dim))?;
+            // Width-aware bracket+dash decoration. Title is
+            // centered.
+            let title = " [ALERT] ";
+            let cols_usize = cols as usize;
+            let total_dashes = cols_usize.saturating_sub(title.chars().count() + 2);
+            let left = total_dashes / 2;
+            let right = total_dashes - left;
+            write!(
+                stdout,
+                "[{}{}{}]",
+                "─".repeat(left),
+                title,
+                "─".repeat(right),
+            )?;
+            write!(stdout, "{}", ResetColor)?;
+        }
         // Heavy block prompt indicator. While running, we tick a 4-stage
         // gradient through the block characters to suggest a phosphor
         // pulse — readable without becoming distracting.
@@ -1787,10 +1830,7 @@ impl Renderer {
                     color,
                 )
             };
-            let load_items = vec![
-                gauge("CPU", snap.cpu_pct),
-                gauge("MEM", snap.mem_pct),
-            ];
+            let load_items = vec![gauge("CPU", snap.cpu_pct), gauge("MEM", snap.mem_pct)];
             push_section(&mut out, "SYSTEM LOAD", load_items);
         }
 
