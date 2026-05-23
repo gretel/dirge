@@ -19,11 +19,15 @@ pub struct LineEntry {
 /// the chat-history viewport would be unreasonably squashed.
 pub const MAX_INPUT_VISIBLE_LINES: usize = 8;
 
-/// ui-redesign Phase 4: a single-row decorative border above the
-/// input area, carrying an `[ALERT]` / `[INPUT]` title. The border
-/// row is reserved at the bottom of the chat viewport so chat + the
-/// border + input + status line all coexist without overlap.
-pub const ALERT_FRAME_ROWS: u16 = 1;
+/// ui-redesign: the bottom [ALERT] panel wraps the input area in a
+/// double-line frame. Two reserved rows = top border (with title)
+/// + bottom border. Side borders (║ ... ║) are painted on every
+/// input row so the entire input area reads as one framed card,
+/// matching the mockup's bottom strip.
+///
+/// The frame title is `[ALERT]` permanently — input text and
+/// permission prompts both live INSIDE the frame.
+pub const ALERT_FRAME_ROWS: u16 = 2;
 
 /// Width of the optional right-hand info panel content area, in columns.
 /// Plus one column for the vertical divider gives `PANEL_RESERVE`.
@@ -472,7 +476,12 @@ impl Renderer {
     /// this as their bottom limit.
     pub fn input_top_row(&self) -> u16 {
         let (_, rows) = self.terminal_size();
-        rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS)
+        // ui-redesign: input_top sits BELOW the [ALERT] top border
+        // and ABOVE the bottom border + status row. Reserve
+        // input_rows for input + 1 for status + (ALERT_FRAME_ROWS - 1)
+        // for the bottom border; subtracting (input_rows +
+        // ALERT_FRAME_ROWS) puts us right after the top border row.
+        rows.saturating_sub(self.input_rows + ALERT_FRAME_ROWS)
     }
 
     /// Map a screen `(row, col)` to a `(line_idx, char_col)` anchor for
@@ -970,25 +979,29 @@ impl Renderer {
         let agent = self.color(crate::ui::theme::agent());
         let dim = self.color(crate::ui::theme::dim());
 
-        // Card top border with [AGENT STATUS] title in the middle.
-        let title = " [AGENT STATUS] ";
+        // ui-redesign: double-line frame, bracketed title centered.
+        let title = "[AGENT STATUS]";
         let total_dashes = inner.saturating_sub(title.chars().count());
         let left_dashes = total_dashes / 2;
         let right_dashes = total_dashes - left_dashes;
         let top = format!(
-            "╭{}{}{}╮",
-            "─".repeat(left_dashes),
+            "╔{}{}{}╗",
+            "═".repeat(left_dashes),
             title,
-            "─".repeat(right_dashes),
+            "═".repeat(right_dashes),
         );
-        let bottom = format!("╰{}╯", "─".repeat(inner));
+        let bottom = format!("╚{}╝", "═".repeat(inner));
         let wipe = " ".repeat(indent.saturating_sub(1));
 
+        // Center content inside the inner band so logo + metadata
+        // balance horizontally.
         let row = |text: &str| -> String {
             use unicode_width::UnicodeWidthStr;
             let dw = UnicodeWidthStr::width(text);
-            let pad = inner.saturating_sub(dw);
-            format!("│{}{}│", text, " ".repeat(pad))
+            let fill = inner.saturating_sub(dw);
+            let left = fill / 2;
+            let right = fill - left;
+            format!("║{}{}{}║", " ".repeat(left), text, " ".repeat(right),)
         };
 
         // Wipe the gutter then paint top.
@@ -1024,7 +1037,7 @@ impl Renderer {
             let dw = UnicodeWidthStr::width(*text);
             let leading = inner.saturating_sub(dw) / 2;
             let trailing = inner.saturating_sub(dw).saturating_sub(leading);
-            let line = format!("│{}{}{}│", " ".repeat(leading), text, " ".repeat(trailing),);
+            let line = format!("║{}{}{}║", " ".repeat(leading), text, " ".repeat(trailing),);
             stdout.execute(MoveTo(0, y))?;
             write!(stdout, "{}", wipe)?;
             stdout.execute(MoveTo(0, y))?;
@@ -1113,7 +1126,7 @@ impl Renderer {
             // streaming (until the next `draw_bottom` is called by
             // the UI loop on a significant event). Cheap: one
             // MoveTo + 5 chars at a known column.
-            let input_top = rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS);
+            let input_top = rows.saturating_sub(self.input_rows + ALERT_FRAME_ROWS);
             let _ = self.draw_avatar(&mut stdout, input_top);
             let _ = stdout.flush();
         }
@@ -1409,39 +1422,47 @@ impl Renderer {
         }
 
         let status_row = rows.saturating_sub(1);
-        let input_top = rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS);
+        let input_top = rows.saturating_sub(self.input_rows + ALERT_FRAME_ROWS);
 
-        // ui-redesign Phase 4: paint the [ALERT] frame ABOVE the
-        // input area. One-row border: `[──────[ALERT]──────]` style
-        // with brackets in the corners. The frame title is `[ALERT]`
-        // by default; alert handlers can swap it via a future
-        // `set_alert_frame_title` if they want to indicate state.
-        // Frame row sits at `input_top - 1` (the row freed by
-        // ALERT_FRAME_ROWS in the visible_lines math above).
-        if ALERT_FRAME_ROWS > 0 && input_top > 0 {
-            let frame_row = input_top - 1;
-            stdout.execute(MoveTo(0, frame_row))?;
-            // Wipe with spaces — clears any stale chat row that
-            // might have painted here before the layout
-            // recalculated.
-            write!(stdout, "{}", " ".repeat(cols as usize))?;
-            stdout.execute(MoveTo(0, frame_row))?;
-            let dim = self.color(crate::ui::theme::dim());
-            write!(stdout, "{}", SetForegroundColor(dim))?;
-            // Width-aware bracket+dash decoration. Title is
-            // centered.
-            let title = " [ALERT] ";
-            let cols_usize = cols as usize;
-            let total_dashes = cols_usize.saturating_sub(title.chars().count() + 2);
-            let left = total_dashes / 2;
-            let right = total_dashes - left;
+        // ui-redesign: paint the double-line [ALERT] frame around
+        // the input area. Top border (row `input_top - 1`) carries
+        // the centered title; bottom border (row `status_row - 1` =
+        // `input_top + input_rows`) closes the frame. Side borders
+        // (║) on every input row are painted further down inside
+        // the per-row paint loop.
+        let cols_usize = cols as usize;
+        let dim_color = self.color(crate::ui::theme::dim());
+        if ALERT_FRAME_ROWS >= 1 && input_top > 0 {
+            let top_row = input_top - 1;
+            let title = "[ALERT]";
+            let title_w = title.chars().count();
+            // Reserve 2 cells for the corners.
+            let fill = cols_usize.saturating_sub(2).saturating_sub(title_w);
+            let left = fill / 2;
+            let right = fill - left;
+            stdout.execute(MoveTo(0, top_row))?;
+            write!(stdout, "{}", " ".repeat(cols_usize))?;
+            stdout.execute(MoveTo(0, top_row))?;
+            write!(stdout, "{}", SetForegroundColor(dim_color))?;
             write!(
                 stdout,
-                "[{}{}{}]",
-                "─".repeat(left),
+                "╔{}{}{}╗",
+                "═".repeat(left),
                 title,
-                "─".repeat(right),
+                "═".repeat(right),
             )?;
+            write!(stdout, "{}", ResetColor)?;
+        }
+        if ALERT_FRAME_ROWS >= 2 && status_row > 0 {
+            // Bottom border sits on the row immediately above the
+            // status line. With ALERT_FRAME_ROWS=2 the visible_lines
+            // math reserves both rows; this is the bottom one.
+            let bot_row = status_row - 1;
+            stdout.execute(MoveTo(0, bot_row))?;
+            write!(stdout, "{}", " ".repeat(cols_usize))?;
+            stdout.execute(MoveTo(0, bot_row))?;
+            write!(stdout, "{}", SetForegroundColor(dim_color))?;
+            write!(stdout, "╚{}╝", "═".repeat(cols_usize.saturating_sub(2)),)?;
             write!(stdout, "{}", ResetColor)?;
         }
         // Heavy block prompt indicator. While running, we tick a 4-stage
@@ -1762,36 +1783,60 @@ impl Renderer {
             // row left a 1-cell gap before the right border.
             let len = UnicodeWidthStr::width(trimmed.as_str());
             let pad = inner.saturating_sub(len);
-            format!("│{}{}│", trimmed, " ".repeat(pad))
+            // ui-redesign: double-line vertical borders.
+            format!("║{}{}║", trimmed, " ".repeat(pad))
         };
-        // Helper: bottom border of a pill (`╰────────╯`).
-        let bottom = || -> String { format!("╰{}╯", "─".repeat(inner)) };
+        // Helper: bottom border of a pill (`╚════════╝`).
+        let bottom = || -> String { format!("╚{}╝", "═".repeat(inner)) };
 
-        // Panel top pill: `╭─ DIRGE.SYS ────╮` … `╰──────────╯`.
-        let dirge_label = " DIRGE.SYS ";
-        let dirge_pre_len = dirge_label.chars().count() + 2;
-        let dirge_dashes = inner.saturating_sub(dirge_label.chars().count() + 1);
-        let _ = dirge_pre_len;
+        // ui-redesign: panel header now uses double-line frame with
+        // bracketed title (`╔═══[DIRGE.SYS]═══╗`). Title is centered
+        // in the top border to match the mockup's visual rhythm.
+        let dirge_label = "[DIRGE.SYS]";
+        let dirge_w = dirge_label.chars().count();
+        let dirge_fill = inner.saturating_sub(dirge_w);
+        let dirge_left = dirge_fill / 2;
+        let dirge_right = dirge_fill - dirge_left;
         out.push((
-            format!("╭─{}{}╮", dirge_label, "─".repeat(dirge_dashes)),
+            format!(
+                "╔{}{}{}╗",
+                "═".repeat(dirge_left),
+                dirge_label,
+                "═".repeat(dirge_right),
+            ),
             Color::Cyan,
         ));
-        out.push((row(&format!(" {}", d.cwd)), Color::White));
+        // Center cwd inside the inner band so the header / body
+        // both balance horizontally.
+        let cwd_disp = format!(" {} ", d.cwd);
+        let cwd_w = UnicodeWidthStr::width(cwd_disp.as_str()).min(inner);
+        let cwd_fill = inner.saturating_sub(cwd_w);
+        let cwd_left = cwd_fill / 2;
+        let cwd_right = cwd_fill - cwd_left;
+        out.push((
+            format!(
+                "║{}{}{}║",
+                " ".repeat(cwd_left),
+                cwd_disp,
+                " ".repeat(cwd_right),
+            ),
+            Color::White,
+        ));
         out.push((bottom(), Color::Cyan));
 
-        // Section helper: closed pill with the section name on the
-        // top border (`╭─ MCP ─────╮ … ╰────────╯`). Every content
-        // row gets a `│ … │` left+right border so the section reads
-        // as a discrete card, matching the btop / cool-retro-term
-        // reference. Empty sections show `· (none)` in the dim
-        // phosphor tone rather than grey.
+        // ui-redesign: sub-section helper. Each sub-panel uses
+        // double-line frame with bracketed title centered in the
+        // top border (`╔═══[MCP]═══╗`). Item content is centered
+        // horizontally too.
         let push_section =
             |out: &mut Vec<(String, Color)>, title: &str, items: Vec<(String, Color)>| {
                 out.push((String::new(), Color::Reset));
-                let label = format!(" {} ", title);
-                let pre_len = label.chars().count() + 1;
-                let dashes = inner.saturating_sub(pre_len);
-                let header = format!("╭─{}{}╮", label, "─".repeat(dashes));
+                let label = format!("[{}]", title);
+                let label_w = label.chars().count();
+                let fill = inner.saturating_sub(label_w);
+                let left = fill / 2;
+                let right = fill - left;
+                let header = format!("╔{}{}{}╗", "═".repeat(left), label, "═".repeat(right),);
                 out.push((header, Color::Cyan));
                 if items.is_empty() {
                     out.push((row(" · (none)"), Color::Reset));

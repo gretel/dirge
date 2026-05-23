@@ -43,44 +43,68 @@ use super::wrap;
 /// (double-line, ASCII-fallback for legacy terminals).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BoxStyle {
-    /// `╭─╮ │ │ ╰─╯` — the only style currently used. Rounded
-    /// corners + light single-line borders.
+    /// `╭─╮ │ │ ╰─╯` — rounded corners + light single-line
+    /// borders. Used for tool chambers and inline alerts.
     Rounded,
+    /// `╔═╗ ║ ║ ╚═╝` — double-line borders. Used for the
+    /// outer UI panel frames (left AGENT STATUS, right
+    /// SYSTEM & PROJECT DATA, bottom ALERT). Matches the
+    /// mockup's framing.
+    Double,
 }
 
 impl BoxStyle {
     pub fn top_left(self) -> char {
         match self {
             BoxStyle::Rounded => '╭',
+            BoxStyle::Double => '╔',
         }
     }
     pub fn top_right(self) -> char {
         match self {
             BoxStyle::Rounded => '╮',
+            BoxStyle::Double => '╗',
         }
     }
     pub fn bottom_left(self) -> char {
         match self {
             BoxStyle::Rounded => '╰',
+            BoxStyle::Double => '╚',
         }
     }
     pub fn bottom_right(self) -> char {
         match self {
             BoxStyle::Rounded => '╯',
+            BoxStyle::Double => '╝',
         }
     }
     pub fn horizontal(self) -> char {
-        '─'
+        match self {
+            BoxStyle::Rounded => '─',
+            BoxStyle::Double => '═',
+        }
     }
     pub fn vertical(self) -> char {
-        '│'
+        match self {
+            BoxStyle::Rounded => '│',
+            BoxStyle::Double => '║',
+        }
     }
     /// Left + right T-junctions used by divider rows inside a box.
+    /// Double-style fallbacks to single-line tees because the
+    /// double-tee glyphs (╠ ╣) read as heavier than the rest of
+    /// the panel.
     pub fn tee_left(self) -> char {
-        '├'
+        match self {
+            BoxStyle::Rounded => '├',
+            BoxStyle::Double => '╠',
+        }
     }
     pub fn tee_right(self) -> char {
-        '┤'
+        match self {
+            BoxStyle::Rounded => '┤',
+            BoxStyle::Double => '╣',
+        }
     }
 }
 
@@ -102,22 +126,47 @@ pub fn top(style: BoxStyle, title: &str, total_w: usize) -> String {
             style.top_right(),
         );
     }
-    let title_w = UnicodeWidthStr::width(title);
-    // Layout: `╭─ {title} ─{fill}─╮`
-    // Cells fixed regardless of title/fill:
-    //   ╭ (1) + ─ (1) + ' ' (1) + title + ' ' (1) + ─ (1)
-    //   + fill + ─ (1) + ╮ (1) = title_w + fill + 7
-    // So fill = total_w − title_w − 7. Saturating-sub keeps the
-    // call safe when total_w is tiny (degenerate terminals).
-    const OVERHEAD: usize = 7;
-    let fill = total_w.saturating_sub(OVERHEAD).saturating_sub(title_w);
-    format!(
-        "{}─ {} ─{}─{}",
-        style.top_left(),
-        title,
-        style.horizontal().to_string().repeat(fill),
-        style.top_right(),
-    )
+    let hch = style.horizontal();
+    let hstr = hch.to_string();
+    // ui-redesign: double-style frames put the title centered in
+    // the top border surrounded by `[...]` brackets — matches the
+    // mockup look. Rounded keeps the legacy `─ TITLE ─` shape so
+    // tool chambers / alert frames don't suddenly look different.
+    match style {
+        BoxStyle::Double => {
+            // Layout: `╔═══[TITLE]═══╗` with title centered.
+            // Overhead = 2 corners + 2 brackets = 4 cells.
+            let bracketed = format!("[{title}]");
+            let bracketed_w = UnicodeWidthStr::width(bracketed.as_str());
+            let fill = total_w.saturating_sub(2).saturating_sub(bracketed_w);
+            let left = fill / 2;
+            let right = fill - left;
+            format!(
+                "{}{}{}{}{}",
+                style.top_left(),
+                hstr.repeat(left),
+                bracketed,
+                hstr.repeat(right),
+                style.top_right(),
+            )
+        }
+        BoxStyle::Rounded => {
+            // Legacy: `╭─ TITLE ─────╮` — left-anchored, single-
+            // line shape. Tool chambers + inline alerts use this.
+            let title_w = UnicodeWidthStr::width(title);
+            const OVERHEAD: usize = 7;
+            let fill = total_w.saturating_sub(OVERHEAD).saturating_sub(title_w);
+            format!(
+                "{}{} {} {}{}{}",
+                style.top_left(),
+                hstr,
+                title,
+                hstr,
+                hstr.repeat(fill),
+                style.top_right(),
+            )
+        }
+    }
 }
 
 /// Build a `╰─────╯` bottom border sized to `total_w`.
