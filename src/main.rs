@@ -454,19 +454,26 @@ async fn main() -> anyhow::Result<()> {
                 if !is_janet_file && !is_plugin_dir {
                     continue;
                 }
-                eprintln!("loading plugin: {}", path.display());
+                if cli.verbose {
+                    eprintln!("loading plugin: {}", path.display());
+                }
                 let mut mgr = pm_arc.lock().unwrap_or_else(|e| e.into_inner());
                 match plugin::load_plugin(&mut mgr, &path) {
                     Ok(loaded) => {
-                        if loaded.files.len() > 1 {
+                        if cli.verbose && loaded.files.len() > 1 {
                             eprintln!(
                                 "  loaded {} files from plugin '{}'",
                                 loaded.files.len(),
                                 loaded.stem,
                             );
                         }
-                        for hook in &loaded.hooks_registered {
-                            eprintln!("  registered hook: {} -> {}-{}", hook, loaded.stem, hook);
+                        if cli.verbose {
+                            for hook in &loaded.hooks_registered {
+                                eprintln!(
+                                    "  registered hook: {} -> {}-{}",
+                                    hook, loaded.stem, hook
+                                );
+                            }
                         }
                     }
                     Err(e) => {
