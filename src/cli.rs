@@ -1,13 +1,45 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use compact_str::CompactString;
 
 use crate::config;
+
+/// dirge-rmk: output format selector for `--print` mode. Ported from
+/// maki's `OutputFormat` enum (`maki/src/print.rs:44-49`) which itself
+/// matches Claude Code's `--output-format` so tools/scripts written
+/// against Claude Code work against dirge unchanged.
+///
+/// - `Text` (default): the raw assistant response only, no metadata.
+/// - `Json`: a single Claude-Code-shaped `PrintResult` object on
+///   stdout with `result`, `duration_ms`, `num_turns`, `usage`, etc.
+/// - `StreamJson`: NDJSON — one JSON object per line. Emits
+///   `system/init`, `assistant`, and a final `result` event so
+///   downstream tools can stream-parse turn-by-turn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum, Default)]
+#[clap(rename_all = "kebab-case")]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+    StreamJson,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "dirge", version, about = "Minimal coding agent")]
 pub struct Cli {
     #[arg(short = 'p', long = "print", help = "Print response and exit")]
     pub print: bool,
+
+    /// dirge-rmk: output format for `--print` mode (text | json |
+    /// stream-json). Mirrors Claude Code's flag exactly. Ignored
+    /// outside `--print`.
+    #[arg(
+        long = "output-format",
+        value_enum,
+        default_value_t = OutputFormat::Text,
+        requires = "print",
+        help = "Output format for --print mode (text | json | stream-json)"
+    )]
+    pub output_format: OutputFormat,
 
     #[arg(short = 'c', long = "continue", help = "Continue most recent session")]
     pub continue_session: bool,

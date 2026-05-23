@@ -4934,20 +4934,56 @@ fn chamber_row_with_bg(content: &str, inner: usize, bg_idx: u8) -> String {
     box_render::row_with_bg(box_render::BoxStyle::Rounded, content, inner + 4, bg_idx)
 }
 
+/// Ctrl-F scrollback search. Ported from maki
+/// (`maki-ui/src/components/search_modal.rs:147-185`): fuzzy match via
+/// `nucleo-matcher`, ranked by score descending so the best matches
+/// surface first. Previously this was a `to_lowercase().contains()`
+/// substring filter — it failed on typos, partial words, and out-of-
+/// order keystrokes that fuzzy matching handles naturally.
+///
+/// Empty / whitespace-only queries clear the result set (same as
+/// maki). Matching is case-insensitive with smart-case semantics:
+/// lowercase query matches both cases; mixed-case query forces an
+/// exact-case match — handled inside `Atom::new` with
+/// `CaseMatching::Smart`.
 fn update_search(renderer: &Renderer, query: &str, matches: &mut Vec<usize>, selected: &mut usize) {
-    if query.is_empty() {
-        matches.clear();
+    use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
+    use nucleo_matcher::{Config, Matcher, Utf32Str};
+
+    matches.clear();
+    *selected = 0;
+    if query.trim().is_empty() {
         return;
     }
-    let query_lower = query.to_lowercase();
+
+    let atom = Atom::new(
+        query,
+        CaseMatching::Smart,
+        Normalization::Smart,
+        AtomKind::Fuzzy,
+        false,
+    );
+    let mut matcher = Matcher::new(Config::DEFAULT);
     let lines = renderer.buffer_lines();
-    *matches = lines
-        .iter()
-        .enumerate()
-        .filter(|(_, line)| line.to_lowercase().contains(&query_lower))
-        .map(|(i, _)| i)
-        .collect();
-    *selected = 0;
+    // Collect (line_idx, score) so we can sort by score descending
+    // and keep the original buffer positions for Enter-to-scroll.
+    let mut scored: Vec<(usize, u16)> = Vec::new();
+    let mut buf = Vec::new();
+    let mut indices = Vec::new();
+    for (idx, text) in lines.iter().enumerate() {
+        if text.is_empty() {
+            continue;
+        }
+        buf.clear();
+        indices.clear();
+        let haystack = Utf32Str::new(text, &mut buf);
+        if let Some(score) = atom.indices(haystack, &mut matcher, &mut indices) {
+            scored.push((idx, score));
+        }
+    }
+    // Higher score first; tie-break on earlier line for determinism.
+    scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    *matches = scored.into_iter().map(|(idx, _)| idx).collect();
 }
 
 fn draw_search_bar(query: &str, matches: &[usize], selected: usize) -> std::io::Result<()> {
@@ -5177,6 +5213,51 @@ async fn run_shell_command(cmd: &str, sandbox: &Sandbox) -> anyhow::Result<Strin
 mod tests {
     use super::*;
     use unicode_width::UnicodeWidthStr;
+
+    /// dirge-bfd: Ctrl-F search uses fuzzy matching (nucleo) — typos,
+    /// non-contiguous subsequences, and missing characters all match
+    /// where they wouldn't under the prior substring scheme.
+    #[test]
+    fn fuzzy_search_matches_non_contiguous_subsequence() {
+        let mut renderer = crate::ui::renderer::Renderer::new().expect("renderer");
+        renderer
+            .write_line("connect to database", Color::White)
+            .unwrap();
+        renderer
+            .write_line("contributing guide", Color::White)
+            .unwrap();
+        renderer
+            .write_line("totally unrelated", Color::White)
+            .unwrap();
+
+        let mut matches: Vec<usize> = Vec::new();
+        let mut selected = 0;
+
+        // Substring `ctd` matches nothing under the old `contains`
+        // scheme. Fuzzy matches "connect to database" by its
+        // c-o-n-n-e-C-T-o-D... subsequence.
+        update_search(&renderer, "ctd", &mut matches, &mut selected);
+        assert!(
+            !matches.is_empty(),
+            "fuzzy `ctd` should produce matches; matches={matches:?}",
+        );
+
+        // Empty / whitespace queries clear matches.
+        update_search(&renderer, "", &mut matches, &mut selected);
+        assert!(matches.is_empty());
+        update_search(&renderer, "   ", &mut matches, &mut selected);
+        assert!(matches.is_empty());
+
+        // Lowercase query matches (smart case).
+        update_search(&renderer, "database", &mut matches, &mut selected);
+        assert!(matches.iter().any(|&i| {
+            renderer
+                .buffer_lines()
+                .get(i)
+                .map(|s| s.contains("database"))
+                .unwrap_or(false)
+        }));
+    }
 
     /// Chamber banner fills the full frame width when the value fits.
     /// Right border is flush at frame_w; no extra trailing whitespace.

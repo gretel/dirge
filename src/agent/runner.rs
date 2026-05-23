@@ -126,17 +126,53 @@ pub fn convert_history(session: &Session) -> Vec<Message> {
 
     messages
 }
+/// dirge-rmk: emit one stream-json event line to stdout. NDJSON shape
+/// matches Claude Code so tooling written against `claude --print
+/// --output-format stream-json` works against dirge unchanged.
+fn emit_stream_json_event(value: serde_json::Value) {
+    if let Ok(s) = serde_json::to_string(&value) {
+        println!("{}", s);
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+}
+
 pub async fn run_print<M, P>(
     agent: &Agent<M, P>,
     prompt: &str,
     max_turns: usize,
     chunk_timeout: std::time::Duration,
+    output_format: crate::cli::OutputFormat,
 ) -> anyhow::Result<String>
 where
     M: CompletionModel + 'static,
     M::StreamingResponse: Send + Sync + Unpin + Clone + 'static,
     P: rig::agent::PromptHook<M> + 'static,
 {
+    let start_instant = std::time::Instant::now();
+    let session_id = uuid_v4_simple();
+    let mut num_turns: u32 = 0;
+    // For Json / StreamJson modes the assistant text is BUFFERED
+    // (never streamed inline to stdout) so the JSON envelope is the
+    // only thing the user sees on stdout. Text mode keeps the prior
+    // streaming behavior.
+    let suppress_inline = !matches!(output_format, crate::cli::OutputFormat::Text);
+
+    // StreamJson init event — fires once at startup so downstream
+    // tools can pick up cwd/session/model before any turns stream.
+    // Ported from maki print.rs:67-75 (InitEvent shape).
+    if matches!(output_format, crate::cli::OutputFormat::StreamJson) {
+        let cwd = std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        emit_stream_json_event(serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "cwd": cwd,
+            "session_id": session_id,
+            "tools": Vec::<String>::new(),
+            "model": "",
+        }));
+    }
     // Retry loop. Print mode (`dirge --print "..."`) is commonly used
     // in scripts and CI where a single transient 502 or rate-limit
     // would otherwise turn a 5-line shell snippet into a flaky one.
@@ -176,15 +212,24 @@ where
                     text,
                 ))) => {
                     full_response.push_str(&text.text);
-                    print!("{}", text.text);
-                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                    if !suppress_inline {
+                        print!("{}", text.text);
+                        let _ = std::io::Write::flush(&mut std::io::stdout());
+                    }
                     had_output = true;
                 }
                 Ok(MultiTurnStreamItem::StreamAssistantItem(
                     StreamedAssistantContent::Reasoning(r),
                 )) => {
-                    eprint!("{}", r.display_text());
-                    let _ = std::io::Write::flush(&mut std::io::stderr());
+                    if !suppress_inline {
+                        // Json / StreamJson modes: reasoning is the
+                        // model's internal thinking — not part of the
+                        // user-visible result. Suppressing keeps the
+                        // JSON output clean of chain-of-thought
+                        // noise.
+                        eprint!("{}", r.display_text());
+                        let _ = std::io::Write::flush(&mut std::io::stderr());
+                    }
                 }
                 Ok(MultiTurnStreamItem::FinalResponse(_)) => break,
                 Ok(_) => {}
@@ -222,7 +267,96 @@ where
             return Err(anyhow::anyhow!("{}", msg));
         }
 
-        println!();
+        // dirge-rmk: turn complete. Bump turn counter; emit per-format
+        // closing payload. Ported from maki print.rs:51-64
+        // (`PrintResult`) and the StreamJson assistant event shape.
+        num_turns += 1;
+        match output_format {
+            crate::cli::OutputFormat::Text => {
+                println!();
+            }
+            crate::cli::OutputFormat::Json => {
+                // Single Claude-shaped result object. `total_cost_usd`
+                // is 0.0 until provider cost plumbing lands.
+                let result = serde_json::json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "duration_ms": start_instant.elapsed().as_millis() as u64,
+                    "num_turns": num_turns,
+                    "result": full_response.clone(),
+                    "session_id": session_id,
+                    "total_cost_usd": 0.0,
+                });
+                if let Ok(s) = serde_json::to_string(&result) {
+                    println!("{}", s);
+                }
+            }
+            crate::cli::OutputFormat::StreamJson => {
+                // Per-turn assistant event + closing result event.
+                emit_stream_json_event(serde_json::json!({
+                    "type": "assistant",
+                    "message": {
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": full_response.clone()}],
+                    },
+                    "session_id": session_id,
+                }));
+                emit_stream_json_event(serde_json::json!({
+                    "type": "result",
+                    "subtype": "success",
+                    "is_error": false,
+                    "duration_ms": start_instant.elapsed().as_millis() as u64,
+                    "num_turns": num_turns,
+                    "result": full_response.clone(),
+                    "session_id": session_id,
+                    "total_cost_usd": 0.0,
+                }));
+            }
+        }
         return Ok(full_response);
     }
+}
+
+/// Generate a UUIDv4-shaped session id without pulling the `uuid`
+/// crate (dirge already has enough deps). Random bytes via system
+/// time + thread id seeded into a small xorshift.
+fn uuid_v4_simple() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let mut state = nanos.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(pid);
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        let words = state.to_le_bytes();
+        chunk.copy_from_slice(&words[..chunk.len()]);
+    }
+    // Set version (4) + variant (10) bits per RFC 4122.
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        bytes[4],
+        bytes[5],
+        bytes[6],
+        bytes[7],
+        bytes[8],
+        bytes[9],
+        bytes[10],
+        bytes[11],
+        bytes[12],
+        bytes[13],
+        bytes[14],
+        bytes[15],
+    )
 }

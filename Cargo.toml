@@ -73,6 +73,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 futures = "0.3"
 reqwest = "0.13"
+# Fuzzy matcher for Ctrl-F search (dirge-bfd). Same crate maki uses for
+# its scrollback fuzzy search; matches by score with smart-case +
+# Unicode normalization, no need to roll our own ranking.
+nucleo-matcher = "0.3"
 dirs = "6"
 compact_str = { version = "0.9", features = ["serde"] }
 smallvec = "1"

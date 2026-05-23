@@ -569,17 +569,23 @@ impl AnyAgent {
         }
     }
 
-    pub async fn run_print(&self, prompt: &str, max_turns: usize) -> anyhow::Result<String> {
+    pub async fn run_print(
+        &self,
+        prompt: &str,
+        max_turns: usize,
+        output_format: crate::cli::OutputFormat,
+    ) -> anyhow::Result<String> {
         let t = self.chunk_timeout;
+        let f = output_format;
         match &self.inner {
-            AnyAgentInner::OpenRouter(a) => runner::run_print(a, prompt, max_turns, t).await,
-            AnyAgentInner::OpenAI(a) => runner::run_print(a, prompt, max_turns, t).await,
-            AnyAgentInner::Anthropic(a) => runner::run_print(a, prompt, max_turns, t).await,
-            AnyAgentInner::Gemini(a) => runner::run_print(a, prompt, max_turns, t).await,
-            AnyAgentInner::DeepSeek(a) => runner::run_print(a, prompt, max_turns, t).await,
-            AnyAgentInner::Glm(a) => runner::run_print(a, prompt, max_turns, t).await,
-            AnyAgentInner::Ollama(a) => runner::run_print(a, prompt, max_turns, t).await,
-            AnyAgentInner::Custom(a) => runner::run_print(a, prompt, max_turns, t).await,
+            AnyAgentInner::OpenRouter(a) => runner::run_print(a, prompt, max_turns, t, f).await,
+            AnyAgentInner::OpenAI(a) => runner::run_print(a, prompt, max_turns, t, f).await,
+            AnyAgentInner::Anthropic(a) => runner::run_print(a, prompt, max_turns, t, f).await,
+            AnyAgentInner::Gemini(a) => runner::run_print(a, prompt, max_turns, t, f).await,
+            AnyAgentInner::DeepSeek(a) => runner::run_print(a, prompt, max_turns, t, f).await,
+            AnyAgentInner::Glm(a) => runner::run_print(a, prompt, max_turns, t, f).await,
+            AnyAgentInner::Ollama(a) => runner::run_print(a, prompt, max_turns, t, f).await,
+            AnyAgentInner::Custom(a) => runner::run_print(a, prompt, max_turns, t, f).await,
         }
     }
 
