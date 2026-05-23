@@ -111,6 +111,7 @@ pub async fn handle_compress(
     sandbox: &Sandbox,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
+    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
 ) -> anyhow::Result<CompressOutcome> {
     renderer.write_line("compressing...", c_agent())?;
     renderer.write_line("", Color::White)?;
@@ -227,7 +228,7 @@ pub async fn handle_compress(
         None,
         bg_store.clone(),
         #[cfg(feature = "lsp")]
-        None,
+        lsp_manager.cloned(),
         sandbox.clone(),
         #[cfg(feature = "mcp")]
         mcp_manager,
@@ -288,6 +289,12 @@ pub async fn handle_slash(
     #[cfg(feature = "loop")] loop_state: &mut Option<crate::extras::r#loop::LoopState>,
     #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
     #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
+    // C8 (audit fix): every prior agent-rebuild path (/model,
+    // /prompt, /mode, /cd, /worktree, /wt-exit, /regen-prompts,
+    // /loop start/stop, /toggle) passed None for lsp_manager into
+    // build_agent. The user lost LSP silently after the first such
+    // command. Thread the actual manager through.
+    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
 ) -> anyhow::Result<()> {
     let parts: SmallVec<[&str; 3]> = text.trim().splitn(3, ' ').collect();
     match parts[0] {
@@ -308,7 +315,7 @@ pub async fn handle_slash(
                     None,
                     bg_store.clone(),
                     #[cfg(feature = "lsp")]
-                    None,
+                    lsp_manager.cloned(),
                     sandbox.clone(),
                     #[cfg(feature = "mcp")]
                     mcp_manager,
@@ -479,7 +486,7 @@ pub async fn handle_slash(
                                 None,
                                 bg_store.clone(),
                                 #[cfg(feature = "lsp")]
-                                None,
+                                lsp_manager.cloned(),
                                 sandbox.clone(),
                                 #[cfg(feature = "mcp")]
                                 mcp_manager,
@@ -715,7 +722,7 @@ pub async fn handle_slash(
                         None,
                         bg_store.clone(),
                         #[cfg(feature = "lsp")]
-                        None,
+                        lsp_manager.cloned(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -861,7 +868,7 @@ pub async fn handle_slash(
                         None,
                         bg_store.clone(),
                         #[cfg(feature = "lsp")]
-                        None,
+                        lsp_manager.cloned(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -895,7 +902,7 @@ pub async fn handle_slash(
                         None,
                         bg_store.clone(),
                         #[cfg(feature = "lsp")]
-                        None,
+                        lsp_manager.cloned(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -948,7 +955,7 @@ pub async fn handle_slash(
                         None,
                         bg_store.clone(),
                         #[cfg(feature = "lsp")]
-                        None,
+                        lsp_manager.cloned(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,
@@ -1059,7 +1066,7 @@ pub async fn handle_slash(
                     None,
                     bg_store.clone(),
                     #[cfg(feature = "lsp")]
-                    None,
+                    lsp_manager.cloned(),
                     sandbox.clone(),
                     #[cfg(feature = "mcp")]
                     mcp_manager,
@@ -1288,7 +1295,7 @@ pub async fn handle_slash(
                         None,
                         bg_store.clone(),
                         #[cfg(feature = "lsp")]
-                        None,
+                        lsp_manager.cloned(),
                         sandbox.clone(),
                         #[cfg(feature = "mcp")]
                         mcp_manager,

@@ -139,6 +139,19 @@ fn next_line_start(s: &str, cursor: usize) -> Option<usize> {
     after.find('\n').map(|p| cursor + p + 1)
 }
 
+/// Map a CHAR column on the line `[start..end]` of `s` to its
+/// byte offset within `s`. Clamps to `end` when the column exceeds
+/// the line's char count. Used by history Up/Down (H-batch1-2) so
+/// vertical motion across multi-byte chars never lands a cursor
+/// mid-codepoint — slicing the buffer there would panic.
+fn byte_at_char_col(s: &str, start: usize, end: usize, char_col: usize) -> usize {
+    let line = &s[start..end];
+    match line.char_indices().nth(char_col) {
+        Some((i, _)) => start + i,
+        None => end, // column past EOL — clamp
+    }
+}
+
 /// Threshold for collapsing pastes: anything with >= this many newlines becomes a
 /// `[N lines pasted]` placeholder. Single-line and short pastes go in raw so a
 /// quick paste-of-a-command isn't surprising.
@@ -987,12 +1000,18 @@ impl InputEditor {
                 // Try moving up within the multiline buffer first.
                 if let Some(pos) = prev_line_start(&self.buffer, self.cursor) {
                     let line_start = cursor_line_start(&self.buffer, self.cursor);
-                    let col = self.cursor - line_start;
+                    // H-batch1-2 (audit fix): map by CHAR column, not
+                    // byte column. Adding `cursor - line_start` (a
+                    // byte distance) to `pos` could land mid-codepoint
+                    // when either line has multi-byte chars — the
+                    // next `replace_range`/slice would panic with
+                    // "byte index N is not a char boundary."
+                    let char_col = self.buffer[line_start..self.cursor].chars().count();
                     let target_line_end = self.buffer[pos..]
                         .find('\n')
                         .map(|p| pos + p)
                         .unwrap_or(self.buffer.len());
-                    self.cursor = (pos + col).min(target_line_end);
+                    self.cursor = byte_at_char_col(&self.buffer, pos, target_line_end, char_col);
                     return None;
                 }
                 // At top of buffer → fall through to history.
@@ -1010,12 +1029,13 @@ impl InputEditor {
                 // Try moving down within the multiline buffer first.
                 if let Some(pos) = next_line_start(&self.buffer, self.cursor) {
                     let line_start = cursor_line_start(&self.buffer, self.cursor);
-                    let col = self.cursor - line_start;
+                    // H-batch1-2 (audit fix) — see KeyCode::Up.
+                    let char_col = self.buffer[line_start..self.cursor].chars().count();
                     let target_line_end = self.buffer[pos..]
                         .find('\n')
                         .map(|p| pos + p)
                         .unwrap_or(self.buffer.len());
-                    self.cursor = (pos + col).min(target_line_end);
+                    self.cursor = byte_at_char_col(&self.buffer, pos, target_line_end, char_col);
                     return None;
                 }
                 // At bottom of buffer → fall through to history.
@@ -1146,5 +1166,45 @@ mod tests {
     fn test_next_line_start() {
         assert_eq!(next_line_start("hello\nworld", 0), Some(6));
         assert_eq!(next_line_start("hello\nworld", 10), None);
+    }
+
+    // --- H-batch1-2: byte_at_char_col panic-defence ----------------
+
+    #[test]
+    fn byte_at_char_col_ascii_round_trip() {
+        // "hello\nworld" — moving from col 3 on "world" (target line)
+        let s = "hello\nworld";
+        assert_eq!(byte_at_char_col(s, 6, 11, 3), 9);
+    }
+
+    #[test]
+    fn byte_at_char_col_handles_multibyte_target() {
+        // Source line has 4 ASCII chars; target line has 2 emoji
+        // chars. Moving "col 3" to a 2-char target → clamp to end.
+        let s = "abcd\n🦀🚀";
+        // col 0 on "🦀🚀" lands at start byte (just after \n = 5)
+        assert_eq!(byte_at_char_col(s, 5, s.len(), 0), 5);
+        // col 1 = start of 🚀 (after 4-byte 🦀)
+        assert_eq!(byte_at_char_col(s, 5, s.len(), 1), 9);
+        // col 2 = end-of-line
+        assert_eq!(byte_at_char_col(s, 5, s.len(), 2), s.len());
+        // col 3 (past EOL) clamps to end
+        assert_eq!(byte_at_char_col(s, 5, s.len(), 3), s.len());
+    }
+
+    #[test]
+    fn byte_at_char_col_handles_multibyte_source_for_history_up() {
+        // Regression: source line had emoji; col was previously
+        // counted in BYTES (4 per emoji). Moving up to a shorter
+        // ASCII line landed mid-codepoint or past EOL of the
+        // target — the next replace_range panicked.
+        let s = "🦀🦀🦀\nabc";
+        // The source line is "🦀🦀🦀" — 3 chars, 12 bytes. From
+        // byte-cursor 12 (end of source), char_col should be 3.
+        // Moving "up" to ... well there's no line above the source,
+        // but as the target-side helper: col 3 on "abc" (3-char
+        // line) lands at end (byte 3 relative to target start = 13).
+        // Target line is &s[13..16] = "abc".
+        assert_eq!(byte_at_char_col(s, 13, s.len(), 3), s.len());
     }
 }

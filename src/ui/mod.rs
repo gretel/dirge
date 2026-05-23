@@ -1699,7 +1699,7 @@ pub async fn run_interactive(
                                     renderer.write_line(&format!("<you> {}", safe_line), theme::user())?;
                                 }
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager).await;
+                                let result = handle_slash(&text, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut show_reasoning, &mut is_running, &mut input, &permission, &ask_tx, &mut todo_tools_enabled, &bg_store, &sandbox, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager, #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref()).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();
@@ -1713,6 +1713,7 @@ pub async fn run_interactive(
                                             &permission, &ask_tx, &bg_store, &sandbox,
                                             #[cfg(feature = "mcp")] mcp_manager,
                                             #[cfg(feature = "semantic")] semantic_manager,
+                                            #[cfg(feature = "lsp")] lsp_manager.as_ref(),
                                         ).await;
                                         if let Err(e) = compress_result {
                                             renderer.write_line(&format!("compress error: {}", e), c_error())?;
@@ -1777,7 +1778,7 @@ pub async fn run_interactive(
                                                 None,
                                                 bg_store.clone(),
                                                                                                 #[cfg(feature = "lsp")]
-                                                                                                None,
+                                                                                                lsp_manager.clone(),
                                                 sandbox.clone(),
                                                 #[cfg(feature = "mcp")] mcp_manager,
                                                 #[cfg(feature = "semantic")] semantic_manager,
@@ -2461,7 +2462,7 @@ pub async fn run_interactive(
                                         None,
                                         bg_store.clone(),
                                         #[cfg(feature = "lsp")]
-                                        None,
+                                        lsp_manager.clone(),
                                         sandbox.clone(),
                                         #[cfg(feature = "mcp")]
                                         mcp_manager,
@@ -2567,6 +2568,7 @@ pub async fn run_interactive(
                                 &permission, &ask_tx, &bg_store, &sandbox,
                                 #[cfg(feature = "mcp")] mcp_manager,
                                 #[cfg(feature = "semantic")] semantic_manager,
+                                #[cfg(feature = "lsp")] lsp_manager.as_ref(),
                             ).await;
                             if let Err(e) = compress_result {
                                 renderer.write_line(
@@ -2717,7 +2719,7 @@ pub async fn run_interactive(
                                         None,
                                         bg_store.clone(),
                                                                                 #[cfg(feature = "lsp")]
-                                                                                None,
+                                                                                lsp_manager.clone(),
                                         sandbox.clone(),
                                         #[cfg(feature = "mcp")] mcp_manager,
                                         #[cfg(feature = "semantic")] semantic_manager,
@@ -2950,6 +2952,8 @@ pub async fn run_interactive(
                             mcp_manager,
                             #[cfg(feature = "semantic")]
                             semantic_manager,
+                            #[cfg(feature = "lsp")]
+                            lsp_manager.as_ref(),
                         )
                         .await;
 
