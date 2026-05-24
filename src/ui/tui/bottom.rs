@@ -294,6 +294,25 @@ fn paint_editor_box(
     // Frame::set_cursor_position.
 }
 
+/// Return the display width of a `label:` prefix at the start of
+/// `text`, or 0 if there is no such prefix. The label must be all
+/// ASCII alpha (`[A-Za-z]+`) followed by a literal `: ` — narrow
+/// enough that arbitrary user content like "1:30 ratio" won't be
+/// treated as a label. Used to compute hanging continuation
+/// indents for wrapped overlay lines.
+fn label_prefix_width(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+        i += 1;
+    }
+    if i > 0 && bytes.get(i) == Some(&b':') && bytes.get(i + 1) == Some(&b' ') {
+        i + 2
+    } else {
+        0
+    }
+}
+
 fn paint_overlay_box(
     buf: &mut Buffer,
     area: Rect,
@@ -312,13 +331,27 @@ fn paint_overlay_box(
     // Soft-wrap each input line, but use a single SENTINEL value for
     // the action-keys row (passed as the LAST line in `lines`) so
     // we can guarantee it stays visible even if the body overflows.
+    // Lines shaped like `label: value` get a hanging continuation
+    // indent equal to the label width — wrapped rows align under
+    // the value column instead of bleeding back to col 0.
     let wrap_w = inner_w.saturating_sub(2).max(1);
     use crate::ui::wrap::soft_wrap;
     let last_idx = lines.len().saturating_sub(1);
     let mut head_visual: Vec<(String, crossterm::style::Color)> = Vec::new();
     let mut sticky_last: Vec<(String, crossterm::style::Color)> = Vec::new();
     for (i, (text, color)) in lines.iter().enumerate() {
-        let chunks = soft_wrap(text, wrap_w, "  ");
+        // Detect `label: ` prefix to derive the hanging indent for
+        // continuation rows. e.g. `args: very long content` wraps to:
+        //   args: very long
+        //         content
+        // rather than:
+        //   args: very long
+        //   content
+        // We restrict this to ASCII alpha labels followed by ": " so
+        // arbitrary user content like "1:30 ratio" doesn't trigger.
+        let hang = label_prefix_width(text);
+        let cont_indent: String = " ".repeat(hang);
+        let chunks = soft_wrap(text, wrap_w, &cont_indent);
         for chunk in chunks {
             if i == last_idx {
                 sticky_last.push((chunk, *color));

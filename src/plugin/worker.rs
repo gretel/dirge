@@ -69,6 +69,18 @@ use janetrs::env::CFunOptions;
 /// Kept as a single string so worker init does one `client.run` call.
 #[cfg(feature = "plugin")]
 const HARNESS_INIT: &str = r#"
+# Redirect Janet's stdout to a discard buffer BEFORE anything else
+# runs. The default `:out` is the real stdout — in dirge's
+# interactive (raw-mode) TUI, every `(print …)` from plugin code
+# corrupts the screen: bare `\n` produces staircase artifacts AND
+# bypasses ratatui's tracked buffer, leaving "ghost" cells that
+# the next diff doesn't clean up (this is what the user saw as
+# `[plugin] tool: list_dir` leaking under the alert dialog).
+# Plugin authors that need real logging should write to a file
+# via `file/open`/`file/write` — Janet's `(print …)` is silent.
+(setdyn :out @"")
+(setdyn :err @"")
+
 (var harness-pending nil)
 (var harness-response nil)
 # Per-tool-hook slots: cleared by the host at the start of
@@ -77,7 +89,10 @@ const HARNESS_INIT: &str = r#"
 (var harness-mutate-input nil)
 (var harness-replace-result nil)
 
-(defn harness/log [msg] (print "[plugin] " msg))
+# harness/log is now a no-op. The return value of plugin commands
+# is what surfaces in chat — that's the supported surface for
+# plugin output.
+(defn harness/log [msg] nil)
 (defn harness/get-cwd [] (os/cwd))
 (defn harness/request-prompt [prompt]
   (when (string? prompt)

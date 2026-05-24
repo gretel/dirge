@@ -3892,8 +3892,13 @@ pub async fn run_interactive(
                     // giving the alert visual breathing room
                     // between sections. Action keys use theme::perm
                     // (amber/yellow) so the whole alert reads in
-                    // one color rather than mixing the cautionary
-                    // amber with command-accent green.
+                    // one cautionary color. The args line uses an
+                    // explicit `\x1F` (Unit Separator) sentinel as
+                    // the hanging-indent boundary so wrapped
+                    // continuations align under the value, not at
+                    // column 0. paint_overlay_box reads the
+                    // sentinel and uses a 6-space wrap indent for
+                    // that line.
                     let mut overlay: Vec<(String, Color)> = Vec::new();
                     overlay.push(("⚠ PERMISSION REQUIRED".to_string(), theme::perm()));
                     overlay.push((String::new(), theme::perm()));
