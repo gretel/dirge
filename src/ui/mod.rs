@@ -2801,25 +2801,25 @@ pub async fn run_interactive(
                             // doesn't orphan. Skip the rest of branch
                             // (a).
                             if resolved_name.is_empty() {
-                                let (frame_w, _) = chamber_widths(&renderer);
+                                let (frame_w, inner) = chamber_widths(&renderer);
                                 let trimmed = output.trim();
-                                if !trimmed.is_empty() {
+                                let row_text = if trimmed.is_empty() {
+                                    "(unresolved tool, no output)".to_string()
+                                } else {
                                     let first = trimmed.lines().next().unwrap_or("");
-                                    let inner = frame_w.saturating_sub(4);
-                                    renderer.write_line(
-                                        &chamber_row(
-                                            &format!("(unresolved tool) {}", first),
-                                            inner,
-                                        ),
-                                        theme::dim(),
-                                    )?;
-                                }
+                                    format!("(unresolved tool) {}", first)
+                                };
+                                renderer.write_line(
+                                    &chamber_row(&row_text, inner),
+                                    theme::dim(),
+                                )?;
                                 renderer.write_line(
                                     &chamber_bottom(frame_w),
                                     theme::dim(),
                                 )?;
                                 tool_chamber_open = false;
-                                // Don't fall through to is_edit / render_tool_output.
+                                chamber_top_start = None;
+                                chamber_top_end = None;
                                 last_tool_name = None;
                                 continue;
                             }
@@ -2938,9 +2938,30 @@ pub async fn run_interactive(
                         // would mislead the user about an otherwise-
                         // successful run).
                         if tool_chamber_open {
-                            let (frame_w, _) = chamber_widths(&renderer);
-                            renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+                            // Same drop-or-close logic as
+                            // close_tool_chamber_passive: if no
+                            // body content was added since the
+                            // TOP was painted (result never
+                            // arrived from the agent — MCP timeout,
+                            // network blip, agent loop bug), drop
+                            // the chamber entirely instead of
+                            // leaving an empty box on screen.
+                            // Otherwise close with a bottom border.
+                            let drop_chamber = match (chamber_top_start, chamber_top_end) {
+                                (Some(_), Some(end)) => renderer.buffer_len() == end,
+                                _ => false,
+                            };
+                            if drop_chamber {
+                                if let Some(start) = chamber_top_start {
+                                    renderer.replace_from(start, Vec::new());
+                                }
+                            } else {
+                                let (frame_w, _) = chamber_widths(&renderer);
+                                renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+                            }
                             tool_chamber_open = false;
+                            chamber_top_start = None;
+                            chamber_top_end = None;
                         }
                         last_tool_name = None;
                         renderer.set_avatar_state(avatar::AvatarState::Done);
@@ -3872,6 +3893,8 @@ pub async fn run_interactive(
                     )?;
                     renderer.write_line(&chamber_bottom(frame_w), c_tool())?;
                     tool_chamber_open = false;
+                    chamber_top_start = None;
+                    chamber_top_end = None;
                     let reopen = last_tool_name.clone();
                     last_tool_name = None;
                     // If `last_tool_name` was somehow cleared while
