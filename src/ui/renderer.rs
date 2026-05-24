@@ -321,10 +321,21 @@ impl Renderer {
             }
         };
 
+        // When the overlay is active, size the input box to fit
+        // its content — otherwise the alert is rendered into a
+        // 3-row frame that can only show the title, hiding the
+        // tool/args/action-keys rows. Without overlay, use the
+        // wrapped-editor row count we cached.
+        let effective_input_rows = if let Some(lines) = alert_overlay.as_ref() {
+            (lines.len() as u16).clamp(1, MAX_INPUT_VISIBLE_LINES as u16)
+        } else {
+            *input_rows
+        };
+
         let scene = Scene {
             chat_buffer: buffer,
             scroll_offset: *scroll_offset,
-            input_rows: *input_rows,
+            input_rows: effective_input_rows,
             panel_data,
             left_info: left_panel_info,
             subagents: subagent_status,
@@ -335,7 +346,21 @@ impl Renderer {
             frame_color,
         };
 
-        terminal.draw(|f| render_frame(&scene, f))?;
+        // Wrap the draw in Begin/EndSynchronizedUpdate. Modern
+        // terminals (iTerm2, kitty, foot, recent xterm, Windows
+        // Terminal) buffer the bracketed escape sequences and
+        // present the resulting frame atomically — eliminates the
+        // flicker we'd otherwise see as ratatui emits one escape
+        // per changed cell sequentially. Terminals that don't
+        // implement the sequence ignore it (it's a private DECSET
+        // ?2026), so the bracket is harmless backwards-compat.
+        use crossterm::ExecutableCommand as _;
+        use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+        let mut stdout = std::io::stdout();
+        let _ = stdout.execute(BeginSynchronizedUpdate);
+        let draw_result = terminal.draw(|f| render_frame(&scene, f));
+        let _ = stdout.execute(EndSynchronizedUpdate);
+        draw_result?;
         Ok(())
     }
 
