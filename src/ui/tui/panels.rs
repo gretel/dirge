@@ -93,9 +93,7 @@ impl<'a> Widget for SubPanel<'a> {
         } else {
             // Title wider than inner — fall back to plain ────.
             for i in 0..inner_w as u16 {
-                buf[(area.x + 1 + i, area.y)]
-                    .set_char('─')
-                    .set_style(bs);
+                buf[(area.x + 1 + i, area.y)].set_char('─').set_style(bs);
             }
         }
         buf[(area.x + area.width - 1, area.y)]
@@ -113,13 +111,7 @@ impl<'a> Widget for SubPanel<'a> {
             if let Some((text, color)) = self.lines.get(i) {
                 // One leading space, then text clipped to inner_w - 1.
                 let text_style = Style::default().fg(*color);
-                buf.set_stringn(
-                    area.x + 1,
-                    y,
-                    format!(" {}", text),
-                    inner_w,
-                    text_style,
-                );
+                buf.set_stringn(area.x + 1, y, format!(" {}", text), inner_w, text_style);
             }
         }
 
@@ -424,7 +416,9 @@ impl<'a> Widget for RightPanel<'a> {
 /// Render `LABEL: [####....] NN%` of fixed width.
 fn format_bar(label: &str, pct: f32) -> String {
     let bar_w = 10;
-    let filled = ((pct / 100.0) * bar_w as f32).round().clamp(0.0, bar_w as f32) as usize;
+    let filled = ((pct / 100.0) * bar_w as f32)
+        .round()
+        .clamp(0.0, bar_w as f32) as usize;
     let empty = bar_w - filled;
     format!(
         "{}: [{}{}] {:>3}%",
@@ -440,8 +434,8 @@ const _: fn(crossterm::style::Color) -> RColor = crossterm_to_ratatui;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::layout::Layout;
+    use super::*;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -460,14 +454,7 @@ mod tests {
 
         let row = |y: u16| -> String {
             (0..20)
-                .map(|x| {
-                    backend
-                        .buffer()
-                        .cell((x, y))
-                        .unwrap()
-                        .symbol()
-                        .to_string()
-                })
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
                 .collect()
         };
         // [MCP] is 5 chars in a 18-wide inner band, pad=13, left=6.
@@ -498,14 +485,7 @@ mod tests {
         backend = terminal.backend().clone();
         // Body row.
         let body: String = (0..20)
-            .map(|x| {
-                backend
-                    .buffer()
-                    .cell((x, 1))
-                    .unwrap()
-                    .symbol()
-                    .to_string()
-            })
+            .map(|x| backend.buffer().cell((x, 1)).unwrap().symbol().to_string())
             .collect();
         // Expected: "│ hi              │" — text at cols 2-3, spaces to 18, │ at 19.
         let body_chars: Vec<char> = body.chars().collect();
@@ -539,14 +519,7 @@ mod tests {
         backend = terminal.backend().clone();
         // Row 1 should contain "D I R G E" centered.
         let row1: String = (0..30)
-            .map(|x| {
-                backend
-                    .buffer()
-                    .cell((x, 1))
-                    .unwrap()
-                    .symbol()
-                    .to_string()
-            })
+            .map(|x| backend.buffer().cell((x, 1)).unwrap().symbol().to_string())
             .collect();
         assert!(row1.contains("D I R G E"), "got {:?}", row1);
         // Some row should contain "Agent ID: abc123".
@@ -599,9 +572,17 @@ mod tests {
                 .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
                 .collect()
         };
-        assert!(row_at(1).starts_with("⋯ ...abc123"), "row1 = {:?}", row_at(1));
+        assert!(
+            row_at(1).starts_with("⋯ ...abc123"),
+            "row1 = {:?}",
+            row_at(1)
+        );
         assert!(row_at(2).contains("do thing"), "row2 = {:?}", row_at(2));
-        assert!(row_at(3).starts_with("✓ ...def456"), "row3 = {:?}", row_at(3));
+        assert!(
+            row_at(3).starts_with("✓ ...def456"),
+            "row3 = {:?}",
+            row_at(3)
+        );
         assert!(row_at(4).contains("done"), "row4 = {:?}", row_at(4));
     }
 
@@ -622,9 +603,7 @@ mod tests {
 
         // Scan the right panel rect for each title.
         let mut titles_found: Vec<&str> = Vec::new();
-        for y in layout.right_panel.y
-            ..(layout.right_panel.y + layout.right_panel.height)
-        {
+        for y in layout.right_panel.y..(layout.right_panel.y + layout.right_panel.height) {
             let row: String = (layout.right_panel.x
                 ..layout.right_panel.x + layout.right_panel.width)
                 .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
@@ -643,9 +622,7 @@ mod tests {
 
         // The MCP server name "server1" should appear too.
         let mut found_server = false;
-        for y in layout.right_panel.y
-            ..(layout.right_panel.y + layout.right_panel.height)
-        {
+        for y in layout.right_panel.y..(layout.right_panel.y + layout.right_panel.height) {
             let row: String = (layout.right_panel.x
                 ..layout.right_panel.x + layout.right_panel.width)
                 .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())

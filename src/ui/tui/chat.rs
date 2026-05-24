@@ -229,10 +229,7 @@ mod tests {
         let layout = Layout::new(160, 30, 1);
         let mut backend = TestBackend::new(160, 30);
         let mut terminal = Terminal::new(backend.clone()).unwrap();
-        let lines = vec![
-            line("hello", CC::Green),
-            line("world", CC::Cyan),
-        ];
+        let lines = vec![line("hello", CC::Green), line("world", CC::Cyan)];
         terminal
             .draw(|f| {
                 let area = f.area();
@@ -330,9 +327,7 @@ mod tests {
         // 30 lines named "L0".."L29"; with scroll_offset = 5 the
         // window is lines[30-5-24 .. 30-5] = lines[1..25]. Painted
         // top-anchored: row chat.y → L1, row chat.y + 23 → L24.
-        let lines: Vec<LineEntry> = (0..30)
-            .map(|i| line(&format!("L{i}"), CC::Green))
-            .collect();
+        let lines: Vec<LineEntry> = (0..30).map(|i| line(&format!("L{i}"), CC::Green)).collect();
         terminal
             .draw(|f| {
                 let area = f.area();

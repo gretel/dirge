@@ -70,15 +70,7 @@ impl<'a> Widget for TopFrame<'a> {
         let y = l.top_frame.y;
 
         // Left section: cols [0, chat_v_left_col).
-        paint_titled_horizontal(
-            buf,
-            0,
-            y,
-            l.chat_v_left_col,
-            LEFT_TITLE,
-            '═',
-            self.style,
-        );
+        paint_titled_horizontal(buf, 0, y, l.chat_v_left_col, LEFT_TITLE, '═', self.style);
         // Chat corner ╔.
         if l.chat_v_left_col < l.top_frame.width {
             buf[(l.chat_v_left_col, y)]
@@ -215,8 +207,8 @@ fn paint_titled_horizontal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     /// Render the top frame on a wide terminal and assert the exact
     /// content of row 0. Verifies section widths, corner placement,
@@ -249,7 +241,16 @@ mod tests {
 
         // Read row 0 from the buffer.
         let row0: String = (0..160)
-            .map(|x| backend.buffer().cell((x, 0)).unwrap().symbol().chars().next().unwrap())
+            .map(|x| {
+                backend
+                    .buffer()
+                    .cell((x, 0))
+                    .unwrap()
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap()
+            })
             .collect();
 
         // Expected:
@@ -262,17 +263,9 @@ mod tests {
         // cols [141,159] → ═══[SYSTEM]═══ in 19 cells
         //   pad=19-8=11, left=5, right=6
         let expected_left = format!("{}{}{}", "═".repeat(2), LEFT_TITLE, "═".repeat(3));
-        let expected_chat = format!(
-            "{}{}{}",
-            "═".repeat(51),
-            CHAT_TITLE,
-            "═".repeat(51)
-        );
+        let expected_chat = format!("{}{}{}", "═".repeat(51), CHAT_TITLE, "═".repeat(51));
         let expected_right = format!("{}{}{}", "═".repeat(5), RIGHT_TITLE, "═".repeat(6));
-        let expected = format!(
-            "{}╔{}╗{}",
-            expected_left, expected_chat, expected_right
-        );
+        let expected = format!("{}╔{}╗{}", expected_left, expected_chat, expected_right);
         assert_eq!(row0, expected, "top frame row 0 mismatch");
     }
 
@@ -296,15 +289,19 @@ mod tests {
         backend = terminal.backend().clone();
 
         let row0: String = (0..40)
-            .map(|x| backend.buffer().cell((x, 0)).unwrap().symbol().chars().next().unwrap())
+            .map(|x| {
+                backend
+                    .buffer()
+                    .cell((x, 0))
+                    .unwrap()
+                    .symbol()
+                    .chars()
+                    .next()
+                    .unwrap()
+            })
             .collect();
         // Chat inner width = 38, title = 18 chars, pad = 20, left = 10.
-        let expected = format!(
-            "╔{}{}{}╗",
-            "═".repeat(10),
-            CHAT_TITLE,
-            "═".repeat(10)
-        );
+        let expected = format!("╔{}{}{}╗", "═".repeat(10), CHAT_TITLE, "═".repeat(10));
         assert_eq!(row0, expected);
     }
 
@@ -369,11 +366,7 @@ mod tests {
         );
         for x in (layout.chat_v_left_col + 1)..layout.chat_v_right_col {
             assert_eq!(
-                backend
-                    .buffer()
-                    .cell((x, row))
-                    .unwrap()
-                    .symbol(),
+                backend.buffer().cell((x, row)).unwrap().symbol(),
                 "═",
                 "expected ═ at col {x}"
             );
@@ -384,15 +377,7 @@ mod tests {
     #[test]
     fn titled_horizontal_drops_title_when_too_narrow() {
         let mut buf = Buffer::empty(Rect::new(0, 0, 5, 1));
-        paint_titled_horizontal(
-            &mut buf,
-            0,
-            0,
-            5,
-            "[AGENT STATUS]",
-            '═',
-            Style::default(),
-        );
+        paint_titled_horizontal(&mut buf, 0, 0, 5, "[AGENT STATUS]", '═', Style::default());
         let row: String = (0..5)
             .map(|x| buf.cell((x, 0)).unwrap().symbol().chars().next().unwrap())
             .collect();

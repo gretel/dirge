@@ -225,8 +225,7 @@ pub struct Renderer {
     /// must skip the actual draw call (the legacy paint paths kept
     /// no terminal handle either — this preserves the same testable
     /// shape).
-    tui_terminal:
-        Option<ratatui::Terminal<ratatui::backend::CrosstermBackend<BackendWriter>>>,
+    tui_terminal: Option<ratatui::Terminal<ratatui::backend::CrosstermBackend<BackendWriter>>>,
     /// Cached input editor snapshot used when `write_line` / `write`
     /// trigger a redraw — they don't have the editor reference at
     /// hand, but the last `draw_bottom` did. Stored as pre-wrapped
@@ -289,7 +288,7 @@ impl Renderer {
         })
     }
 
-/// Phase 6 paint entry point. Builds a `Scene` from current
+    /// Phase 6 paint entry point. Builds a `Scene` from current
     /// Renderer state and calls `render_frame` through the ratatui
     /// Terminal. Every legacy paint method funnels here.
     ///
@@ -335,8 +334,7 @@ impl Renderer {
         };
 
         let face = avatar::art(*avatar_state, *avatar_tick);
-        let avatar_color =
-            crate::ui::tui::chat::crossterm_to_ratatui(avatar::color(*avatar_state));
+        let avatar_color = crate::ui::tui::chat::crossterm_to_ratatui(avatar::color(*avatar_state));
         let avatar = Some(AvatarSpec {
             face,
             color: avatar_color,
@@ -369,10 +367,8 @@ impl Renderer {
         let (cols_q, rows_q) = crate::ui::terminal::tty_size();
         let effective_input_rows = if let Some(lines) = alert_overlay.as_ref() {
             let probe = crate::ui::tui::layout::Layout::new(cols_q, rows_q, 1);
-            let wrapped = crate::ui::tui::bottom::overlay_wrapped_row_count(
-                lines,
-                probe.input_box.width,
-            );
+            let wrapped =
+                crate::ui::tui::bottom::overlay_wrapped_row_count(lines, probe.input_box.width);
             // Leave at least 4 rows for the chat (+ 5 fixed rows
             // of frames/status), so input_rows ≤ rows - 9.
             let ceiling = (rows_q as i32 - 9).max(1) as u16;
@@ -767,9 +763,8 @@ impl Renderer {
 
     pub fn buffer_line_at_row(&self, row: u16) -> Option<usize> {
         let (_, rows) = self.terminal_size();
-        let visible = rows
-            .saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS)
-            as usize;
+        let visible =
+            rows.saturating_sub(self.input_rows + 1 + ALERT_FRAME_ROWS + CHAT_FRAME_ROWS) as usize;
         let total = self.buffer.len();
         if total == 0 {
             return None;
@@ -1402,7 +1397,10 @@ mod tests {
     #[test]
     fn wrap_editor_newlines_split() {
         let (rows, r, c) = wrap_editor("a\nb\ncc", 5, 80);
-        assert_eq!(rows, vec!["a".to_string(), "b".to_string(), "cc".to_string()]);
+        assert_eq!(
+            rows,
+            vec!["a".to_string(), "b".to_string(), "cc".to_string()]
+        );
         // Cursor at byte 5 = "cc" position 1.
         assert_eq!((r, c), (2, 1));
     }

@@ -16,12 +16,12 @@ mod status;
 mod streaming;
 pub(crate) mod sysload;
 pub(crate) mod terminal;
+pub(crate) mod theme;
+mod tree;
 /// ui-redesign: ratatui-based render pipeline. Lives alongside the
 /// legacy `renderer` module during the staged migration; see beads
 /// dirge-a3x..dirge-eu3 for the phase plan.
 mod tui;
-pub(crate) mod theme;
-mod tree;
 mod wrap;
 
 use std::collections::VecDeque;
@@ -6114,7 +6114,9 @@ mod tests {
         let chamber_start = renderer.buffer_len();
         // Simulate a ToolCall painting spacer + header.
         renderer.write_line("", Color::White).unwrap();
-        renderer.write_line("╭─ MOCK_TOOL ─────╮", Color::White).unwrap();
+        renderer
+            .write_line("╭─ MOCK_TOOL ─────╮", Color::White)
+            .unwrap();
         let chamber_end = renderer.buffer_len();
         assert_eq!(chamber_end - chamber_start, 2);
 
@@ -6122,14 +6124,8 @@ mod tests {
         let mut open = true;
         let mut start: Option<usize> = Some(chamber_start);
         let mut end: Option<usize> = Some(chamber_end);
-        close_tool_chamber_passive(
-            &mut renderer,
-            &mut name,
-            &mut open,
-            &mut start,
-            &mut end,
-        )
-        .unwrap();
+        close_tool_chamber_passive(&mut renderer, &mut name, &mut open, &mut start, &mut end)
+            .unwrap();
         // Buffer is back to BEFORE the chamber TOP — the empty
         // chamber is gone entirely.
         assert_eq!(
@@ -6151,7 +6147,9 @@ mod tests {
         let mut renderer = Renderer::new().expect("renderer");
         let chamber_start = renderer.buffer_len();
         renderer.write_line("", Color::White).unwrap();
-        renderer.write_line("╭─ MOCK_TOOL ─────╮", Color::White).unwrap();
+        renderer
+            .write_line("╭─ MOCK_TOOL ─────╮", Color::White)
+            .unwrap();
         let chamber_end = renderer.buffer_len();
         // Add body content.
         renderer.write_line("│ body row 1 │", Color::White).unwrap();
@@ -6162,14 +6160,8 @@ mod tests {
         let mut open = true;
         let mut start: Option<usize> = Some(chamber_start);
         let mut end: Option<usize> = Some(chamber_end);
-        close_tool_chamber_passive(
-            &mut renderer,
-            &mut name,
-            &mut open,
-            &mut start,
-            &mut end,
-        )
-        .unwrap();
+        close_tool_chamber_passive(&mut renderer, &mut name, &mut open, &mut start, &mut end)
+            .unwrap();
         // One more row (the chamber bottom) is appended — no truncation.
         assert_eq!(
             renderer.buffer_len(),
@@ -6321,8 +6313,7 @@ mod tests {
 
         // Unknown tool → generic "(no output)".
         let mut renderer = Renderer::new().expect("renderer");
-        render_tool_output(&mut renderer, "weird_tool", "x", "", 10_000, 100)
-            .expect("render ok");
+        render_tool_output(&mut renderer, "weird_tool", "x", "", 10_000, 100).expect("render ok");
         let body_text: Vec<&str> = renderer.buffer_lines();
         assert!(
             body_text.iter().any(|l| l.contains("(no output)")),

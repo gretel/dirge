@@ -86,9 +86,7 @@ impl Layout {
         //   chat_bot_frame (1) + chat_content (N) + top_frame (1) = rows
         // So chat_content_h = rows - input_rows - 5 (saturating).
         let fixed_v = 5_u16; // top_frame + chat_bot_frame + 2 bot-strip frames + status
-        let chat_h = rows
-            .saturating_sub(input_rows)
-            .saturating_sub(fixed_v);
+        let chat_h = rows.saturating_sub(input_rows).saturating_sub(fixed_v);
         let top_frame = Rect::new(0, 0, cols, if rows >= 1 { 1 } else { 0 });
         // Chat content rows 1..1+chat_h
         let chat_content_top = 1_u16.min(rows);
@@ -130,7 +128,9 @@ impl Layout {
         // Input box includes both chat ║ cols so its rounded ╭...╮
         // sits exactly at the chat verticals — visual continuation.
         let input_box_x = chat_v_left_col;
-        let input_box_w = chat_v_right_col.saturating_sub(chat_v_left_col).saturating_add(1);
+        let input_box_w = chat_v_right_col
+            .saturating_sub(chat_v_left_col)
+            .saturating_add(1);
         let input_box = Rect::new(input_box_x, bottom_strip_top_y, input_box_w, strip_h);
         let right_margin_w = cols.saturating_sub(right_panel_x);
         let right_margin = Rect::new(right_panel_x, bottom_strip_top_y, right_margin_w, strip_h);
@@ -205,7 +205,8 @@ mod tests {
         assert_eq!(
             1 + l.chat.height + 1 + l.input_box.height + 1,
             rows,
-            "vertical tiling: {:?}", l
+            "vertical tiling: {:?}",
+            l
         );
         // Adjacent rects must abut, not overlap.
         assert_eq!(l.top_frame.y + l.top_frame.height, l.chat.y);
@@ -235,10 +236,7 @@ mod tests {
     fn input_box_aligns_with_chat_verticals() {
         let l = Layout::new(200, 30, 1);
         assert_eq!(l.input_box.x, l.chat_v_left_col);
-        assert_eq!(
-            l.input_box.x + l.input_box.width - 1,
-            l.chat_v_right_col
-        );
+        assert_eq!(l.input_box.x + l.input_box.width - 1, l.chat_v_right_col);
     }
 
     /// Avatar box ends exactly where input box begins; right margin

@@ -72,8 +72,7 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
 
     // Chat region (content + ║ verticals).
     f.render_widget(
-        ChatPane::new(&layout, scene.chat_buffer, scene.scroll_offset)
-            .border_style(frame_style),
+        ChatPane::new(&layout, scene.chat_buffer, scene.scroll_offset).border_style(frame_style),
         area,
     );
 
@@ -196,14 +195,7 @@ mod tests {
 
         // Top frame row contains all three titles.
         let row0: String = (0..160)
-            .map(|x| {
-                backend
-                    .buffer()
-                    .cell((x, 0))
-                    .unwrap()
-                    .symbol()
-                    .to_string()
-            })
+            .map(|x| backend.buffer().cell((x, 0)).unwrap().symbol().to_string())
             .collect();
         assert!(row0.contains("[AGENT STATUS]"));
         assert!(row0.contains("[AGENT LOG STREAM]"));
@@ -281,7 +273,14 @@ mod tests {
         // The input box top border should have "[ALERT]" centered.
         let top_y = layout.input_box.y;
         let top_row: String = (layout.input_box.x..layout.input_box.x + layout.input_box.width)
-            .map(|x| backend.buffer().cell((x, top_y)).unwrap().symbol().to_string())
+            .map(|x| {
+                backend
+                    .buffer()
+                    .cell((x, top_y))
+                    .unwrap()
+                    .symbol()
+                    .to_string()
+            })
             .collect();
         assert!(top_row.contains("[ALERT]"), "got top {:?}", top_row);
 
@@ -332,21 +331,17 @@ mod tests {
         let mut found_dirge = false;
         for y in 0..20 {
             let r: String = (0..60)
-                .map(|x| {
-                    backend
-                        .buffer()
-                        .cell((x, y))
-                        .unwrap()
-                        .symbol()
-                        .to_string()
-                })
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
                 .collect();
             if r.contains("D I R G E") {
                 found_dirge = true;
                 break;
             }
         }
-        assert!(!found_dirge, "DIRGE banner should not appear on narrow term");
+        assert!(
+            !found_dirge,
+            "DIRGE banner should not appear on narrow term"
+        );
     }
 
     /// Typing into the input field: render the same Scene twice
@@ -413,8 +408,7 @@ mod tests {
         // is present somewhere on it.
         let layout = Layout::new(160, 30, 1);
         let inner_y = layout.input_box.y + 1;
-        let row: String = (layout.input_box.x
-            ..layout.input_box.x + layout.input_box.width)
+        let row: String = (layout.input_box.x..layout.input_box.x + layout.input_box.width)
             .map(|x| {
                 backend
                     .buffer()
@@ -424,7 +418,10 @@ mod tests {
                     .to_string()
             })
             .collect();
-        assert!(row.contains("hello"), "input row should contain typed text; got {row:?}");
+        assert!(
+            row.contains("hello"),
+            "input row should contain typed text; got {row:?}"
+        );
     }
 
     /// Chat content from the scene's buffer paints into the chat
@@ -455,14 +452,7 @@ mod tests {
         // Lines paint top-anchored at chat.y, chat.y + 1.
         let read = |y: u16| -> String {
             (layout.chat.x..layout.chat.x + layout.chat.width)
-                .map(|x| {
-                    backend
-                        .buffer()
-                        .cell((x, y))
-                        .unwrap()
-                        .symbol()
-                        .to_string()
-                })
+                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
                 .collect()
         };
         assert!(read(layout.chat.y).starts_with("first line"));

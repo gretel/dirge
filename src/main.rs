@@ -289,9 +289,7 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
                     .join("dirge.log")
             });
-        let _ = std::fs::create_dir_all(
-            path.parent().unwrap_or(std::path::Path::new("/tmp")),
-        );
+        let _ = std::fs::create_dir_all(path.parent().unwrap_or(std::path::Path::new("/tmp")));
         Some(path)
     } else {
         None

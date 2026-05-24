@@ -18,14 +18,14 @@
 // widget, chat region, side panels, bottom strip). The dead-code
 // warning will go away as those phases land.
 #[allow(dead_code)]
-pub mod layout;
-#[allow(dead_code)]
-pub mod frame;
+pub mod bottom;
 #[allow(dead_code)]
 pub mod chat;
 #[allow(dead_code)]
-pub mod panels;
+pub mod frame;
 #[allow(dead_code)]
-pub mod bottom;
+pub mod layout;
+#[allow(dead_code)]
+pub mod panels;
 #[allow(dead_code)]
 pub mod scene;

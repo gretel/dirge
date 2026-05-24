@@ -1,6 +1,6 @@
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::ExecutableCommand;
@@ -193,11 +193,7 @@ fn redirect_stdout_stderr_to_log() -> (Option<libc::c_int>, Option<libc::c_int>)
         .create(true)
         .append(true)
         .open(&configured)
-        .or_else(|_| {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open("/dev/null")
-        });
+        .or_else(|_| std::fs::OpenOptions::new().write(true).open("/dev/null"));
     let file = match file {
         Ok(f) => f,
         Err(_) => return (None, None),
@@ -215,8 +211,16 @@ fn redirect_stdout_stderr_to_log() -> (Option<libc::c_int>, Option<libc::c_int>)
     // Drop our handle — the duplicated fds in 1/2 keep the file alive.
     drop(file);
     (
-        if saved_stdout_fd >= 0 { Some(saved_stdout_fd) } else { None },
-        if saved_stderr_fd >= 0 { Some(saved_stderr_fd) } else { None },
+        if saved_stdout_fd >= 0 {
+            Some(saved_stdout_fd)
+        } else {
+            None
+        },
+        if saved_stderr_fd >= 0 {
+            Some(saved_stderr_fd)
+        } else {
+            None
+        },
     )
 }
 

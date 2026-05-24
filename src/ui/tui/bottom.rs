@@ -99,23 +99,11 @@ impl<'a> Widget for BottomStrip<'a> {
         paint_avatar_box(buf, l.avatar_box, self.avatar.as_ref(), self.border_style);
         match self.body.as_ref() {
             Some(BottomBody::Editor {
-                rows,
-                is_running,
-                ..
-            }) => paint_editor_box(
-                buf,
-                l.input_box,
-                rows,
-                *is_running,
-                self.border_style,
-            ),
-            Some(BottomBody::Overlay { title, lines }) => paint_overlay_box(
-                buf,
-                l.input_box,
-                title,
-                lines,
-                self.border_style,
-            ),
+                rows, is_running, ..
+            }) => paint_editor_box(buf, l.input_box, rows, *is_running, self.border_style),
+            Some(BottomBody::Overlay { title, lines }) => {
+                paint_overlay_box(buf, l.input_box, title, lines, self.border_style)
+            }
             None => paint_empty_box(buf, l.input_box, self.border_style),
         }
         // right_margin: blank — explicitly clear so stale right
@@ -261,13 +249,7 @@ fn paint_empty_box(buf: &mut Buffer, area: Rect, style: Style) {
     paint_frame(buf, area, None, style);
 }
 
-fn paint_editor_box(
-    buf: &mut Buffer,
-    area: Rect,
-    rows: &[String],
-    is_running: bool,
-    style: Style,
-) {
+fn paint_editor_box(buf: &mut Buffer, area: Rect, rows: &[String], is_running: bool, style: Style) {
     paint_frame(buf, area, None, style);
     if area.width < 6 || area.height < 3 {
         return;
