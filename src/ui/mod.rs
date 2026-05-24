@@ -881,6 +881,15 @@ pub async fn run_interactive(
     // the alert handler can rely on a fact about the *screen* rather
     // than a fact about a name that has other clear sites.
     let mut tool_chamber_open: bool = false;
+    // Buffer positions bracketing the chamber TOP (spacer + header
+    // banner). `chamber_top_start` is the buffer length BEFORE
+    // those lines were pushed; `chamber_top_end` is the length
+    // AFTER. If the chamber is closed passively (next ToolCall,
+    // notification, etc.) AND buffer_len() == chamber_top_end (no
+    // body content was added in between), the chamber is dropped
+    // entirely via replace_from(start, []) — no orphan empty box.
+    let mut chamber_top_start: Option<usize> = None;
+    let mut chamber_top_end: Option<usize> = None;
 
     // dirge-ov2 Phase C: per-chat UI state. When the user switches
     // chats (Ctrl-N/P/X, /tasks), the locals above (response_buf,
@@ -1411,6 +1420,8 @@ pub async fn run_interactive(
                                     &mut renderer,
                                     &mut last_tool_name,
                                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                     &msg,
                                     c_error(),
                                 )?;
@@ -1432,6 +1443,8 @@ pub async fn run_interactive(
                                     &mut renderer,
                                     &mut last_tool_name,
                                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                     "copied selection",
                                     Color::Green,
                                 )?;
@@ -1460,6 +1473,8 @@ pub async fn run_interactive(
                                 &mut renderer,
                                 &mut last_tool_name,
                                 &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                 &format!(
                                     "dropped 1 queued message ({} remaining)",
                                     interjection_queue.len()
@@ -1973,6 +1988,8 @@ pub async fn run_interactive(
                                         &mut renderer,
                                         &mut last_tool_name,
                                         &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                         "agent is busy, wait or interrupt first",
                                         c_error(),
                                     )?;
@@ -2089,6 +2106,8 @@ pub async fn run_interactive(
                                         &mut renderer,
                                         &mut last_tool_name,
                                         &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                         "agent is busy — wait, interrupt (Ctrl+C), or use /quit. (/tasks /help /sessions /tree /model /prompt run during agent activity.)",
                                         c_error(),
                                     )?;
@@ -2550,7 +2569,13 @@ pub async fn run_interactive(
                         // (Error / Interjected / ContextOverflow) are
                         // genuine denial-shaped events and stay on
                         // `close_tool_chamber_if_open`.
-                        close_tool_chamber_passive(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
+                        close_tool_chamber_passive(
+                            &mut renderer,
+                            &mut last_tool_name,
+                            &mut tool_chamber_open,
+                            &mut chamber_top_start,
+                            &mut chamber_top_end,
+                        )?;
                         last_tool_name = Some(name.to_string());
                         last_tool_call_id = Some(id.to_string());
                         if agent_line_started {
@@ -2569,6 +2594,11 @@ pub async fn run_interactive(
                         // width so it visually mates with the closing
                         // bottom border (matching btop's framed cards).
                         let upper = name.to_ascii_uppercase();
+                        // Record the buffer position BEFORE the
+                        // spacer + header — used by passive close
+                        // to drop the chamber entirely if no body
+                        // content follows (parallel tool calls).
+                        chamber_top_start = Some(renderer.buffer_len());
                         // Blank line BEFORE the chamber top so the eye
                         // has an anchor between dense prior output (a
                         // permission alert + "allowed ..." lines) and
@@ -2584,6 +2614,7 @@ pub async fn run_interactive(
                         let (frame_w, _) = chamber_widths(&renderer);
                         let header = fit_banner_header(&upper, &raw_value, frame_w);
                         renderer.write_line(&header, c_tool())?;
+                        chamber_top_end = Some(renderer.buffer_len());
                         tool_chamber_open = true;
 
                         // Note: on-tool-start fires from HookedToolDyn now,
@@ -2647,6 +2678,8 @@ pub async fn run_interactive(
                                     &mut renderer,
                                     &mut last_tool_name,
                                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                                 )?;
                             }
                             let (resolved_name, resolved_args) = tool_calls_buf
@@ -4226,6 +4259,8 @@ pub async fn run_interactive(
                     &mut renderer,
                     &mut last_tool_name,
                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                     &text,
                     color,
                 )?;
@@ -4295,6 +4330,8 @@ pub async fn run_interactive(
                     &mut renderer,
                     &mut last_tool_name,
                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                     &label,
                     resolve_color(color, cli.no_color),
                 )?;
@@ -4485,6 +4522,8 @@ pub async fn run_interactive(
                     &mut renderer,
                     &mut last_tool_name,
                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                     "",
                     Color::White,
                 )?;
@@ -4772,6 +4811,8 @@ pub async fn run_interactive(
                             &mut renderer,
                             &mut last_tool_name,
                             &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                             &format!("[plugin {}] {}", title, question),
                             c_perm(),
                         )?;
@@ -4822,6 +4863,8 @@ pub async fn run_interactive(
                             &mut renderer,
                             &mut last_tool_name,
                             &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                             &format!("[plugin {}] pick one:", title),
                             c_perm(),
                         )?;
@@ -4903,6 +4946,8 @@ pub async fn run_interactive(
                     &mut renderer,
                     &mut last_tool_name,
                     &mut tool_chamber_open,
+                                    &mut chamber_top_start,
+                                    &mut chamber_top_end,
                     &format!("[plan] switch to {}? (y/n)", label),
                     c_perm(),
                 )?;
@@ -5110,6 +5155,8 @@ pub(crate) fn write_outside_chamber(
     renderer: &mut Renderer,
     last_tool_name: &mut Option<String>,
     tool_chamber_open: &mut bool,
+    chamber_top_start: &mut Option<usize>,
+    chamber_top_end: &mut Option<usize>,
     text: &str,
     color: Color,
 ) -> anyhow::Result<()> {
@@ -5124,7 +5171,13 @@ pub(crate) fn write_outside_chamber(
     // ANSI escapes into chat. KEEP_NEWLINE preserves intentional
     // multi-line content; `renderer.write_line` handles the
     // per-line splits + per-row caps.
-    close_tool_chamber_passive(renderer, last_tool_name, tool_chamber_open)?;
+    close_tool_chamber_passive(
+        renderer,
+        last_tool_name,
+        tool_chamber_open,
+        chamber_top_start,
+        chamber_top_end,
+    )?;
     let safe = crate::ui::ansi::strip_controls(text, crate::ui::ansi::StripPolicy::KEEP_NEWLINE);
     renderer.write_line(&safe, color)?;
     Ok(())
@@ -5169,28 +5222,32 @@ fn close_tool_chamber_passive(
     renderer: &mut Renderer,
     last_tool_name: &mut Option<String>,
     tool_chamber_open: &mut bool,
+    chamber_top_start: &mut Option<usize>,
+    chamber_top_end: &mut Option<usize>,
 ) -> anyhow::Result<()> {
     if last_tool_name.is_some() || *tool_chamber_open {
-        // Passive close fires when something else is about to paint
-        // (next ToolCall, notification, plugin dialog, etc.) and the
-        // current chamber's result hasn't arrived yet. Without a
-        // body row this would render as an empty box (just top +
-        // bottom borders adjacent) — frequent under parallel tool
-        // calls where the agent fires multiple tools before any
-        // result lands. Drop a "(superseded — result in fresh
-        // chamber below)" hint so the user knows what they're
-        // looking at instead of a mystery rectangle.
-        let (frame_w, inner) = chamber_widths(renderer);
-        renderer.write_line(
-            &chamber_row(
-                "(superseded — result in fresh chamber below)",
-                inner,
-            ),
-            theme::dim(),
-        )?;
-        renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+        // If the chamber TOP was painted but no body content
+        // followed (parallel tool-call displacement: the agent
+        // fired the next tool before any result for this one
+        // landed), DROP the chamber entirely instead of closing
+        // an empty box. The result for the displaced id will
+        // paint its own fresh chamber via the dirge-jzj path.
+        let drop_chamber = match (*chamber_top_start, *chamber_top_end) {
+            (Some(_start), Some(end)) => renderer.buffer_len() == end,
+            _ => false,
+        };
+        if drop_chamber {
+            if let Some(start) = *chamber_top_start {
+                renderer.replace_from(start, Vec::new());
+            }
+        } else {
+            let (frame_w, _inner) = chamber_widths(renderer);
+            renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
+        }
         *last_tool_name = None;
         *tool_chamber_open = false;
+        *chamber_top_start = None;
+        *chamber_top_end = None;
     }
     Ok(())
 }
@@ -5964,14 +6021,36 @@ mod tests {
         // reports).
         let mut name: Option<String> = None;
         let mut open = true;
-        write_outside_chamber(&mut renderer, &mut name, &mut open, "hello", Color::White).unwrap();
+        let mut start: Option<usize> = None;
+        let mut end: Option<usize> = None;
+        write_outside_chamber(
+            &mut renderer,
+            &mut name,
+            &mut open,
+            &mut start,
+            &mut end,
+            "hello",
+            Color::White,
+        )
+        .unwrap();
         assert!(!open, "chamber must be closed");
         assert!(name.is_none());
 
         // Name-only open (legacy signal).
         let mut name: Option<String> = Some("read".to_string());
         let mut open = false;
-        write_outside_chamber(&mut renderer, &mut name, &mut open, "hi", Color::White).unwrap();
+        let mut start: Option<usize> = None;
+        let mut end: Option<usize> = None;
+        write_outside_chamber(
+            &mut renderer,
+            &mut name,
+            &mut open,
+            &mut start,
+            &mut end,
+            "hi",
+            Color::White,
+        )
+        .unwrap();
         assert!(name.is_none());
         assert!(!open);
 
@@ -5979,7 +6058,18 @@ mod tests {
         // (idempotent close, then write).
         let mut name: Option<String> = None;
         let mut open = false;
-        write_outside_chamber(&mut renderer, &mut name, &mut open, "plain", Color::White).unwrap();
+        let mut start: Option<usize> = None;
+        let mut end: Option<usize> = None;
+        write_outside_chamber(
+            &mut renderer,
+            &mut name,
+            &mut open,
+            &mut start,
+            &mut end,
+            "plain",
+            Color::White,
+        )
+        .unwrap();
         // No assertion on state — just verifying it doesn't panic
         // / error.
     }
@@ -5992,35 +6082,79 @@ mod tests {
     /// the helper uses the passive close which only emits the
     /// chamber bottom + clears state.
     #[test]
-    fn close_passive_does_not_paint_abort_row() {
+    fn close_passive_drops_empty_chamber() {
+        // When the chamber TOP was painted but no body content
+        // followed, passive close DROPS the chamber entirely
+        // (truncates buffer back to before the TOP). No empty
+        // box on screen.
         let mut renderer = Renderer::new().expect("renderer");
-        let initial_buffer_len = renderer.buffer_len();
-        let mut name: Option<String> = None;
+        let chamber_start = renderer.buffer_len();
+        // Simulate a ToolCall painting spacer + header.
+        renderer.write_line("", Color::White).unwrap();
+        renderer.write_line("╭─ MOCK_TOOL ─────╮", Color::White).unwrap();
+        let chamber_end = renderer.buffer_len();
+        assert_eq!(chamber_end - chamber_start, 2);
+
+        let mut name: Option<String> = Some("mock".into());
         let mut open = true;
-        close_tool_chamber_passive(&mut renderer, &mut name, &mut open).unwrap();
-        let after = renderer.buffer_len();
-        // Passive close now emits TWO rows: a "(superseded …)"
-        // placeholder so empty boxes from parallel-call displacement
-        // get an explanation, then the chamber bottom. The abort
-        // variant emits two ALSO but the placeholder text differs:
-        // passive = "(superseded …)", abort = "⚠ tool denied …".
-        let body_lines = renderer.buffer_lines();
-        let appended = body_lines.iter().rev().take(2).collect::<Vec<_>>();
+        let mut start: Option<usize> = Some(chamber_start);
+        let mut end: Option<usize> = Some(chamber_end);
+        close_tool_chamber_passive(
+            &mut renderer,
+            &mut name,
+            &mut open,
+            &mut start,
+            &mut end,
+        )
+        .unwrap();
+        // Buffer is back to BEFORE the chamber TOP — the empty
+        // chamber is gone entirely.
         assert_eq!(
-            after - initial_buffer_len,
-            2,
-            "passive close should emit placeholder + bottom = 2 rows",
+            renderer.buffer_len(),
+            chamber_start,
+            "passive close on an empty chamber should drop it"
         );
-        // The placeholder row must NOT carry the abort wording.
-        let joined = format!("{:?}", appended);
-        assert!(
-            !joined.contains("tool denied"),
-            "passive close must not paint the abort warning; got {joined}",
+        assert!(!open);
+        assert!(name.is_none());
+        assert!(start.is_none());
+        assert!(end.is_none());
+    }
+
+    /// When body content WAS added (buffer_len > chamber_top_end),
+    /// passive close paints a bottom border to close the chamber
+    /// normally — does NOT truncate.
+    #[test]
+    fn close_passive_with_body_writes_bottom() {
+        let mut renderer = Renderer::new().expect("renderer");
+        let chamber_start = renderer.buffer_len();
+        renderer.write_line("", Color::White).unwrap();
+        renderer.write_line("╭─ MOCK_TOOL ─────╮", Color::White).unwrap();
+        let chamber_end = renderer.buffer_len();
+        // Add body content.
+        renderer.write_line("│ body row 1 │", Color::White).unwrap();
+        let after_body = renderer.buffer_len();
+        assert!(after_body > chamber_end);
+
+        let mut name: Option<String> = Some("mock".into());
+        let mut open = true;
+        let mut start: Option<usize> = Some(chamber_start);
+        let mut end: Option<usize> = Some(chamber_end);
+        close_tool_chamber_passive(
+            &mut renderer,
+            &mut name,
+            &mut open,
+            &mut start,
+            &mut end,
+        )
+        .unwrap();
+        // One more row (the chamber bottom) is appended — no truncation.
+        assert_eq!(
+            renderer.buffer_len(),
+            after_body + 1,
+            "passive close with body should append exactly one row (bottom)",
         );
-        assert!(
-            joined.contains("superseded"),
-            "passive close should paint the superseded placeholder; got {joined}",
-        );
+        let body_lines = renderer.buffer_lines();
+        assert!(body_lines.last().unwrap().contains('╰'));
         assert!(!open);
         assert!(name.is_none());
     }
