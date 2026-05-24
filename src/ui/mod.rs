@@ -5171,7 +5171,23 @@ fn close_tool_chamber_passive(
     tool_chamber_open: &mut bool,
 ) -> anyhow::Result<()> {
     if last_tool_name.is_some() || *tool_chamber_open {
-        let (frame_w, _inner) = chamber_widths(renderer);
+        // Passive close fires when something else is about to paint
+        // (next ToolCall, notification, plugin dialog, etc.) and the
+        // current chamber's result hasn't arrived yet. Without a
+        // body row this would render as an empty box (just top +
+        // bottom borders adjacent) — frequent under parallel tool
+        // calls where the agent fires multiple tools before any
+        // result lands. Drop a "(superseded — result in fresh
+        // chamber below)" hint so the user knows what they're
+        // looking at instead of a mystery rectangle.
+        let (frame_w, inner) = chamber_widths(renderer);
+        renderer.write_line(
+            &chamber_row(
+                "(superseded — result in fresh chamber below)",
+                inner,
+            ),
+            theme::dim(),
+        )?;
         renderer.write_line(&chamber_bottom(frame_w), theme::dim())?;
         *last_tool_name = None;
         *tool_chamber_open = false;
@@ -5983,13 +5999,27 @@ mod tests {
         let mut open = true;
         close_tool_chamber_passive(&mut renderer, &mut name, &mut open).unwrap();
         let after = renderer.buffer_len();
-        // Exactly ONE row appended (the bottom border). The abort
-        // variant would have appended TWO (centered abort row +
-        // bottom border).
+        // Passive close now emits TWO rows: a "(superseded …)"
+        // placeholder so empty boxes from parallel-call displacement
+        // get an explanation, then the chamber bottom. The abort
+        // variant emits two ALSO but the placeholder text differs:
+        // passive = "(superseded …)", abort = "⚠ tool denied …".
+        let body_lines = renderer.buffer_lines();
+        let appended = body_lines.iter().rev().take(2).collect::<Vec<_>>();
         assert_eq!(
             after - initial_buffer_len,
-            1,
-            "passive close should emit exactly one row (chamber bottom)",
+            2,
+            "passive close should emit placeholder + bottom = 2 rows",
+        );
+        // The placeholder row must NOT carry the abort wording.
+        let joined = format!("{:?}", appended);
+        assert!(
+            !joined.contains("tool denied"),
+            "passive close must not paint the abort warning; got {joined}",
+        );
+        assert!(
+            joined.contains("superseded"),
+            "passive close should paint the superseded placeholder; got {joined}",
         );
         assert!(!open);
         assert!(name.is_none());

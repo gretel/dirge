@@ -173,28 +173,53 @@ const LEFT_PANEL_TOP_PAD: u16 = 1;
 
 fn paint_idle_card(buf: &mut Buffer, area: Rect, info: &LeftPanelInfo, style: Style) {
     let dim = Style::default().fg(RColor::DarkGray);
+    let panel_w = area.width as usize;
 
-    let lines: Vec<(String, Style)> = vec![
-        ("D I R G E".to_string(), style),
-        (String::new(), dim),
-        (String::new(), dim),
-        (format!("Agent ID: {}", info.agent_id), dim),
-        (format!("Model:    {}", info.model), dim),
-        (format!("Focus:    {}", info.focus), dim),
+    // DIRGE banner centered at top. Metadata block (Agent ID /
+    // Model / Focus) below it, LEFT-aligned as a column so the
+    // labels and values line up. The block as a whole is centered
+    // horizontally so it doesn't sit flush against the left edge —
+    // the per-row labels are aligned, not the row centers.
+    let banner = "D I R G E";
+    let metadata = [
+        format!("Agent ID: {}", info.agent_id),
+        format!("Model:    {}", info.model),
+        format!("Focus:    {}", info.focus),
     ];
+    let max_meta_w = metadata
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0);
+    let meta_indent = panel_w.saturating_sub(max_meta_w) / 2;
 
-    for (i, (text, st)) in lines.iter().enumerate() {
-        let dy = LEFT_PANEL_TOP_PAD + i as u16;
+    // Row 0 (after top pad): banner centered.
+    let banner_dy = LEFT_PANEL_TOP_PAD;
+    if banner_dy < area.height {
+        let bw = banner.chars().count();
+        let bpad = panel_w.saturating_sub(bw) / 2;
+        buf.set_stringn(
+            area.x + bpad as u16,
+            area.y + banner_dy,
+            banner,
+            panel_w.saturating_sub(bpad),
+            style,
+        );
+    }
+    // Rows 1-2: blank spacer.
+    // Rows 3..: metadata block, left-aligned as a column.
+    for (i, line) in metadata.iter().enumerate() {
+        let dy = banner_dy + 3 + i as u16;
         if dy >= area.height {
             break;
         }
-        let y = area.y + dy;
-        let w = area.width as usize;
-        let tw = text.chars().count();
-        let pad = w.saturating_sub(tw) / 2;
-        if !text.is_empty() {
-            buf.set_stringn(area.x + pad as u16, y, text, w.saturating_sub(pad), *st);
-        }
+        buf.set_stringn(
+            area.x + meta_indent as u16,
+            area.y + dy,
+            line,
+            panel_w.saturating_sub(meta_indent),
+            dim,
+        );
     }
 }
 
