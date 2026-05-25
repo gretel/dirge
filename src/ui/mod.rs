@@ -10,6 +10,7 @@ pub(crate) mod picker;
 #[cfg(feature = "plugin")]
 mod plugin_tree;
 mod renderer;
+mod selection;
 mod slash;
 mod status;
 #[cfg(feature = "plugin")]
@@ -28,7 +29,7 @@ use std::collections::VecDeque;
 
 use compact_str::CompactString;
 use crossterm::event;
-use crossterm::event::{KeyCode, KeyModifiers};
+use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
 use crossterm::style::Color;
 use tokio::sync::mpsc;
 
@@ -1128,6 +1129,36 @@ pub async fn run_interactive(
                         break;
                     }
                 }
+                Ok(event::Event::Mouse(m)) => {
+                    // Wheel → scroll the output pane. Left button
+                    // down/drag/up → app-level text selection
+                    // (`ui::selection::handle`). Other buttons are
+                    // ignored. Right/middle clicks fall through with
+                    // no app action and the terminal's own handling
+                    // for them takes over (paste, menu, etc.).
+                    let ev = match m.kind {
+                        MouseEventKind::ScrollUp => Some(UserEvent::ScrollUp),
+                        MouseEventKind::ScrollDown => Some(UserEvent::ScrollDown),
+                        MouseEventKind::Down(MouseButton::Left) => Some(UserEvent::MouseDown {
+                            row: m.row,
+                            col: m.column,
+                        }),
+                        MouseEventKind::Drag(MouseButton::Left) => Some(UserEvent::MouseDrag {
+                            row: m.row,
+                            col: m.column,
+                        }),
+                        MouseEventKind::Up(MouseButton::Left) => Some(UserEvent::MouseUp {
+                            row: m.row,
+                            col: m.column,
+                        }),
+                        _ => None,
+                    };
+                    if let Some(ev) = ev {
+                        if user_tx_clone.blocking_send(ev).is_err() {
+                            break;
+                        }
+                    }
+                }
                 Ok(event::Event::Paste(text)) => {
                     if user_tx_clone.blocking_send(UserEvent::Paste(text)).is_err() {
                         break;
@@ -1285,7 +1316,51 @@ pub async fn run_interactive(
 
         tokio::select! {
             Some(ev) = user_rx.recv() => {
+                // Drain selection-relevant events (mouse drag/up,
+                // `y`, `Esc`-while-active) before the consumer's
+                // own match. Repaint + continue on hit so modal
+                // UI can't block app-level selection.
+                match crate::ui::selection::handle(&ev, &mut renderer) {
+                    crate::ui::selection::Outcome::Repaint
+                    | crate::ui::selection::Outcome::RepaintAndCopied(_) => {
+                        renderer.render_viewport()?;
+                        renderer.draw_bottom(
+                            &input,
+                            &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                            is_running,
+                        )?;
+                        continue;
+                    }
+                    crate::ui::selection::Outcome::NotHandled => {}
+                }
                 match ev {
+                    // Mouse Down/Drag/Up that selection::handle declined
+                    // (e.g. drag started outside the chat rect, or a
+                    // stray Drag/Up with no active selection) are no-ops
+                    // here — the consumer doesn't know about mouse events.
+                    UserEvent::MouseDown { .. }
+                    | UserEvent::MouseDrag { .. }
+                    | UserEvent::MouseUp { .. } => continue,
+                    UserEvent::ScrollUp => {
+                        renderer.scroll_line_up();
+                        renderer.render_viewport()?;
+                        renderer.draw_bottom(
+                            &input,
+                            &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                            is_running,
+                        )?;
+                        continue;
+                    }
+                    UserEvent::ScrollDown => {
+                        renderer.scroll_line_down();
+                        renderer.render_viewport()?;
+                        renderer.draw_bottom(
+                            &input,
+                            &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                            is_running,
+                        )?;
+                        continue;
+                    }
                     UserEvent::Paste(text) => {
                         input.handle_paste(&text);
                         renderer.draw_bottom(
@@ -3644,6 +3719,25 @@ pub async fn run_interactive(
                 let decision = loop {
                     tokio::select! {
                         Some(ev) = user_rx.recv() => {
+                            // Selection works through the alert: drag
+                            // anywhere over the chat behind, mouse-up
+                            // copies. `y` and `Esc` are reserved for
+                            // the alert's own keys when no selection
+                            // is active — selection::handle only
+                            // claims them while active.
+                            match crate::ui::selection::handle(&ev, &mut renderer) {
+                                crate::ui::selection::Outcome::Repaint
+                                | crate::ui::selection::Outcome::RepaintAndCopied(_) => {
+                                    renderer.render_viewport()?;
+                                    renderer.draw_bottom(
+                                        &input,
+                                        &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                        is_running,
+                                    )?;
+                                    continue;
+                                }
+                                crate::ui::selection::Outcome::NotHandled => {}
+                            }
                             match ev {
                                 UserEvent::Key(key) => {
                                     // Ctrl+C / Ctrl+D in the alert
@@ -4299,9 +4393,21 @@ pub async fn run_interactive(
                             is_running,
                         )?;
 
-                        // Wait for user input
+                        // Wait for user input. Selection events
+                        // (drag, mouse-up, `y`/`Esc` while active)
+                        // are handled before the question's own
+                        // key handling so the user can still copy
+                        // chat text behind the question.
                         let user_ev = user_rx.recv().await;
-                        let Some(UserEvent::Key(key)) = user_ev else {
+                        let Some(ev) = user_ev else { continue; };
+                        match crate::ui::selection::handle(&ev, &mut renderer) {
+                            crate::ui::selection::Outcome::Repaint
+                            | crate::ui::selection::Outcome::RepaintAndCopied(_) => {
+                                continue;
+                            }
+                            crate::ui::selection::Outcome::NotHandled => {}
+                        }
+                        let UserEvent::Key(key) = ev else {
                             continue;
                         };
 
@@ -4470,6 +4576,19 @@ pub async fn run_interactive(
                         let answer = loop {
                             tokio::select! {
                                 Some(ev) = user_rx.recv() => {
+                                    match crate::ui::selection::handle(&ev, &mut renderer) {
+                                        crate::ui::selection::Outcome::Repaint
+                                        | crate::ui::selection::Outcome::RepaintAndCopied(_) => {
+                                            renderer.render_viewport()?;
+                                            renderer.draw_bottom(
+                                                &input,
+                                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                                is_running,
+                                            )?;
+                                            continue;
+                                        }
+                                        crate::ui::selection::Outcome::NotHandled => {}
+                                    }
                                     if let UserEvent::Key(key) = ev {
                                         match key.code {
                                             KeyCode::Char('y') | KeyCode::Char('Y') => break true,
@@ -4527,6 +4646,19 @@ pub async fn run_interactive(
                         let answer: Option<String> = loop {
                             tokio::select! {
                                 Some(ev) = user_rx.recv() => {
+                                    match crate::ui::selection::handle(&ev, &mut renderer) {
+                                        crate::ui::selection::Outcome::Repaint
+                                        | crate::ui::selection::Outcome::RepaintAndCopied(_) => {
+                                            renderer.render_viewport()?;
+                                            renderer.draw_bottom(
+                                                &input,
+                                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                                is_running,
+                                            )?;
+                                            continue;
+                                        }
+                                        crate::ui::selection::Outcome::NotHandled => {}
+                                    }
                                     if let UserEvent::Key(key) = ev {
                                         match key.code {
                                             KeyCode::Char(c) if c.is_ascii_digit() => {
@@ -4599,9 +4731,21 @@ pub async fn run_interactive(
                 )?;
 
                 let accepted = loop {
-                    let Some(UserEvent::Key(key)) = user_rx.recv().await else {
-                        continue;
-                    };
+                    let Some(ev) = user_rx.recv().await else { continue; };
+                    match crate::ui::selection::handle(&ev, &mut renderer) {
+                        crate::ui::selection::Outcome::Repaint
+                        | crate::ui::selection::Outcome::RepaintAndCopied(_) => {
+                            renderer.render_viewport()?;
+                            renderer.draw_bottom(
+                                &input,
+                                &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
+                                is_running,
+                            )?;
+                            continue;
+                        }
+                        crate::ui::selection::Outcome::NotHandled => {}
+                    }
+                    let UserEvent::Key(key) = ev else { continue; };
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Enter => break true,
                         KeyCode::Char('n') | KeyCode::Esc => break false,
@@ -5431,7 +5575,15 @@ async fn run_shell_command(cmd: &str, sandbox: &Sandbox) -> anyhow::Result<Strin
     if exit_code != 0 {
         result.push_str(&format!("\nExit code: {}", exit_code));
     }
-    Ok(result)
+    // Strip control characters before the output reaches the
+    // chat buffer. Shell commands can emit ANSI escapes, BEL,
+    // and other terminal controls that `write_line` would pass
+    // straight to ratatui's buffer — and from there to the
+    // terminal emulator.
+    Ok(crate::ui::ansi::strip_escapes(
+        &result,
+        crate::ui::ansi::StripPolicy::KEEP_NEWLINE,
+    ))
 }
 
 #[cfg(test)]

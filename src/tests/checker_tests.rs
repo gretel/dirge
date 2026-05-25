@@ -267,6 +267,92 @@ fn relative_path_escaping_cwd_is_external() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// `/dev/null` is a harmless bit-bucket — writes discard data, reads
+/// return immediate EOF. It must be allowed for ALL tools without
+/// prompting, regardless of security mode (except Yolo which already
+/// allows everything). This test pins the post-fix contract: a write
+/// to `/dev/null` outside the CWD does NOT trigger Ask/Deny.
+#[test]
+fn dev_null_is_always_allowed_for_all_tools() {
+    let mut checker = make_checker(SecurityMode::Standard);
+    // Writes are the crucial case — read-only tools already have `**`
+    // builtin-allow. Write/edit/apply_patch only have CWD-scoped
+    // allow, so /dev/null would hit the default Ask without this fix.
+    for tool in ["write", "edit", "apply_patch", "read", "grep"] {
+        let result = checker.check_path(tool, "/dev/null");
+        assert!(
+            matches!(result, CheckResult::Allowed),
+            "{tool} /dev/null must be Allowed in Standard mode; got {result:?}",
+        );
+    }
+    // Accept mode: same contract — no prompt for /dev/null.
+    let mut checker_accept = make_checker(SecurityMode::Accept);
+    for tool in ["write", "edit", "apply_patch"] {
+        let result = checker_accept.check_path(tool, "/dev/null");
+        assert!(
+            matches!(result, CheckResult::Allowed),
+            "{tool} /dev/null must be Allowed in Accept mode; got {result:?}",
+        );
+    }
+    // Restrictive mode: same.
+    let mut checker_restr = make_checker(SecurityMode::Restrictive);
+    for tool in ["write", "edit", "apply_patch"] {
+        let result = checker_restr.check_path(tool, "/dev/null");
+        assert!(
+            matches!(result, CheckResult::Allowed),
+            "{tool} /dev/null must be Allowed in Restrictive mode; got {result:?}",
+        );
+    }
+}
+
+/// Session allowlist entries for path tools must actually take
+/// effect on the next check — user bug report that "allow always"
+/// didn't stick. This test pins that adding a session-allow entry
+/// for a path tool makes the next check_path call return Allowed.
+#[test]
+fn session_allowlist_takes_effect_for_path_tool_on_next_check() {
+    let mut checker = make_checker(SecurityMode::Standard);
+    // Use a path that's definitely outside CWD and not special.
+    let out_path = if cfg!(windows) {
+        "C:\\Windows\\Temp\\test.txt"
+    } else {
+        "/tmp/allowlist_test.txt"
+    };
+    let before = checker.check_path("write", out_path);
+    assert!(
+        matches!(before, CheckResult::Ask),
+        "baseline write to {out_path} must Ask; got {before:?}",
+    );
+
+    // Simulate "allow always" press: the UI would call
+    // suggest_pattern("write", out_path) → parent/**.
+    let pattern = if cfg!(windows) {
+        "C:\\Windows\\Temp\\**"
+    } else {
+        "/tmp/**"
+    };
+    checker.add_session_allowlist("write".to_string(), pattern);
+
+    // Now the same path must be allowed.
+    let after = checker.check_path("write", out_path);
+    assert!(
+        matches!(after, CheckResult::Allowed),
+        "after adding session allowlist entry {pattern}, write to {out_path} must be Allowed; got {after:?}",
+    );
+
+    // A nested path within the allowed subtree must also match.
+    let nested = if cfg!(windows) {
+        "C:\\Windows\\Temp\\subdir\\nested.txt"
+    } else {
+        "/tmp/subdir/nested.txt"
+    };
+    let nested_result = checker.check_path("write", nested);
+    assert!(
+        matches!(nested_result, CheckResult::Allowed),
+        "nested path {nested} must be Allowed after session allowlist {pattern}; got {nested_result:?}",
+    );
+}
+
 // --- Config-driven rules ---
 
 #[test]

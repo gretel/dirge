@@ -219,19 +219,40 @@ pub fn sanitize_output(text: &str) -> CompactString {
     while let Some(c) = chars.next() {
         if c == '\x1b' {
             // Strip ALL escape sequences, not just CSI/OSC.
-            // CSI: ESC [ ... final-byte
+            // CSI: ESC [ ... final-byte (0x40..=0x7E)
             // OSC: ESC ] ... BEL or ESC \
             // DCS/APC/PM/SOS: ESC P/X/^/_ ... ESC \
             // Single-byte: ESC + any other char (reset, etc.)
             match chars.next() {
-                Some('[') | Some(']') => {
-                    // Consume until sequence terminator. Cap at 256
-                    // bytes to prevent DoS on unterminated sequences
-                    // (tool output containing "\x1b[no-alpha-here").
+                Some('[') => {
                     let mut n = 0;
                     for next in &mut chars {
-                        if next.is_ascii_alphabetic() || next == '~' || next == '\x07' {
+                        let cp = next as u32;
+                        if (0x40..=0x7e).contains(&cp) {
                             break;
+                        }
+                        n += 1;
+                        if n >= 256 {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    let mut n = 0;
+                    loop {
+                        let next = match chars.next() {
+                            Some(c) => c,
+                            None => break,
+                        };
+                        if next == '\x07' {
+                            break;
+                        }
+                        if next == '\x1b' {
+                            let mut peek = chars.clone();
+                            if peek.next() == Some('\\') {
+                                chars = peek;
+                                break;
+                            }
                         }
                         n += 1;
                         if n >= 256 {

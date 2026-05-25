@@ -190,6 +190,14 @@ impl PermissionChecker {
         // `install_cwd_allow_rules` for the contract.
         let cwd_allow_pattern = install_cwd_allow_rules(&mut rules, &working_dir);
 
+        // /dev/null is a harmless bit-bucket — writes silently
+        // discard data, reads return immediate EOF. It must be
+        // allowed for ALL tools without prompting, regardless of
+        // security mode. Without this, every `> /dev/null` bash
+        // redirect and every `write /dev/null` call triggers an
+        // unnecessary permission dialog.
+        install_dev_null_allow(&mut rules);
+
         // Helper: append a `ToolPerm` (Simple or Granular) onto a
         // tool's rule vec. Used by both the legacy per-tool fields and
         // the M2 `tools` map. The legacy fields are syntactic sugar
@@ -861,6 +869,35 @@ fn install_cwd_allow_rules(
             .push((pattern_for_tool(tool, &cwd_glob), Action::Allow));
     }
     Some(cwd_glob)
+}
+
+/// Install a builtin-allow for `/dev/null` on every tool so the
+/// harmless bit-bucket never triggers a permission prompt. Writes
+/// to `/dev/null` discard data; reads return immediate EOF — no
+/// side effects, no security risk, no reason to ask.
+fn install_dev_null_allow(rules: &mut HashMap<String, Vec<(Pattern, Action)>>) {
+    for tool in [
+        "read",
+        "write",
+        "edit",
+        "apply_patch",
+        "glob",
+        "grep",
+        "find_files",
+        "list_dir",
+        "list_symbols",
+        "find_definition",
+        "find_callers",
+        "find_callees",
+        "get_symbol_body",
+        "repo_overview",
+        "lsp",
+    ] {
+        rules
+            .entry(tool.to_string())
+            .or_default()
+            .push((pattern_for_tool(tool, "/dev/null"), Action::Allow));
+    }
 }
 
 pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {

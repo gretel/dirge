@@ -261,7 +261,18 @@ impl Tool for BashTool {
     }
 
     async fn call(&self, args: BashArgs) -> Result<String, ToolError> {
-        check_bash_segments(&self.permission, &self.ask_tx, &args.command).await?;
+        // Strip control characters from the command string before
+        // it reaches bash. The LLM can embed raw escape sequences
+        // and C0 controls in tool arguments; a bare BEL or ESC in
+        // a `bash -c` argument would be interpreted by the shell
+        // (or passed through to child processes that write to
+        // /dev/tty, bypassing our pipe capture). Keep \n (multi-
+        // line scripts via `-c`) and \t (indentation).
+        let command = crate::ui::ansi::strip_escapes(
+            &args.command,
+            crate::ui::ansi::StripPolicy::KEEP_BOTH,
+        );
+        check_bash_segments(&self.permission, &self.ask_tx, &command).await?;
 
         // F6: spawn into its own process group so a timeout can
         // SIGKILL the entire subprocess tree, not just the
@@ -275,7 +286,7 @@ impl Tool for BashTool {
         if secs == 0 {
             return Err(ToolError::Msg("timeout must be > 0".to_string()));
         }
-        let output = run_with_timeout(self.sandbox.wrap_command(&args.command), secs).await?;
+        let output = run_with_timeout(self.sandbox.wrap_command(&command), secs).await?;
 
         // F12: `merged` already contains stdout + stderr in arrival
         // order. Previously we concatenated stdout then stderr,

@@ -76,6 +76,13 @@ impl StripPolicy {
 /// filtered, avoiding the `chars().filter().collect()` allocation
 /// for the common case (most MCP log lines / chat tokens have no
 /// control bytes to strip).
+///
+/// NOTE: this drops individual control bytes but does NOT consume
+/// the printable payload of escape sequences. `"\x1b]0;EVIL\x07"`
+/// becomes `"]0;EVIL"` (the non-control chars between ESC and BEL
+/// survive). For text that may contain attacker-crafted escape
+/// sequences, use [`strip_escapes`] instead — it consumes the
+/// entire sequence including the payload.
 pub fn strip_controls(s: &str, policy: StripPolicy) -> String {
     if s.chars().all(|c| keep_char(c, policy)) {
         return s.to_string();
@@ -98,6 +105,97 @@ pub fn strip_controls_compact(s: &str, policy: StripPolicy) -> CompactString {
         }
     }
     CompactString::from(out)
+}
+
+/// Strip full ANSI escape sequences AND control characters.
+///
+/// Unlike [`strip_controls`], which drops individual control bytes
+/// but leaves the printable payload of escape sequences intact,
+/// this function consumes the ENTIRE sequence:
+///   - CSI: `ESC [...final-byte`  (consumed until alphabetic, `~`, or BEL)
+///   - OSC: `ESC ]...BEL` or `ESC ]...ESC \`  (consumed until terminator)
+///   - DCS/APC/PM/SOS: `ESC P/X/^/_...ESC \`  (consumed until ST)
+///   - Single-byte ESC: the byte after ESC is consumed
+///   - C0 controls (U+0000..U+001F), DEL (U+007F), C1 (U+0080..U+009F)
+///
+/// Caps sequence length at 256 bytes (CSI/OSC) or 4096 bytes (DCS)
+/// to prevent DoS on unterminated sequences. `\n` and `\t` are
+/// preserved or stripped per `policy`.
+///
+/// Use this for text from untrusted producers (LLM output, bash
+/// results) that may carry attacker-crafted escape sequences.
+pub fn strip_escapes(s: &str, policy: StripPolicy) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.next() {
+                Some('[') => {
+                    // CSI: ESC [...final-byte  (final byte in 0x40..=0x7E)
+                    let mut n = 0;
+                    for next in &mut chars {
+                        let cp = next as u32;
+                        if (0x40..=0x7e).contains(&cp) {
+                            break;
+                        }
+                        n += 1;
+                        if n >= 256 {
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    // OSC: ESC ]...BEL or ESC ]...ESC \
+                    let mut n = 0;
+                    loop {
+                        let next = match chars.next() {
+                            Some(c) => c,
+                            None => break,
+                        };
+                        if next == '\x07' {
+                            break;
+                        }
+                        if next == '\x1b' {
+                            // ST terminator: ESC \ — peek the next
+                            // char without consuming it if it's not
+                            // a backslash.
+                            let mut peek = chars.clone();
+                            if peek.next() == Some('\\') {
+                                chars = peek;
+                                break;
+                            }
+                            // Not ST — ESC inside payload; continue.
+                        }
+                        n += 1;
+                        if n >= 256 {
+                            break;
+                        }
+                    }
+                }
+                Some('P') | Some('X') | Some('^') | Some('_') => {
+                    let mut prev = '\0';
+                    let mut n = 0;
+                    for next in &mut chars {
+                        if prev == '\x1b' && next == '\\' {
+                            break;
+                        }
+                        prev = next;
+                        n += 1;
+                        if n >= 4096 {
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {} // Single-byte ESC — skip the second char.
+                None => break,
+            }
+        } else if !keep_char(c, policy) {
+            continue;
+        } else {
+            result.push(c);
+        }
+    }
+    result
 }
 
 /// Strip ANSI CSI escape sequences (`\x1b[…m` and friends) from `s`,
@@ -257,5 +355,63 @@ mod tests {
         ] {
             assert_eq!(strip_controls(s, policy), s);
         }
+    }
+
+    // --- strip_escapes tests ---
+
+    #[test]
+    fn strip_escapes_strips_osc_sequence_with_payload() {
+        // OSC title-set: the "EVIL" payload must be stripped too,
+        // not just the ESC and BEL bytes.
+        let s = "hello\x1b]0;EVIL\x07world";
+        let out = strip_escapes(s, StripPolicy::STRICT);
+        assert_eq!(out, "helloworld");
+    }
+
+    #[test]
+    fn strip_escapes_strips_csi_sequence() {
+        let s = "before\x1b[2Jafter";
+        let out = strip_escapes(s, StripPolicy::STRICT);
+        assert_eq!(out, "beforeafter");
+    }
+
+    #[test]
+    fn strip_escapes_strips_sgr_sequence() {
+        let s = "\x1b[31mred\x1b[0m";
+        let out = strip_escapes(s, StripPolicy::STRICT);
+        assert_eq!(out, "red");
+    }
+
+    #[test]
+    fn strip_escapes_strips_dcs_sequence() {
+        let s = "start\x1bP0;data\x1b\\end";
+        let out = strip_escapes(s, StripPolicy::STRICT);
+        assert_eq!(out, "startend");
+    }
+
+    #[test]
+    fn strip_escapes_preserves_newline_and_tab_with_keep_both() {
+        let s = "line1\n\tindented\x07line2\x1b[31mstyled";
+        let out = strip_escapes(s, StripPolicy::KEEP_BOTH);
+        assert_eq!(out, "line1\n\tindentedline2styled");
+    }
+
+    #[test]
+    fn strip_escapes_handles_truncated_csi() {
+        // Unterminated CSI — cap at 256 bytes.
+        let s = "ab\x1b[9999999999";
+        let out = strip_escapes(s, StripPolicy::STRICT);
+        assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn strip_escapes_handles_esc_inside_osc_not_st() {
+        // ESC inside OSC payload that is NOT followed by \ (not ST)
+        // must NOT consume the non-backslash char — the ESC is part
+        // of the OSC payload, not a terminator. The real terminator
+        // is BEL further in.
+        let s = "a\x1b]0;payload\x1b[2J\x07b";
+        let out = strip_escapes(s, StripPolicy::STRICT);
+        assert_eq!(out, "ab");
     }
 }
