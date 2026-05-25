@@ -1828,6 +1828,26 @@ pub async fn handle_slash(
             }
         }
         _ => {
+            // If `slash_command_names()` advertised this command
+            // but no match arm above caught it, the lists drifted
+            // (added to the canonical list without wiring up the
+            // dispatch). Emit a loud error here rather than falling
+            // through to plugin lookup / "unknown command", so the
+            // mistake is obvious in dev/test rather than silently
+            // shadowed by either path. Plugin commands by
+            // convention don't have a leading `/` in the canonical
+            // list, so this won't false-fire on them.
+            if is_known_slash_command(parts[0]) {
+                renderer.write_line(
+                    &format!(
+                        "internal error: {} is listed in slash_command_names() but has no dispatch arm in handle_slash — wire it up or remove from the list",
+                        parts[0]
+                    ),
+                    c_error(),
+                )?;
+                return Ok(());
+            }
+
             // Fall through to plugin-registered commands. The process-global
             // PluginManager is the same one HookedToolDyn uses, so we don't
             // need to thread an Arc through handle_slash's already long
@@ -1897,15 +1917,23 @@ pub fn try_complete(buffer: &str, cursor: usize) -> Option<CompletionResult> {
         return None;
     }
 
-    // Find the current word under cursor.
-    let word_start = buffer[..cursor.min(buffer.len())]
-        .rfind(' ')
-        .map(|p| p + 1)
-        .unwrap_or(0);
-    let current_word = &buffer[word_start..cursor.min(buffer.len())];
+    let cursor = cursor.min(buffer.len());
+    // Find the bounds of the FIRST word in the buffer (the command
+    // name). Previously the replacement range was
+    // `[word_start..cursor]`, which corrupted the buffer when the
+    // cursor sat mid-word: e.g. Tab with cursor at byte 2 of `/mod`
+    // produced `/mcpod` (replacement appended to the tail after the
+    // cursor). Anchor the replacement to the whole word boundary
+    // instead — the cursor can land anywhere inside the command and
+    // the result is still well-formed.
+    let word_start = 0usize;
+    let word_end = buffer.find(char::is_whitespace).unwrap_or(buffer.len());
+    let current_word = &buffer[word_start..word_end];
 
-    // Only complete the first word (the command name).
-    if word_start != 0 || current_word.contains(' ') {
+    // Only complete when the cursor is inside (or just after) the
+    // first word. Cursor past the first whitespace means the user is
+    // typing args, not a command name.
+    if cursor > word_end {
         return None;
     }
 
@@ -1942,10 +1970,13 @@ pub fn try_complete(buffer: &str, cursor: usize) -> Option<CompletionResult> {
         let all_idx = all_commands.iter().position(|c| *c == cmd).unwrap_or(0);
         (cmd, all_idx)
     };
-    let mut new_buffer = replacement.to_string();
-    if cursor < buffer.len() {
-        new_buffer.push_str(&buffer[cursor..]);
-    }
+    // Build the new buffer: prefix (everything before the word —
+    // always empty here since word_start==0) + replacement + tail
+    // (everything from word_end onward). Cursor lands at the end of
+    // the replacement so the user can immediately type args.
+    let mut new_buffer = String::with_capacity(replacement.len() + buffer.len() - word_end);
+    new_buffer.push_str(replacement);
+    new_buffer.push_str(&buffer[word_end..]);
     let new_cursor = replacement.len();
     Some(CompletionResult {
         new_buffer,
@@ -1955,9 +1986,22 @@ pub fn try_complete(buffer: &str, cursor: usize) -> Option<CompletionResult> {
     })
 }
 
-/// Returns all built-in slash commands (with leading `/`), sorted alphabetically.
-#[cfg(feature = "experimental-ui-tab-slash")]
-pub fn builtin_commands() -> Vec<&'static str> {
+/// Canonical list of built-in slash commands. **Single source of
+/// truth** consulted by:
+///   * `builtin_commands()`     — tab completion (feature-gated)
+///   * `is_known_slash_command` — handle_slash's "internal error"
+///     vs "unknown command" branching in the default arm
+///
+/// **When you add a new slash command to `handle_slash`'s match
+/// arms, add it here too.** A drift in the other direction (listed
+/// here but no match arm in `handle_slash`) surfaces at runtime as
+/// an explicit `internal error: known command X reached default
+/// arm` so the mistake is loud rather than silent.
+///
+/// Always-compiled (not feature-gated) because `handle_slash`'s
+/// default arm consults it regardless of the tab-completion
+/// feature.
+pub fn slash_command_names() -> Vec<&'static str> {
     let mut cmds = vec![
         "/allow",
         "/btw",
@@ -1994,6 +2038,21 @@ pub fn builtin_commands() -> Vec<&'static str> {
     cmds.push("/loop");
     cmds.sort_unstable();
     cmds
+}
+
+/// Returns true if `name` (with leading `/`) is a built-in slash
+/// command. Used by `handle_slash`'s default arm to distinguish
+/// "command name we should have dispatched but didn't" (internal
+/// error) from "command name we don't know about" (plugin fallback /
+/// unknown).
+pub fn is_known_slash_command(name: &str) -> bool {
+    slash_command_names().iter().any(|c| *c == name)
+}
+
+/// Returns all built-in slash commands (with leading `/`), sorted alphabetically.
+#[cfg(feature = "experimental-ui-tab-slash")]
+pub fn builtin_commands() -> Vec<&'static str> {
+    slash_command_names()
 }
 
 /// Format a completion preview string showing upcoming commands.
@@ -2205,5 +2264,172 @@ mod tests {
             !upcoming.is_empty(),
             "should have commands after the current one"
         );
+    }
+
+    // ============================================================
+    // Code-review B1 fix: cursor mid-word produces well-formed
+    // buffer
+    // ============================================================
+
+    /// Regression: cursor sitting at byte 2 of `/mod` previously
+    /// produced `/mcpod` (replacement appended to the tail AFTER
+    /// the cursor, with `od` left over from the original word).
+    /// The fix anchors replacement to the whole-word boundary
+    /// instead, so cursor position inside the command name doesn't
+    /// corrupt the buffer — the result is exactly one of the
+    /// matching commands, no Frankenstein.
+    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[test]
+    fn complete_with_cursor_mid_word_produces_clean_buffer() {
+        // /mod, cursor at the `o` (byte 2). The new buffer must be
+        // exactly a candidate command — not the candidate +
+        // residual `od` from the source.
+        let r = try_complete("/mod", 2).unwrap();
+        let candidates = builtin_commands()
+            .into_iter()
+            .filter(|c| c.starts_with("/mod"))
+            .collect::<Vec<_>>();
+        assert!(
+            candidates.contains(&r.new_buffer.as_str()),
+            "{:?} must be one of the /mod* commands {:?} — no Frankenstein concatenation",
+            r.new_buffer,
+            candidates,
+        );
+        assert_eq!(
+            r.new_cursor,
+            r.new_buffer.len(),
+            "cursor should land at end of replacement",
+        );
+    }
+
+    /// Cursor at byte 0 (Home before Tab) used to produce
+    /// `/allow/mod` because the entire buffer was concatenated as
+    /// the tail. Verify it now produces a clean replacement —
+    /// exactly one of the matching commands, no residual `/mod`.
+    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[test]
+    fn complete_with_cursor_at_start_produces_clean_buffer() {
+        let r = try_complete("/mod", 0).unwrap();
+        let candidates = builtin_commands()
+            .into_iter()
+            .filter(|c| c.starts_with("/mod"))
+            .collect::<Vec<_>>();
+        assert!(
+            candidates.contains(&r.new_buffer.as_str()),
+            "{:?} must be a /mod* command (clean replacement, no /mod residual): candidates {:?}",
+            r.new_buffer,
+            candidates,
+        );
+    }
+
+    /// Tab on a command with trailing args (e.g. `/mode standard`
+    /// with cursor after `/mode`) preserves the args tail.
+    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[test]
+    fn complete_preserves_trailing_args() {
+        let r = try_complete("/mod standard", 4).unwrap();
+        assert!(
+            r.new_buffer.ends_with(" standard"),
+            "args after the command should be preserved: {:?}",
+            r.new_buffer
+        );
+    }
+
+    /// Cursor past the first whitespace means the user is typing
+    /// args, not a command name — no completion should fire.
+    #[cfg(feature = "experimental-ui-tab-slash")]
+    #[test]
+    fn no_completion_when_cursor_in_args() {
+        // Cursor inside the args portion of "/mode standard".
+        let buf = "/mode standard";
+        let cursor = buf.len(); // past the space
+        assert!(try_complete(buf, cursor).is_none());
+    }
+
+    // ============================================================
+    // Code-review B2 fix: canonical command list + drift guard
+    // ============================================================
+
+    /// `is_known_slash_command` must agree with `slash_command_names`
+    /// since the helper just iterates the list. Catches a future
+    /// refactor that decouples them (e.g. someone introducing a
+    /// second hardcoded match).
+    #[test]
+    fn is_known_slash_command_agrees_with_canonical_list() {
+        for name in slash_command_names() {
+            assert!(
+                is_known_slash_command(name),
+                "{name} is in slash_command_names() but is_known_slash_command rejects it",
+            );
+        }
+        // Spot-check negatives.
+        assert!(!is_known_slash_command("/not-a-real-command"));
+        assert!(!is_known_slash_command(""));
+        assert!(!is_known_slash_command("/"));
+    }
+
+    /// The canonical list is sorted (tab completion preview relies
+    /// on stable ordering for the cycle direction).
+    #[test]
+    fn slash_command_names_is_sorted() {
+        let cmds = slash_command_names();
+        for pair in cmds.windows(2) {
+            assert!(
+                pair[0] <= pair[1],
+                "{} should sort before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+    }
+
+    /// Pin that the canonical list and `handle_slash`'s actual
+    /// match arms agree on the always-on commands. If a name in
+    /// the list above is missing from the dispatch tree the user
+    /// would hit the new "internal error" arm at runtime; this
+    /// duplicates the check in plain test code so a future
+    /// maintainer sees the gap before users do.
+    ///
+    /// This DOES NOT enforce the reverse direction (arm present in
+    /// `handle_slash` but missing from `slash_command_names`) — that
+    /// would require parsing source. We accept it as the lesser
+    /// drift: the only user-visible cost is that the missing
+    /// command isn't tab-completable.
+    #[test]
+    fn always_on_commands_appear_in_canonical_list() {
+        // Subset that is unconditionally compiled (no cfg) and
+        // therefore must always be present. Cross-checked by hand
+        // against the `match parts[0]` arms in `handle_slash`.
+        const ALWAYS_ON: &[&str] = &[
+            "/allow",
+            "/btw",
+            "/cd",
+            "/clear",
+            "/clone",
+            "/compact",
+            "/compress",
+            "/fork",
+            "/help",
+            "/mode",
+            "/model",
+            "/panel",
+            "/prompt",
+            "/quit",
+            "/reasoning",
+            "/regen-prompts",
+            "/retry",
+            "/sessions",
+            "/tasks",
+            "/toggle",
+            "/tree",
+            "/undo",
+        ];
+        let list = slash_command_names();
+        for name in ALWAYS_ON {
+            assert!(
+                list.contains(name),
+                "{name} must appear in slash_command_names() — it's an always-on dispatch arm in handle_slash",
+            );
+        }
     }
 }

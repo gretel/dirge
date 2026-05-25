@@ -1104,7 +1104,15 @@ impl InputEditor {
             KeyCode::Tab => {
                 #[cfg(feature = "experimental-ui-tab-slash")]
                 {
-                    if self.buffer.starts_with('/')
+                    // Don't grab Tab while the `@`-file-picker is
+                    // active — that path has its own keystroke
+                    // handling. The buffer wouldn't start with `/`
+                    // in practice, but guard explicitly so future
+                    // changes can't accidentally race the picker —
+                    // mirrors the Enter / Ctrl+J guards above.
+                    let picker_active = self.picker.as_ref().is_some_and(|p| p.active);
+                    if !picker_active
+                        && self.buffer.starts_with('/')
                         && let Some(cr) = try_complete(&self.buffer, self.cursor)
                     {
                         self.buffer = cr.new_buffer.clone().into();
