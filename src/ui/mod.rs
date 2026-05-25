@@ -3577,18 +3577,44 @@ pub async fn run_interactive(
                     let safe_input = sanitize_output(&ask_req.input);
                     // Spacer rows are empty strings — the widget
                     // wraps + paints them as a blank row each,
-                    // giving the alert visual breathing room
-                    // between sections. Action keys use theme::perm
-                    // (amber/yellow) so the whole alert reads in
-                    // one cautionary color. The args line uses an
-                    // explicit `\x1F` (Unit Separator) sentinel as
-                    // the hanging-indent boundary so wrapped
-                    // continuations align under the value, not at
-                    // column 0. paint_overlay_box reads the
-                    // sentinel and uses a 6-space wrap indent for
-                    // that line.
+                    // effectively adding breathing room above / below
+                    // the prompt text.
                     let mut overlay: Vec<(String, Color)> = Vec::new();
                     overlay.push(("⚠ PERMISSION REQUIRED".to_string(), theme::perm()));
+                    overlay.push((String::new(), theme::perm()));
+                    overlay.push((format!("tool: {}", safe_tool), theme::perm()));
+
+                    // Show path context for file-operating tools
+                    // instead of the generic "args:" label.
+                    let arg_label = match ask_req.tool.as_str() {
+                        "read" | "write" | "edit" | "list_dir"
+                        | "apply_patch" | "find_files" | "glob"
+                        | "list_symbols" | "get_symbol_body"
+                        | "find_definition" | "find_callers" | "find_callees" => {
+                            let cwd = session.working_dir.as_str();
+                            let path_hint = if !cwd.is_empty() {
+                                let abs = crate::permission::checker::resolve_absolute(
+                                    &ask_req.input, cwd,
+                                );
+                                if abs.starts_with(cwd) {
+                                    " (inside project)"
+                                } else {
+                                    " (outside project)"
+                                }
+                            } else {
+                                ""
+                            };
+                            format!("path: {}{}", safe_input, path_hint)
+                        }
+                        "bash" => format!("command: {}", safe_input),
+                        "task" | "task_status" => format!("task: {}", safe_input),
+                        "webfetch" | "websearch" => format!("url: {}", safe_input),
+                        _ if ask_req.tool.starts_with("mcp_tool") => {
+                            format!("mcp: {}", safe_input)
+                        }
+                        _ => format!("args: {}", safe_input),
+                    };
+                    overlay.push((arg_label, theme::perm()));
                     overlay.push((String::new(), theme::perm()));
                     overlay.push((format!("tool: {}", safe_tool), theme::perm()));
                     overlay.push((format!("args: {}", safe_input), theme::perm()));
@@ -4753,8 +4779,39 @@ fn suggest_pattern(tool: &str, input: &str) -> String {
                 PLACEHOLDER.to_string()
             }
         }
-        // Other unknown tools (semantic, plugin) — return
-        // placeholder so the user explicitly edits before allowing.
+        // Other path-shaped tools: derive parent-dir wildcards.
+        "apply_patch" => {
+            let path = std::path::Path::new(trimmed);
+            let parent = path
+                .parent()
+                .map(|p| p.to_string_lossy())
+                .unwrap_or(std::borrow::Cow::Borrowed(""));
+            if parent.is_empty() {
+                "**".to_string()
+            } else {
+                format!("{}/**", parent)
+            }
+        }
+        // Semantic tools — file-path-shaped arguments.
+        "list_symbols" | "get_symbol_body" | "find_definition" | "find_callers"
+        | "find_callees" => {
+            let path = std::path::Path::new(trimmed);
+            let parent = path
+                .parent()
+                .map(|p| p.to_string_lossy())
+                .unwrap_or(std::borrow::Cow::Borrowed("."));
+            format!("{}/**", parent)
+        }
+        // Network tools — broad wildcard.
+        "webfetch" => "webfetch:*".to_string(),
+        "websearch" => "websearch:*".to_string(),
+        // Task / question / introspection tools — allow them entirely.
+        "task" | "task_status" | "question" => "**".to_string(),
+        "glob" | "repo_overview" | "skill" | "memory" | "write_todo_list" | "lsp" => {
+            "**".to_string()
+        }
+        // Plugin tools — allow by tool name prefix, default to **.
+        _ if tool.starts_with("mcp_tool") => PLACEHOLDER.to_string(),
         _ => PLACEHOLDER.to_string(),
     }
 }

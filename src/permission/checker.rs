@@ -84,6 +84,8 @@ pub(crate) fn is_path_tool_name(tool: &str) -> bool {
             // Semantic tools whose primary arg is a file path.
             | "list_symbols"
             | "get_symbol_body"
+            | "find_definition"
+            | "find_callers"
             | "find_callees"
             // #1 fix: repo_overview's arg is a directory path; user
             // rules like `"/etc/**": "deny"` need path-glob semantics
@@ -494,11 +496,17 @@ impl PermissionChecker {
             return CheckResult::Allowed;
         }
 
-        if self.is_session_allowed(tool, path) {
+        // Resolve BEFORE the allowlist check so we can test both the
+        // raw path and the absolute form. Without this, a user who
+        // granted AllowAlways for a relative path (e.g. src/main.rs)
+        // gets re-prompted when the LLM sends an absolute path for
+        // the same file.
+        let abs_path = resolve_absolute(path, &self.working_dir);
+
+        if self.is_session_allowed(tool, path) || self.is_session_allowed(tool, &abs_path) {
             return CheckResult::Allowed;
         }
 
-        let abs_path = resolve_absolute(path, &self.working_dir);
         let mut matched: Vec<(Action, String)> = Vec::new();
         if let Some(rules) = self.rules.get(tool) {
             for (pattern, action) in rules {
@@ -855,7 +863,7 @@ fn install_cwd_allow_rules(
     Some(cwd_glob)
 }
 
-fn resolve_absolute(path: &str, working_dir: &str) -> String {
+pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {
     let p = Path::new(path);
     let joined = if p.is_absolute() {
         p.to_path_buf()
