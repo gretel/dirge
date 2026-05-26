@@ -511,7 +511,7 @@ impl AnyAgent {
         // event channel collecting text.
         let runner = self
             .clone()
-            .spawn_runner(effective_prompt.clone(), Vec::new());
+            .spawn_runner(effective_prompt.clone(), Vec::new(), None);
         let task = runner.task;
         let mut event_rx = runner.event_rx;
 
@@ -651,7 +651,12 @@ impl AnyAgent {
         }
     }
 
-    pub fn spawn_runner(self, prompt: String, history: Vec<Message>) -> AgentRunner {
+    pub fn spawn_runner(
+        self,
+        prompt: String,
+        history: Vec<Message>,
+        steering_queue: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>>,
+    ) -> AgentRunner {
         use crate::agent::agent_loop::{
             LoopSpawnConfig, loop_tool_to_rig_definition, retrying_stream_fn,
             rig_history_system_prompt, rig_history_to_loop_messages, spawn_loop_runner,
@@ -703,16 +708,11 @@ impl AnyAgent {
         } else {
             Some(self.model_name.clone())
         };
+        cfg.steering_queue = steering_queue;
         #[cfg(feature = "plugin")]
         {
             cfg.plugin_mgr = crate::plugin::hook::global();
         }
-        // steering_queue stays None for h-6 — UI's existing
-        // interjection_queue isn't shared yet. interject_tx →
-        // signal.cancel() handles the legacy "stop the run"
-        // case via the LoopRunner::into_agent_runner adapter.
-        // A follow-up UI commit will share the queue so the
-        // model observes interjections mid-run.
 
         let loop_runner = spawn_loop_runner(cfg);
         loop_runner.into_agent_runner()

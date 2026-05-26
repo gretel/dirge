@@ -34,6 +34,10 @@ Hermes has four layers that work together. We port all of them, adapted:
 └─────────────────────────────────────────────────┘
 ```
 
+VERY IMPORTANT: when making a plan you MUST examine current features such as compression and memory,
+and make sure they are consolidated with the plan, do not create dead code or duplicated functionality,
+old functionality must be either integrated or replaced
+
 ### Per-Project Storage Layout
 
 ```

@@ -197,7 +197,7 @@ async fn run_prompt(
     )
     .await;
 
-    let runner = agent.spawn_runner(prompt_text.to_string(), vec![]);
+    let runner = agent.spawn_runner(prompt_text.to_string(), vec![], None);
     let mut rx = runner.event_rx;
 
     // F5: correlate rig tool-call ids with ACP ids so parallel
