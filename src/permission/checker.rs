@@ -473,7 +473,7 @@ impl PermissionChecker {
         // dialogs for non-existent files.  Absolute paths and
         // relative paths with directory components or file
         // extensions pass through to the normal check.
-        if let Err(reason) = path::validate_write_path(path) {
+        if let Err(reason) = path::validate_path(path) {
             return CheckResult::Denied(reason);
         }
 
@@ -606,10 +606,31 @@ impl PermissionChecker {
 
     pub fn add_session_allowlist(&mut self, tool: String, pattern_str: &str) {
         allowlist::add(&mut self.session_allowlist, &tool, pattern_str);
+        // F2 write↔edit↔apply_patch aliasing: when the user "always
+        // allows" any of these three, also register the pattern under
+        // the other two so the alias check in enforce() doesn't
+        // re-prompt. Without this, a user who "always allows" write
+        // gets asked again on the next write because the edit-alias
+        // check returns Ask with no allowlist match.
+        match tool.as_str() {
+            "write" | "apply_patch" => {
+                allowlist::add(&mut self.session_allowlist, "edit", pattern_str);
+            }
+            "edit" => {
+                allowlist::add(&mut self.session_allowlist, "write", pattern_str);
+                allowlist::add(&mut self.session_allowlist, "apply_patch", pattern_str);
+            }
+            _ => {}
+        }
     }
 
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
-        allowlist::load(&mut self.session_allowlist, entries);
+        // Route through add_session_allowlist (not allowlist::add
+        // directly) so the write↔edit alias mirroring fires for
+        // persisted sessions too.
+        for (tool, pat) in entries {
+            self.add_session_allowlist(tool.clone(), pat);
+        }
     }
 
     pub fn allowlist_entries(&self) -> Vec<(String, String)> {
@@ -1457,6 +1478,98 @@ mod tests {
             matches!(nested, CheckResult::Ask),
             "/probe/src/* must not match nested path; got {:?}",
             nested
+        );
+    }
+
+    /// F2 write↔edit aliasing: when a user "always allows" a write
+    /// path, the alias check against "edit" must also match so the
+    /// most-restrictive merge doesn't re-prompt on every subsequent
+    /// call. Without this, `enforce()` sees Allowed from write rules
+    /// but Ask from edit (no session-allowlist entry), and the
+    /// combined result is Ask — infinite re-prompt loop.
+    #[test]
+    fn add_session_allowlist_mirrors_write_to_edit() {
+        let mut cfg = PermissionConfig::default();
+        cfg.default = Some(Action::Ask);
+        let mut checker = PermissionChecker::new(
+            &cfg,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/cwd-off-test-axis")),
+        );
+        checker.add_session_allowlist("write".to_string(), "/probe/src/**");
+
+        // The write tool itself hits the allowlist.
+        assert!(matches!(
+            checker.check_path("write", "/probe/src/main.rs"),
+            CheckResult::Allowed
+        ));
+        // The edit alias MUST also match — this is what enforce() checks.
+        assert!(matches!(
+            checker.check_path("edit", "/probe/src/main.rs"),
+            CheckResult::Allowed,
+        ),
+            "edit alias must reflect write session-allowlist entry"
+        );
+
+        // Reverse direction: "always allow" edit → write must match.
+        let mut checker2 = PermissionChecker::new(
+            &cfg,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/cwd-off-test-axis")),
+        );
+        checker2.add_session_allowlist("edit".to_string(), "/probe/src/**");
+        assert!(matches!(
+            checker2.check_path("write", "/probe/src/main.rs"),
+            CheckResult::Allowed,
+        ),
+            "write must reflect edit session-allowlist entry"
+        );
+        assert!(matches!(
+            checker2.check_path("apply_patch", "/probe/src/main.rs"),
+            CheckResult::Allowed,
+        ),
+            "apply_patch must reflect edit session-allowlist entry"
+        );
+
+        // apply_patch → edit mirroring too.
+        let mut checker3 = PermissionChecker::new(
+            &cfg,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/cwd-off-test-axis")),
+        );
+        checker3.add_session_allowlist("apply_patch".to_string(), "/probe/src/**");
+        assert!(matches!(
+            checker3.check_path("edit", "/probe/src/main.rs"),
+            CheckResult::Allowed,
+        ),
+            "edit must reflect apply_patch session-allowlist entry"
+        );
+
+        // Via load_session_allowlist too (persisted-session path).
+        let mut checker4 = PermissionChecker::new(
+            &cfg,
+            SecurityMode::Standard,
+            Some(std::path::PathBuf::from("/cwd-off-test-axis")),
+        );
+        checker4.load_session_allowlist(&[("write".to_string(), "/probe/src/**".to_string())]);
+        assert!(matches!(
+            checker4.check_path("edit", "/probe/src/main.rs"),
+            CheckResult::Allowed,
+        ),
+            "load_session_allowlist must also mirror write→edit"
+        );
+
+        // Non-aliased tools are unaffected.
+        let mut checker5 = fresh_checker();
+        checker5.add_session_allowlist("read".to_string(), "/tmp/**");
+        assert!(matches!(
+            checker5.check_path("read", "/tmp/foo.txt"),
+            CheckResult::Allowed,
+        ));
+        // read doesn't alias to write/edit.
+        assert!(
+            !checker5.is_session_allowed("write", "/tmp/foo.txt"),
+            "read allowlist entry must not leak to write"
         );
     }
 

@@ -25,12 +25,6 @@ pub(crate) fn add(allowlist: &mut Vec<(String, Pattern)>, tool: &str, pattern_st
     allowlist.push((tool.to_string(), pattern));
 }
 
-pub(crate) fn load(allowlist: &mut Vec<(String, Pattern)>, entries: &[(String, String)]) {
-    for (tool, pat) in entries {
-        add(allowlist, tool, pat);
-    }
-}
-
 pub(crate) fn entries(allowlist: &[(String, Pattern)]) -> Vec<(String, String)> {
     allowlist
         .iter()
@@ -88,19 +82,6 @@ mod tests {
         add(&mut al, "bash", "git *");
         let e = entries(&al);
         assert_eq!(e.len(), 2, "got: {:?}", e);
-    }
-
-    #[test]
-    fn load_dedupes_against_existing() {
-        let mut al = Vec::new();
-        let entries_in = vec![
-            ("bash".to_string(), "cargo *".to_string()),
-            ("bash".to_string(), "cargo *".to_string()),
-        ];
-        load(&mut al, &entries_in);
-        assert_eq!(entries(&al).len(), 1);
-        load(&mut al, &entries_in);
-        assert_eq!(entries(&al).len(), 1);
     }
 
     #[test]

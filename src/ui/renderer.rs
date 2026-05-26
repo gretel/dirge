@@ -10,8 +10,6 @@ use crossterm::terminal::{Clear, ClearType};
 // streaming + viewport paint no longer touches stdout directly —
 // that's all routed through `tui_redraw` (ratatui).
 
-use super::resolve_color;
-
 /// Output sink for ratatui's CrosstermBackend. Prefers a fresh
 /// `/dev/tty` handle (so painting is isolated from the process's
 /// fd 1 — see `TerminalGuard`'s fd redirection); falls back to
@@ -134,7 +132,6 @@ pub fn normalize_selection_range(a: (usize, usize), b: (usize, usize)) -> Select
 /// main session is always at index 0; subagent chats start at index
 /// 1. Selection state lives per-chat because a selection in chat A
 /// would be meaningless when chat B is on screen.
-#[allow(dead_code)]
 pub struct ChatSnapshot {
     pub name: String,
     buffer: Vec<LineEntry>,
@@ -480,6 +477,7 @@ impl Renderer {
 
     /// Cycle to the next chat (wraps from last → first).
     /// No-op when there's only one chat.
+    #[allow(dead_code)]
     pub fn next_chat(&mut self) {
         if self.chats.len() <= 1 {
             return;
@@ -494,6 +492,7 @@ impl Renderer {
 
     /// Cycle to the previous chat (wraps from first → last).
     /// No-op when there's only one chat.
+    #[allow(dead_code)]
     pub fn prev_chat(&mut self) {
         if self.chats.len() <= 1 {
             return;
@@ -592,9 +591,8 @@ impl ChatSnapshot {
     }
 }
 
-#[allow(dead_code)]
 impl Renderer {
-    // (continuation marker — methods below this block remain unchanged)
+    #[allow(dead_code)]
     fn _ov2_phase_a_anchor() {}
 
     /// dirge-ov2 Phase E: append a line to a SPECIFIC chat's buffer
@@ -670,26 +668,9 @@ impl Renderer {
         }
     }
 
-    /// Set both overlay content and the title shown in the frame's
-    /// top border. Use this instead of `set_alert_overlay` when the
-    /// prompt is something other than a generic alert (e.g.
-    /// `[QUESTION]`).
-    pub fn set_alert_overlay_with_title(
-        &mut self,
-        title: impl Into<String>,
-        rows: Vec<(String, Color)>,
-    ) {
-        self.alert_title = title.into();
-        self.alert_overlay = Some(rows);
-    }
-
     pub fn clear_alert_overlay(&mut self) {
         self.alert_overlay = None;
         self.alert_title.clear();
-    }
-
-    pub fn alert_overlay_active(&self) -> bool {
-        self.alert_overlay.is_some()
     }
 
     pub fn set_panel_data(&mut self, data: PanelData) {
@@ -711,21 +692,8 @@ impl Renderer {
         }
     }
 
-    /// Content-area width in columns. With the centered chat layout,
-    /// the chat fills the middle and the side panels split the
-    /// remainder symmetrically — so chat width math uses the full
-    /// terminal width (minus 2 for the chat ║ borders).
-    fn content_cols(&self) -> u16 {
-        let (cols, _) = self.terminal_size();
-        cols
-    }
-
     pub fn set_monochrome(&mut self, monochrome: bool) {
         self.monochrome = monochrome;
-    }
-
-    fn color(&self, color: Color) -> Color {
-        resolve_color(color, self.monochrome)
     }
 
     fn terminal_size(&self) -> (u16, u16) {
@@ -772,16 +740,9 @@ impl Renderer {
         self.buffer.len()
     }
 
+    #[allow(dead_code)]
     pub fn buffer_lines(&self) -> Vec<&str> {
         self.buffer.iter().map(|e| e.text.as_str()).collect()
-    }
-
-    pub fn scroll_to_line(&mut self, idx: usize) {
-        let visible = self.visible_lines();
-        let total = self.buffer.len();
-        self.scroll_offset = total
-            .saturating_sub(idx + visible)
-            .min(total.saturating_sub(visible));
     }
 
     pub fn replace_from(&mut self, start: usize, lines: Vec<LineEntry>) {
@@ -885,6 +846,7 @@ impl Renderer {
 
     /// Cached chat rect from the most recent `tui_redraw` call.
     /// `None` until the first paint.
+    #[allow(dead_code)]
     pub fn chat_rect(&self) -> Option<ratatui::layout::Rect> {
         self.cached_chat_rect
     }
@@ -1487,7 +1449,6 @@ fn left_truncate(s: &str, max: usize) -> String {
     out
 }
 
-#[allow(dead_code)]
 pub fn copy_to_clipboard(text: &str) {
     let cmds: &[(&str, &[&str])] = &[
         ("wl-copy", &[]),

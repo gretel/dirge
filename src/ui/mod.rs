@@ -1421,27 +1421,46 @@ pub async fn run_interactive(
                                 &mut tool_calls_buf,
                                 &mut tool_calls_this_run,
                             );
-                            let count = renderer.chat_count();
-                            let new_idx = if ctrl_p {
-                                (old_active + count - 1) % count
+                            if ctrl_x {
+                                renderer.remove_chat(old_active);
+                                chat_ui_states.remove(old_active);
+                                load_chat_ui_state(
+                                    &mut chat_ui_states[renderer.active_chat()],
+                                    &mut response_buf,
+                                    &mut response_start_line,
+                                    &mut reasoning_buf,
+                                    &mut reasoning_start_line,
+                                    &mut last_tool_name,
+                                    &mut last_tool_call_id,
+                                    &mut tool_chamber_open,
+                                    &mut agent_line_started,
+                                    &mut was_reasoning,
+                                    &mut tool_calls_buf,
+                                    &mut tool_calls_this_run,
+                                );
                             } else {
-                                (old_active + 1) % count
-                            };
-                            renderer.switch_chat(new_idx);
-                            load_chat_ui_state(
-                                &mut chat_ui_states[new_idx],
-                                &mut response_buf,
-                                &mut response_start_line,
-                                &mut reasoning_buf,
-                                &mut reasoning_start_line,
-                                &mut last_tool_name,
-                                &mut last_tool_call_id,
-                                &mut tool_chamber_open,
-                                &mut agent_line_started,
-                                &mut was_reasoning,
-                                &mut tool_calls_buf,
-                                &mut tool_calls_this_run,
-                            );
+                                let count = renderer.chat_count();
+                                let new_idx = if ctrl_p {
+                                    (old_active + count - 1) % count
+                                } else {
+                                    (old_active + 1) % count
+                                };
+                                renderer.switch_chat(new_idx);
+                                load_chat_ui_state(
+                                    &mut chat_ui_states[new_idx],
+                                    &mut response_buf,
+                                    &mut response_start_line,
+                                    &mut reasoning_buf,
+                                    &mut reasoning_start_line,
+                                    &mut last_tool_name,
+                                    &mut last_tool_call_id,
+                                    &mut tool_chamber_open,
+                                    &mut agent_line_started,
+                                    &mut was_reasoning,
+                                    &mut tool_calls_buf,
+                                    &mut tool_calls_this_run,
+                                );
+                            }
                             renderer.render_viewport()?;
                             renderer.draw_bottom(
                                 &input,
@@ -1484,128 +1503,6 @@ pub async fn run_interactive(
                             }
                             KeyCode::End => {
                                 renderer.scroll_to_bottom()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                    is_running,
-                                )?;
-                                continue;
-                            }
-                            KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if renderer.chat_count() > 1 {
-                                    save_chat_ui_state(
-                                        &mut chat_ui_states[renderer.active_chat()],
-                                        &mut response_buf,
-                                        &mut response_start_line,
-                                        &mut reasoning_buf,
-                                        &mut reasoning_start_line,
-                                        &mut last_tool_name,
-                                        &mut last_tool_call_id,
-                                        &mut tool_chamber_open,
-                                        &mut agent_line_started,
-                                        &mut was_reasoning,
-                                        &mut tool_calls_buf,
-                                        &mut tool_calls_this_run,
-                                    );
-                                    renderer.next_chat();
-                                    load_chat_ui_state(
-                                        &mut chat_ui_states[renderer.active_chat()],
-                                        &mut response_buf,
-                                        &mut response_start_line,
-                                        &mut reasoning_buf,
-                                        &mut reasoning_start_line,
-                                        &mut last_tool_name,
-                                        &mut last_tool_call_id,
-                                        &mut tool_chamber_open,
-                                        &mut agent_line_started,
-                                        &mut was_reasoning,
-                                        &mut tool_calls_buf,
-                                        &mut tool_calls_this_run,
-                                    );
-                                }
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                    is_running,
-                                )?;
-                                continue;
-                            }
-                            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if renderer.chat_count() > 1 {
-                                    save_chat_ui_state(
-                                        &mut chat_ui_states[renderer.active_chat()],
-                                        &mut response_buf,
-                                        &mut response_start_line,
-                                        &mut reasoning_buf,
-                                        &mut reasoning_start_line,
-                                        &mut last_tool_name,
-                                        &mut last_tool_call_id,
-                                        &mut tool_chamber_open,
-                                        &mut agent_line_started,
-                                        &mut was_reasoning,
-                                        &mut tool_calls_buf,
-                                        &mut tool_calls_this_run,
-                                    );
-                                    renderer.prev_chat();
-                                    load_chat_ui_state(
-                                        &mut chat_ui_states[renderer.active_chat()],
-                                        &mut response_buf,
-                                        &mut response_start_line,
-                                        &mut reasoning_buf,
-                                        &mut reasoning_start_line,
-                                        &mut last_tool_name,
-                                        &mut last_tool_call_id,
-                                        &mut tool_chamber_open,
-                                        &mut agent_line_started,
-                                        &mut was_reasoning,
-                                        &mut tool_calls_buf,
-                                        &mut tool_calls_this_run,
-                                    );
-                                }
-                                renderer.render_viewport()?;
-                                renderer.draw_bottom(
-                                    &input,
-                                    &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
-                                    is_running,
-                                )?;
-                                continue;
-                            }
-                            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if renderer.chat_count() > 1 {
-                                    save_chat_ui_state(
-                                        &mut chat_ui_states[renderer.active_chat()],
-                                        &mut response_buf,
-                                        &mut response_start_line,
-                                        &mut reasoning_buf,
-                                        &mut reasoning_start_line,
-                                        &mut last_tool_name,
-                                        &mut last_tool_call_id,
-                                        &mut tool_chamber_open,
-                                        &mut agent_line_started,
-                                        &mut was_reasoning,
-                                        &mut tool_calls_buf,
-                                        &mut tool_calls_this_run,
-                                    );
-                                    let removed_idx = renderer.active_chat();
-                                    renderer.remove_chat(removed_idx);
-                                    chat_ui_states.remove(removed_idx);
-                                    load_chat_ui_state(
-                                        &mut chat_ui_states[renderer.active_chat()],
-                                        &mut response_buf,
-                                        &mut response_start_line,
-                                        &mut reasoning_buf,
-                                        &mut reasoning_start_line,
-                                        &mut last_tool_name,
-                                        &mut last_tool_call_id,
-                                        &mut tool_chamber_open,
-                                        &mut agent_line_started,
-                                        &mut was_reasoning,
-                                        &mut tool_calls_buf,
-                                        &mut tool_calls_this_run,
-                                    );
-                                }
-                                renderer.render_viewport()?;
                                 renderer.draw_bottom(
                                     &input,
                                     &with_queue(StatusLine::render(session, is_running, 0, loop_label.as_deref(), context.current_prompt_name.as_deref(), perm_mode().as_deref()), interjection_queue.len()),
@@ -4866,7 +4763,7 @@ fn suggest_pattern(tool: &str, input: &str) -> String {
 /// lowercase query matches both cases; mixed-case query forces an
 /// exact-case match — handled inside `Atom::new` with
 /// `CaseMatching::Smart`.
-#[allow(dead_code)]
+#[cfg(test)]
 fn update_search(renderer: &Renderer, query: &str, matches: &mut Vec<usize>, selected: &mut usize) {
     use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization};
     use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -4905,38 +4802,6 @@ fn update_search(renderer: &Renderer, query: &str, matches: &mut Vec<usize>, sel
     // Higher score first; tie-break on earlier line for determinism.
     scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     *matches = scored.into_iter().map(|(idx, _)| idx).collect();
-}
-
-#[allow(dead_code)]
-fn draw_search_bar(query: &str, matches: &[usize], selected: usize) -> std::io::Result<()> {
-    use crossterm::style::{Attribute, ResetColor, SetAttribute, SetForegroundColor};
-    use crossterm::terminal::{Clear, ClearType};
-    use std::io::Write;
-
-    let mut stdout = std::io::stdout();
-    let count = matches.len();
-    let indicator = if count > 0 {
-        format!("{}/{}", selected.saturating_add(1).min(count), count)
-    } else {
-        "0/0".to_string()
-    };
-    let bar = format!("Search: {} [{}]", query, indicator);
-    crossterm::execute!(stdout, Clear(ClearType::CurrentLine))?;
-    // Bold-glow on accent so the search bar reads consistently with
-    // the rest of the chat. Without Bold it was visibly duller than
-    // surrounding content.
-    let bloom = theme::is_bright(theme::accent());
-    if bloom {
-        crossterm::execute!(stdout, SetAttribute(Attribute::Bold))?;
-    }
-    crossterm::execute!(stdout, SetForegroundColor(theme::accent()))?;
-    write!(stdout, "\r\n")?;
-    write!(stdout, "{}", bar)?;
-    if bloom {
-        crossterm::execute!(stdout, SetAttribute(Attribute::NormalIntensity))?;
-    }
-    crossterm::execute!(stdout, ResetColor)?;
-    Ok(())
 }
 
 fn open_rewind_picker(session: &Session, picker: &mut ListPicker) {

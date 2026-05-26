@@ -162,13 +162,13 @@ fn lexical_normalize(p: &Path) -> std::path::PathBuf {
 /// trigger permission dialogs.  Relative single-segment paths
 /// that are purely numeric ("1", "42") or trivially short
 /// ("a", "x") are never valid file names a well-behaved
-/// agent would genuinely want to write to; the model is
-/// confusing a counter, index, or file-descriptor number with
-/// a file path.
+/// agent would genuinely want to use; the model is confusing
+/// a counter, index, or file-descriptor number with a file
+/// path.
 ///
 /// Returns `Ok(())` for plausible paths, `Err(reason)` for
 /// paths that should be hard-rejected.
-pub fn validate_write_path(path: &str) -> Result<(), String> {
+pub fn validate_path(path: &str) -> Result<(), String> {
     let p = Path::new(path);
     if p.is_absolute() {
         return Ok(());
@@ -186,13 +186,13 @@ pub fn validate_write_path(path: &str) -> Result<(), String> {
     // with no extension ("a", "xy").
     if path.chars().all(|c| c.is_ascii_digit()) {
         return Err(format!(
-            "Refusing to write to numeric path {:?}. Use an absolute path with a real file name.",
+            "Refusing to use numeric path {:?}. Use an absolute path with a real file name.",
             path,
         ));
     }
     if path.chars().count() <= 2 {
         return Err(format!(
-            "Refusing to write to trivial path {:?}. Use an absolute path with a real file name.",
+            "Refusing to use trivial path {:?}. Use an absolute path with a real file name.",
             path,
         ));
     }
@@ -286,89 +286,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── validate_write_path ──────────────────────────────────────
-
-    /// Reject paths that are clearly LLM hallucinations before they
-    /// trigger permission dialogs.  Relative single-segment paths
-    /// that are purely numeric (\"1\", \"42\") or trivially short
-    /// (\"a\", \"x\") are never valid file names a well-behaved
-    /// agent would genuinely want to write to; the model is
-    /// confusing a counter, index, or file-descriptor number with
-    /// a file path.
-    ///
-    /// Returns `Ok(())` for plausible paths, `Err(reason)` for
-    /// paths that should be hard-rejected.
-    pub fn validate_write_path(path: &str) -> Result<(), String> {
-        let p = Path::new(path);
-        if p.is_absolute() {
-            return Ok(());
-        }
-        // Has a directory component — plausible relative path.
-        if path.contains('/') || path.contains('\\') {
-            return Ok(());
-        }
-        // Has a file extension — plausible filename.
-        if path.contains('.') {
-            return Ok(());
-        }
-        // Just a bare name.  Reject single-segment names that are
-        // purely numeric (\"1\", \"42\") or a single short token
-        // with no extension (\"a\", \"xy\").
-        if path.chars().all(|c| c.is_ascii_digit()) {
-            return Err(format!(
-                "Refusing to write to numeric path {:?}. Use an absolute path with a real file name.",
-                path,
-            ));
-        }
-        if path.chars().count() <= 2 {
-            return Err(format!(
-                "Refusing to write to trivial path {:?}. Use an absolute path with a real file name.",
-                path,
-            ));
-        }
-        Ok(())
-    }
+    // ── validate_path ────────────────────────────────────────────
 
     #[test]
     fn validate_accepts_absolute_paths() {
-        assert!(validate_write_path("/etc/hosts").is_ok());
-        assert!(validate_write_path("/Users/bob/src/main.rs").is_ok());
+        assert!(validate_path("/etc/hosts").is_ok());
+        assert!(validate_path("/Users/bob/src/main.rs").is_ok());
     }
 
     #[test]
     fn validate_accepts_relative_paths_with_separator() {
-        assert!(validate_write_path("src/main.rs").is_ok());
-        assert!(validate_write_path("lib/core.js").is_ok());
-        assert!(validate_write_path("..\\windows\\path").is_ok());
+        assert!(validate_path("src/main.rs").is_ok());
+        assert!(validate_path("lib/core.js").is_ok());
+        assert!(validate_path("..\\windows\\path").is_ok());
     }
 
     #[test]
     fn validate_accepts_relative_names_with_extension() {
-        assert!(validate_write_path("Cargo.toml").is_ok());
-        assert!(validate_write_path("README.md").is_ok());
-        assert!(validate_write_path("build.sh").is_ok());
+        assert!(validate_path("Cargo.toml").is_ok());
+        assert!(validate_path("README.md").is_ok());
+        assert!(validate_path("build.sh").is_ok());
     }
 
     #[test]
     fn validate_accepts_extensionless_names_that_are_not_trivial() {
         // Common extensionless filenames.
-        assert!(validate_write_path("Makefile").is_ok());
-        assert!(validate_write_path("Dockerfile").is_ok());
-        assert!(validate_write_path("README").is_ok());
-        assert!(validate_write_path("LICENSE").is_ok());
-        assert!(validate_write_path("abc").is_ok());
+        assert!(validate_path("Makefile").is_ok());
+        assert!(validate_path("Dockerfile").is_ok());
+        assert!(validate_path("README").is_ok());
+        assert!(validate_path("LICENSE").is_ok());
+        assert!(validate_path("abc").is_ok());
     }
 
     #[test]
     fn validate_rejects_numeric_paths() {
-        assert!(validate_write_path("1").is_err());
-        assert!(validate_write_path("42").is_err());
-        assert!(validate_write_path("007").is_err());
+        assert!(validate_path("1").is_err());
+        assert!(validate_path("42").is_err());
+        assert!(validate_path("007").is_err());
     }
 
     #[test]
     fn validate_rejects_short_nonsense_paths() {
-        assert!(validate_write_path("a").is_err());
-        assert!(validate_write_path("xy").is_err());
+        assert!(validate_path("a").is_err());
+        assert!(validate_path("xy").is_err());
     }
 }
