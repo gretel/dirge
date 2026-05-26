@@ -1504,10 +1504,11 @@ mod tests {
             CheckResult::Allowed
         ));
         // The edit alias MUST also match — this is what enforce() checks.
-        assert!(matches!(
-            checker.check_path("edit", "/probe/src/main.rs"),
-            CheckResult::Allowed,
-        ),
+        assert!(
+            matches!(
+                checker.check_path("edit", "/probe/src/main.rs"),
+                CheckResult::Allowed,
+            ),
             "edit alias must reflect write session-allowlist entry"
         );
 
@@ -1518,16 +1519,18 @@ mod tests {
             Some(std::path::PathBuf::from("/cwd-off-test-axis")),
         );
         checker2.add_session_allowlist("edit".to_string(), "/probe/src/**");
-        assert!(matches!(
-            checker2.check_path("write", "/probe/src/main.rs"),
-            CheckResult::Allowed,
-        ),
+        assert!(
+            matches!(
+                checker2.check_path("write", "/probe/src/main.rs"),
+                CheckResult::Allowed,
+            ),
             "write must reflect edit session-allowlist entry"
         );
-        assert!(matches!(
-            checker2.check_path("apply_patch", "/probe/src/main.rs"),
-            CheckResult::Allowed,
-        ),
+        assert!(
+            matches!(
+                checker2.check_path("apply_patch", "/probe/src/main.rs"),
+                CheckResult::Allowed,
+            ),
             "apply_patch must reflect edit session-allowlist entry"
         );
 
@@ -1538,10 +1541,11 @@ mod tests {
             Some(std::path::PathBuf::from("/cwd-off-test-axis")),
         );
         checker3.add_session_allowlist("apply_patch".to_string(), "/probe/src/**");
-        assert!(matches!(
-            checker3.check_path("edit", "/probe/src/main.rs"),
-            CheckResult::Allowed,
-        ),
+        assert!(
+            matches!(
+                checker3.check_path("edit", "/probe/src/main.rs"),
+                CheckResult::Allowed,
+            ),
             "edit must reflect apply_patch session-allowlist entry"
         );
 
@@ -1552,10 +1556,11 @@ mod tests {
             Some(std::path::PathBuf::from("/cwd-off-test-axis")),
         );
         checker4.load_session_allowlist(&[("write".to_string(), "/probe/src/**".to_string())]);
-        assert!(matches!(
-            checker4.check_path("edit", "/probe/src/main.rs"),
-            CheckResult::Allowed,
-        ),
+        assert!(
+            matches!(
+                checker4.check_path("edit", "/probe/src/main.rs"),
+                CheckResult::Allowed,
+            ),
             "load_session_allowlist must also mirror write→edit"
         );
 

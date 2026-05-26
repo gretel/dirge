@@ -655,7 +655,9 @@ impl AnyAgent {
         self,
         prompt: String,
         history: Vec<Message>,
-        steering_queue: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>>,
+        steering_queue: Option<
+            std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+        >,
     ) -> AgentRunner {
         use crate::agent::agent_loop::{
             LoopSpawnConfig, loop_tool_to_rig_definition, retrying_stream_fn,
