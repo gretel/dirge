@@ -655,7 +655,9 @@ impl AnyAgent {
         self,
         prompt: String,
         history: Vec<Message>,
-        steering_queue: Option<std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>>,
+        steering_queue: Option<
+            std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+        >,
     ) -> AgentRunner {
         use crate::agent::agent_loop::{
             LoopSpawnConfig, loop_tool_to_rig_definition, retrying_stream_fn,
@@ -727,8 +729,7 @@ impl AnyAgent {
         transcript: String,
     ) -> crate::agent::runner::AgentRunner {
         use crate::agent::agent_loop::{
-            LoopSpawnConfig, loop_tool_to_rig_definition, retrying_stream_fn,
-            spawn_loop_runner,
+            LoopSpawnConfig, loop_tool_to_rig_definition, retrying_stream_fn, spawn_loop_runner,
         };
         use crate::agent::recovery::RecoveryPolicy;
 
@@ -751,7 +752,10 @@ impl AnyAgent {
         let inner_stream_fn = self.build_stream_fn(tool_defs);
         let stream_fn = retrying_stream_fn(inner_stream_fn, RecoveryPolicy::default());
 
-        let full_prompt = format!("{}\n\n<session_transcript>\n{}\n</session_transcript>", prompt, transcript);
+        let full_prompt = format!(
+            "{}\n\n<session_transcript>\n{}\n</session_transcript>",
+            prompt, transcript
+        );
 
         let mut cfg = LoopSpawnConfig::minimal(stream_fn, full_prompt);
         cfg.system_prompt = self.preamble.clone();

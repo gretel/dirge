@@ -119,7 +119,13 @@ pub fn build_frontmatter(name: &str, description: &str, tags: &[String]) -> Stri
         fm.push_str("metadata:\n");
         fm.push_str("  dirge:\n");
         fm.push_str("    tags: [");
-        fm.push_str(&tags.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(", "));
+        fm.push_str(
+            &tags
+                .iter()
+                .map(|t| t.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
         fm.push_str("]\n");
     }
     fm.push_str("---\n\n");
@@ -131,7 +137,8 @@ pub fn build_frontmatter(name: &str, description: &str, tags: &[String]) -> Stri
 /// Split frontmatter from body. Returns `None` if there's no
 /// frontmatter or it's malformed. Returns `(frontmatter_text, body_text)`.
 fn split_frontmatter(content: &str) -> Option<(String, String)> {
-    let content = content.strip_prefix("---\n")
+    let content = content
+        .strip_prefix("---\n")
         .or_else(|| content.strip_prefix("---\r\n"))?;
 
     let (fm, body) = if let Some(pos) = content.find("\n---") {
@@ -258,7 +265,8 @@ mod tests {
 
     #[test]
     fn parse_extracts_tags() {
-        let content = "---\nname: s\nmetadata:\n  dirge:\n    tags: [build, rust, cargo]\n---\n\nbody\n";
+        let content =
+            "---\nname: s\nmetadata:\n  dirge:\n    tags: [build, rust, cargo]\n---\n\nbody\n";
         let spec = parse_skill_spec(content, "s").unwrap();
         assert_eq!(spec.tags, vec!["build", "rust", "cargo"]);
     }

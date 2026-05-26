@@ -38,7 +38,9 @@ const IDLE_HOURS: u64 = 2;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct CuratorState {
     /// Unix timestamp (seconds) of the last curator run.
-    last_run: u64,
+    /// `None` means never run (different from epoch-0 which
+    /// is a valid timestamp on some systems).
+    last_run: Option<u64>,
     /// Timestamp when the state was first seeded.
     first_check: u64,
 }
@@ -47,7 +49,7 @@ impl CuratorState {
     fn new() -> Self {
         let now = now_secs();
         CuratorState {
-            last_run: 0,
+            last_run: None,
             first_check: now,
         }
     }
@@ -58,8 +60,7 @@ impl CuratorState {
         }
         let content = std::fs::read_to_string(path)
             .map_err(|e| format!("Failed to read curator state: {e}"))?;
-        serde_json::from_str(&content)
-            .map_err(|e| format!("Failed to parse curator state: {e}"))
+        serde_json::from_str(&content).map_err(|e| format!("Failed to parse curator state: {e}"))
     }
 
     fn save(&self, path: &PathBuf) -> Result<(), String> {
@@ -113,11 +114,11 @@ impl Curator {
         let now = now_secs();
 
         // Never run on the first check — just seed the state.
-        if self.state.last_run == 0 {
+        if self.state.last_run.is_none() {
             return false;
         }
 
-        let elapsed = Duration::from_secs(now - self.state.last_run);
+        let elapsed = Duration::from_secs(now - self.state.last_run.unwrap());
         elapsed >= Duration::from_secs(INTERVAL_HOURS * 3600)
     }
 
@@ -132,7 +133,7 @@ impl Curator {
         let skills_dir = self.paths.skills_dir();
 
         if !skills_dir.is_dir() {
-            self.state.last_run = now;
+            self.state.last_run = Some(now);
             self.state.save(&self.state_path)?;
             return Ok(Vec::new());
         }
@@ -183,7 +184,7 @@ impl Curator {
             }
         }
 
-        self.state.last_run = now;
+        self.state.last_run = Some(now);
         self.state.save(&self.state_path)?;
 
         Ok(stale_names)
@@ -201,10 +202,11 @@ impl Curator {
             .map_err(|e| format!("Failed to create archive directory: {e}"))?;
 
         let dest = archive_dir.join(name);
-        // Remove destination if it already exists from a previous archive.
+        // If destination already exists, the skill was already
+        // archived (possibly by a concurrent curator process).
+        // Skip cleanly rather than removing and risking data loss.
         if dest.exists() {
-            std::fs::remove_dir_all(&dest)
-                .map_err(|e| format!("Failed to remove existing archive: {e}"))?;
+            return Ok(());
         }
 
         std::fs::rename(&src, &dest)
@@ -216,7 +218,7 @@ impl Curator {
     /// Record a curator run (for callers that want to force-update
     /// state after a manual run).
     pub fn record_run(&mut self) -> Result<(), String> {
-        self.state.last_run = now_secs();
+        self.state.last_run = Some(now_secs());
         self.state.save(&self.state_path)
     }
 }
@@ -240,11 +242,8 @@ mod tests {
 
     fn temp_project() -> (ProjectPaths, std::path::PathBuf) {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "dirge-curator-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dirge-curator-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let paths = ProjectPaths::new(&dir);
@@ -265,11 +264,11 @@ mod tests {
         let state_path = paths.skills_dir().join(".curator_state");
 
         let mut state = CuratorState::new();
-        state.last_run = 1234567890;
+        state.last_run = Some(1234567890);
         state.save(&state_path).unwrap();
 
         let loaded = CuratorState::load(&state_path).unwrap();
-        assert_eq!(loaded.last_run, 1234567890);
+        assert_eq!(loaded.last_run, Some(1234567890));
         assert!(loaded.first_check > 0);
     }
 
@@ -278,7 +277,7 @@ mod tests {
         let (paths, _dir) = temp_project();
         let state_path = paths.skills_dir().join(".curator_state");
         let state = CuratorState::load(&state_path).unwrap();
-        assert_eq!(state.last_run, 0);
+        assert_eq!(state.last_run, None);
         assert!(state.first_check > 0);
     }
 
@@ -299,7 +298,7 @@ mod tests {
         // Set state as if last run was 8 days ago.
         let past = now_secs() - INTERVAL_HOURS * 3600 - 1;
         let mut state = CuratorState::new();
-        state.last_run = past;
+        state.last_run = Some(past);
         state.save(&state_path).unwrap();
 
         let curator = Curator::new(&paths).unwrap();
@@ -314,7 +313,7 @@ mod tests {
         // Set state as if last run was 1 hour ago.
         let recent = now_secs() - 3600;
         let mut state = CuratorState::new();
-        state.last_run = recent;
+        state.last_run = Some(recent);
         state.save(&state_path).unwrap();
 
         let curator = Curator::new(&paths).unwrap();
@@ -334,12 +333,14 @@ mod tests {
         // Original gone.
         assert!(!paths.skills_dir().join("old-skill").is_dir());
         // Present in archive.
-        assert!(paths
-            .skills_dir()
-            .join(".archive")
-            .join("old-skill")
-            .join("SKILL.md")
-            .is_file());
+        assert!(
+            paths
+                .skills_dir()
+                .join(".archive")
+                .join("old-skill")
+                .join("SKILL.md")
+                .is_file()
+        );
     }
 
     // ── apply_automatic_transitions ────────────────────

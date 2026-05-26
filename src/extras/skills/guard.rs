@@ -27,9 +27,15 @@ const THREAT_PATTERNS: &[(&str, &str)] = &[
     ("Authorization: Bearer", "hardcoded auth token"),
     ("-----BEGIN RSA PRIVATE KEY", "private key in skill"),
     // Prompt injection in skill content
-    ("ignore previous instructions", "prompt injection: role override"),
+    (
+        "ignore previous instructions",
+        "prompt injection: role override",
+    ),
     ("you are now", "prompt injection: role reassignment"),
-    ("as an AI language model", "prompt injection: identity manipulation"),
+    (
+        "as an AI language model",
+        "prompt injection: identity manipulation",
+    ),
     // Invisible Unicode attacks
     ("\u{200b}", "zero-width space"),
     ("\u{200c}", "zero-width non-joiner"),

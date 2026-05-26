@@ -17,7 +17,7 @@
 //! - Current session exclusion
 //! - FTS5 syntax: AND, OR, NOT, quoted phrases, * wildcards
 
-use crate::extras::session_db::{SessionDb, SearchResult};
+use crate::extras::session_db::{SearchResult, SessionDb};
 
 /// A single search hit in the DISCOVERY shape. Contains the
 /// matched session with context for the agent to understand
@@ -123,7 +123,8 @@ impl SessionSearch {
     /// an anchored window. Results are deduplicated by lineage
     /// root.
     pub fn discover(&self, query: &str) -> Result<Vec<DiscoveryHit>, String> {
-        let results = self.db.search_messages(query, None)?;
+        let sanitized = sanitize_fts5_query(query);
+        let results = self.db.search_messages(&sanitized, None)?;
         if results.is_empty() {
             return Ok(Vec::new());
         }
@@ -176,17 +177,12 @@ impl SessionSearch {
         let session_meta = self.get_session_meta(&result.session_id)?;
 
         // Get message ID for the anchor.
-        let anchor_id = self.find_message_id_near(
-            &result.session_id,
-            &result.timestamp,
-        )?;
+        let anchor_id = self.find_message_id_near(&result.session_id, &result.timestamp)?;
 
         // Get anchored window.
-        let view = self.db.get_anchored_view(
-            &result.session_id,
-            anchor_id,
-            DEFAULT_WINDOW,
-        )?;
+        let view = self
+            .db
+            .get_anchored_view(&result.session_id, anchor_id, DEFAULT_WINDOW)?;
 
         // Get bookends.
         let bookend_start = self.get_bookends(&result.session_id, true)?;
@@ -265,9 +261,7 @@ impl SessionSearch {
     /// List recent sessions, excluding review-fork sources
     /// and the current session.
     pub fn browse(&self) -> Result<Vec<BrowseSession>, String> {
-        let sessions = self
-            .db
-            .list_sessions_rich(Some(&["review-fork"]))?;
+        let sessions = self.db.list_sessions_rich(Some(&["review-fork"]))?;
 
         let mut result = Vec::new();
         let mut seen_roots = std::collections::HashSet::new();
@@ -337,14 +331,8 @@ impl SessionSearch {
     }
 
     /// Find a message id near the given timestamp in a session.
-    fn find_message_id_near(
-        &self,
-        session_id: &str,
-        timestamp: &str,
-    ) -> Result<i64, String> {
-        let view = self
-            .db
-            .get_anchored_view(session_id, 1, 0)?;
+    fn find_message_id_near(&self, session_id: &str, timestamp: &str) -> Result<i64, String> {
+        let view = self.db.get_anchored_view(session_id, 1, 0)?;
         if view.messages.is_empty() {
             return Err(format!("No messages in session '{}'", session_id));
         }
@@ -359,14 +347,8 @@ impl SessionSearch {
     }
 
     /// Get the first or last few messages of a session.
-    fn get_bookends(
-        &self,
-        session_id: &str,
-        start: bool,
-    ) -> Result<Vec<MessagePreview>, String> {
-        let view = self
-            .db
-            .get_anchored_view(session_id, 1, BOOKEND_COUNT)?;
+    fn get_bookends(&self, session_id: &str, start: bool) -> Result<Vec<MessagePreview>, String> {
+        let view = self.db.get_anchored_view(session_id, 1, BOOKEND_COUNT)?;
 
         let messages: Vec<MessagePreview> = view
             .messages
@@ -383,9 +365,7 @@ impl SessionSearch {
             Ok(messages)
         } else {
             // Get the last BOOKEND_COUNT messages.
-            let total_view = self
-                .db
-                .get_anchored_view(session_id, 1, 100_000)?;
+            let total_view = self.db.get_anchored_view(session_id, 1, 100_000)?;
             let total = total_view.messages.len();
             if total <= BOOKEND_COUNT {
                 return Ok(messages);
@@ -393,23 +373,17 @@ impl SessionSearch {
             let last_id = total_view.messages.last().map(|m| m.id).unwrap_or(1);
             let end_view = self
                 .db
-                .get_anchored_view(
-                    session_id,
-                    last_id,
-                    BOOKEND_COUNT,
-                )?;
-            Ok(
-                end_view
-                    .messages
-                    .into_iter()
-                    .map(|m| MessagePreview {
-                        id: m.id,
-                        role: m.role,
-                        content_preview: truncate_content(&m.content, MAX_PREVIEW_LEN),
-                        timestamp: m.timestamp,
-                    })
-                    .collect(),
-            )
+                .get_anchored_view(session_id, last_id, BOOKEND_COUNT)?;
+            Ok(end_view
+                .messages
+                .into_iter()
+                .map(|m| MessagePreview {
+                    id: m.id,
+                    role: m.role,
+                    content_preview: truncate_content(&m.content, MAX_PREVIEW_LEN),
+                    timestamp: m.timestamp,
+                })
+                .collect())
         }
     }
 
@@ -417,11 +391,7 @@ impl SessionSearch {
     /// actually contains the given message. If the message was
     /// created after a compression split, it lives in a child
     /// session.
-    fn find_message_session(
-        &self,
-        session_id: &str,
-        message_id: i64,
-    ) -> Result<String, String> {
+    fn find_message_session(&self, session_id: &str, message_id: i64) -> Result<String, String> {
         // First try the given session.
         if self.db.get_anchored_view(session_id, message_id, 0).is_ok() {
             // Message might exist — we trust the caller.
@@ -460,6 +430,27 @@ fn truncate_content(content: &str, max_len: usize) -> String {
     )
 }
 
+/// Sanitize a user-provided query string for safe use with FTS5 MATCH.
+/// FTS5 has special syntax characters that could be exploited or cause
+/// unexpected behavior: `*` (prefix wildcard), `"` (phrase), parentheses
+/// (grouping), and boolean operators AND/OR/NOT/NEAR. We wrap the query
+/// in double quotes to treat it as a literal phrase, then strip any
+/// embedded quotes from the user input to prevent injection.
+fn sanitize_fts5_query(query: &str) -> String {
+    // Strip characters with FTS5 special meaning.
+    let cleaned: String = query
+        .chars()
+        .filter(|c| !matches!(c, '*' | '"' | '(' | ')'))
+        .collect();
+    // Wrap in double quotes so FTS5 treats it as a literal phrase.
+    // Empty query after cleaning → return empty string (caller handles).
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("\"{}\"", trimmed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,11 +460,8 @@ mod tests {
 
     fn temp_search() -> (SessionSearch, std::path::PathBuf) {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "dirge-search-test-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("dirge-search-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.db");
@@ -534,7 +522,10 @@ mod tests {
         search.current_session_id = Some("sess-1".to_string());
         let sessions = search.browse().unwrap();
         let ids: Vec<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
-        assert!(!ids.contains(&"sess-1"), "current session should be excluded");
+        assert!(
+            !ids.contains(&"sess-1"),
+            "current session should be excluded"
+        );
         assert!(ids.contains(&"sess-2"));
     }
 
@@ -544,10 +535,18 @@ mod tests {
         seed_session(&search.db, "sess-1", "cli");
 
         // Insert a specific message to search for.
-        search.db.insert_message(
-            "sess-1", "user", "how do we handle database migrations with rusqlite",
-            None, None, None, "2025-01-15T10:01:00Z",
-        ).unwrap();
+        search
+            .db
+            .insert_message(
+                "sess-1",
+                "user",
+                "how do we handle database migrations with rusqlite",
+                None,
+                None,
+                None,
+                "2025-01-15T10:01:00Z",
+            )
+            .unwrap();
 
         let hits = search.discover("database migrations").unwrap();
         assert!(!hits.is_empty());
@@ -568,14 +567,30 @@ mod tests {
         seed_session(&search.db, "current", "cli");
         seed_session(&search.db, "other", "cli");
 
-        search.db.insert_message(
-            "current", "user", "database migration in current session",
-            None, None, None, "2025-01-15T10:01:00Z",
-        ).unwrap();
-        search.db.insert_message(
-            "other", "user", "database migration in other session",
-            None, None, None, "2025-01-15T11:01:00Z",
-        ).unwrap();
+        search
+            .db
+            .insert_message(
+                "current",
+                "user",
+                "database migration in current session",
+                None,
+                None,
+                None,
+                "2025-01-15T10:01:00Z",
+            )
+            .unwrap();
+        search
+            .db
+            .insert_message(
+                "other",
+                "user",
+                "database migration in other session",
+                None,
+                None,
+                None,
+                "2025-01-15T11:01:00Z",
+            )
+            .unwrap();
 
         search.current_session_id = Some("current".to_string());
         let hits = search.discover("database migration").unwrap();
@@ -593,14 +608,30 @@ mod tests {
 
         search.db.set_parent_session("child-1", "sess-1").unwrap();
 
-        search.db.insert_message(
-            "sess-1", "user", "unique term: ziggurat construction",
-            None, None, None, "2025-01-15T10:01:00Z",
-        ).unwrap();
-        search.db.insert_message(
-            "child-1", "user", "unique term: ziggurat construction continued",
-            None, None, None, "2025-01-15T11:01:00Z",
-        ).unwrap();
+        search
+            .db
+            .insert_message(
+                "sess-1",
+                "user",
+                "unique term: ziggurat construction",
+                None,
+                None,
+                None,
+                "2025-01-15T10:01:00Z",
+            )
+            .unwrap();
+        search
+            .db
+            .insert_message(
+                "child-1",
+                "user",
+                "unique term: ziggurat construction continued",
+                None,
+                None,
+                None,
+                "2025-01-15T11:01:00Z",
+            )
+            .unwrap();
 
         let hits = search.discover("ziggurat").unwrap();
         // Both sessions match but share a lineage root — only one result.
@@ -610,18 +641,25 @@ mod tests {
     #[test]
     fn scroll_returns_window_around_anchor() {
         let (search, _dir) = temp_search();
-        search.db.insert_session("sess-1", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
+        search
+            .db
+            .insert_session("sess-1", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
             .unwrap();
 
         // Insert 20 messages.
         for i in 0..20 {
-            search.db.insert_message(
-                "sess-1",
-                if i % 2 == 0 { "user" } else { "assistant" },
-                &format!("message {}", i),
-                None, None, None,
-                &format!("2025-01-15T10:{:02}:00Z", i),
-            ).unwrap();
+            search
+                .db
+                .insert_message(
+                    "sess-1",
+                    if i % 2 == 0 { "user" } else { "assistant" },
+                    &format!("message {}", i),
+                    None,
+                    None,
+                    None,
+                    &format!("2025-01-15T10:{:02}:00Z", i),
+                )
+                .unwrap();
         }
 
         let result = search.scroll("sess-1", 10, 3).unwrap();
@@ -661,9 +699,44 @@ mod tests {
     #[test]
     fn find_message_session_falls_back_to_given() {
         let (search, _dir) = temp_search();
-        search.db.insert_session("sess-1", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z").unwrap();
+        search
+            .db
+            .insert_session("sess-1", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
+            .unwrap();
         // Message doesn't exist, but we trust the caller.
         let session = search.find_message_session("sess-1", 999).unwrap();
         assert_eq!(session, "sess-1");
+    }
+
+    // ── sanitize_fts5_query ─────────────────────────────
+
+    #[test]
+    fn sanitize_preserves_normal_query() {
+        let result = sanitize_fts5_query("database migrations");
+        assert_eq!(result, "\"database migrations\"");
+    }
+
+    #[test]
+    fn sanitize_strips_fts5_special_chars() {
+        let result = sanitize_fts5_query("foo* AND (bar)");
+        assert_eq!(result, "\"foo AND bar\"");
+    }
+
+    #[test]
+    fn sanitize_strips_quotes() {
+        let result = sanitize_fts5_query("\"exact phrase\"");
+        assert_eq!(result, "\"exact phrase\"");
+    }
+
+    #[test]
+    fn sanitize_empty_after_cleaning() {
+        let result = sanitize_fts5_query("*\"()");
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn sanitize_trims_whitespace() {
+        let result = sanitize_fts5_query("  hello world  ");
+        assert_eq!(result, "\"hello world\"");
     }
 }
