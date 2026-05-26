@@ -10,4 +10,5 @@ pub mod mcp;
 #[cfg(feature = "acp")]
 pub mod acp;
 
+pub mod dirge_paths;
 pub mod memory;
