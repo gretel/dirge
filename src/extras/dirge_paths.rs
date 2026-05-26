@@ -14,18 +14,48 @@
 
 use std::path::{Path, PathBuf};
 
-/// Walk up from `cwd` until a `.git/` directory is found.
-/// Returns `cwd` unchanged if no git root is found (user may
-/// be outside a repo — per-project features degrade gracefully).
+/// Check if a path is a git reference (either a `.git` directory
+/// or a `.git` file referencing the real git dir, as used by
+/// `git worktree`).
+fn is_git_root_marker(path: &Path) -> bool {
+    let git = path.join(".git");
+    if git.is_dir() {
+        return true;
+    }
+    // Git worktrees: .git is a file containing "gitdir: <path>".
+    if git.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&git) {
+            return content.starts_with("gitdir:");
+        }
+    }
+    false
+}
+
+/// Walk up from `cwd` until a `.git/` directory or worktree
+/// `.git` file is found. Returns `cwd` unchanged if no git root
+/// is found (user may be outside a repo — per-project features
+/// degrade gracefully).
 pub fn find_git_root(cwd: &Path) -> PathBuf {
-    let mut current = cwd.to_path_buf();
+    // Canonicalize to resolve symlinks in the path chain.
+    let cwd = if let Ok(canon) = cwd.canonicalize() {
+        canon
+    } else {
+        cwd.to_path_buf()
+    };
+
+    let mut current = cwd.clone();
     loop {
-        if current.join(".git").is_dir() {
+        if is_git_root_marker(&current) {
             return current;
         }
-        if !current.pop() {
-            return cwd.to_path_buf();
+        let parent = match current.parent() {
+            Some(p) => p.to_path_buf(),
+            None => return cwd.clone(),
+        };
+        if parent == current {
+            return cwd.clone();
         }
+        current = parent;
     }
 }
 
@@ -117,12 +147,14 @@ mod tests {
         );
     }
 
-    /// `/tmp` has no `.git/` — should return `/tmp` unchanged.
+    /// `/tmp` has no `.git/` — should return `/tmp` unchanged
+    /// (canonicalized if possible).
     #[test]
     fn find_git_root_falls_back_to_cwd_outside_repo() {
         let tmp = std::env::temp_dir();
+        let expected = tmp.canonicalize().unwrap_or_else(|_| tmp.clone());
         let root = find_git_root(&tmp);
-        assert_eq!(root, tmp);
+        assert_eq!(root, expected);
     }
 
     /// `DIRGE_PROJECT_ROOT` wins over auto-detection.
@@ -180,5 +212,46 @@ mod tests {
         let f = paths.memory_file("MEMORY.md");
         assert_eq!(f.file_name().unwrap(), "MEMORY.md");
         assert!(f.starts_with(paths.memory_dir()));
+    }
+
+    /// Git worktrees use a `.git` file (not directory) containing
+    /// `gitdir: <path>`. find_git_root should recognise this as a
+    /// git root marker and stop walking.
+    #[test]
+    fn find_git_root_recognises_worktree_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-worktree-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Create a worktree-style .git file.
+        std::fs::write(
+            dir.join(".git"),
+            "gitdir: /some/real/path/.git/worktrees/foo\n",
+        )
+        .unwrap();
+
+        let root = find_git_root(&dir);
+        let expected = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        assert_eq!(root, expected, "should stop at worktree .git file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Paths with symlinks should still find the correct git root.
+    #[test]
+    fn find_git_root_with_symlinks() {
+        let cwd = std::env::current_dir().unwrap();
+        let root = find_git_root(&cwd);
+        assert!(
+            root.join(".git").is_dir() || {
+                let git_file = root.join(".git");
+                git_file.is_file() && std::fs::read_to_string(&git_file)
+                    .map(|c| c.starts_with("gitdir:"))
+                    .unwrap_or(false)
+            },
+            "expected {root:?} to be a git root"
+        );
     }
 }

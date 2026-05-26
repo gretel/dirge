@@ -59,13 +59,9 @@ Across DeepSeek-flash, DeepSeek v4-pro, GLM, and Qwen, the same four mistakes te
 3. **Empty placeholder object instead of array** — emitting `{"items": {}}` when the schema wants an array
 4. **Bare string instead of array-of-string** — emitting `{"paths": "foo"}` instead of `["foo"]`
 
-Four repairs, ~30-100 lines each. That's the whole catalogue. When someone says "this open model can't do tool calls," I now assume one of those four — and so far, that's been right about 90% of the time.
+That's the whole catalogue of common errors. When someone says "this open model can't do tool calls," I now assume one of those four. So far, that's been the case the vast majority of the time.
 
-### Order matters (we learned this the hard way)
-
-JSON-string parse (#2) must run BEFORE bare-string wrap (#4), or `"[\"a\",\"b\"]"` becomes `["[\"a\",\"b\"]"]` — a singleton array containing the original JSON string instead of the intended two-element array. It cost us a debugging session. It's now pinned by a unit test.
-
-### The funniest failure is also the most revealing
+JSON-string parse (#2) must run BEFORE bare-string wrap (#4), or `"[\"a\",\"b\"]"` becomes `["[\"a\",\"b\"]"]`  which is a singleton array containing the original JSON string instead of the intended two-element array.
 
 DeepSeek-flash, when asked to edit a file, sometimes emits the path as a markdown auto-link:
 
@@ -73,9 +69,9 @@ DeepSeek-flash, when asked to edit a file, sometimes emits the path as a markdow
 filePath: "/Users/x/proj/[notes.md](http://notes.md)"
 ```
 
-Our write tool obediently created files literally named `[notes.md](http://notes.md)`. This isn't a hallucination — it's the post-training chat distribution leaking through the tool boundary. The model was rewarded for auto-linking in conversational output and is applying that prior in a context where it makes no sense. The fix is two regex lines that unwrap only the degenerate case where link text equals url-without-protocol. Real markdown like `[click](https://example.com)` passes through untouched.
+What we have here is just the post-training chat distribution leaking through the tool boundary. The model was rewarded for auto-linking in conversational output and is applying that prior in a context where it makes no sense. The fix is to simply unwrap only the degenerate case where link text equals url-without-protocol. Real markdown like `[click](https://example.com)` passes through untouched.
 
-**"Tool confusion" is a more useful frame than "capability gap."** The model knows how to format a path. It just hasn't been told clearly enough that this path is going to `fopen`, not into a chat bubble. So we encode that hint at the schema level — `pathString()` instead of `z.string()` — and the leak is plugged for every path field at once.
+The whole tool confusion problem is a more useful frame than capability gap. The model knows how to format a path. It just hasn't been told clearly enough that this path is going to `fopen`, not into a chat bubble. So we encode that hint at the schema level — `pathString()` instead of `z.string()` — and the leak is plugged for every path field at once.
 
 ### Validate-then-repair, not preprocess-then-validate
 
