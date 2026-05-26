@@ -29,7 +29,6 @@ mod tree;
 mod tui;
 mod wrap;
 
-
 use compact_str::CompactString;
 use crossterm::event;
 use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};

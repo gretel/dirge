@@ -241,8 +241,10 @@ impl SessionDb {
 
         let results: Vec<SessionSummary> = if has_exclude {
             let sources = exclude_sources.unwrap();
-            let refs: Vec<&dyn rusqlite::types::ToSql> =
-                sources.iter().map(|s| s as &dyn rusqlite::types::ToSql).collect();
+            let refs: Vec<&dyn rusqlite::types::ToSql> = sources
+                .iter()
+                .map(|s| s as &dyn rusqlite::types::ToSql)
+                .collect();
             stmt.query_map(rusqlite::params_from_iter(refs.iter()), map_row)
                 .map_err(|e| format!("Failed to list sessions: {e}"))?
                 .filter_map(|r| r.ok())
@@ -402,17 +404,14 @@ impl SessionDb {
             .map_err(|e| format!("Failed to prepare anchored view: {e}"))?;
 
         let messages: Vec<AnchorMessage> = stmt
-            .query_map(
-                params![session_id, before + 1 + after, offset],
-                |row| {
-                    Ok(AnchorMessage {
-                        id: row.get(0)?,
-                        role: row.get(1)?,
-                        content: row.get(2)?,
-                        timestamp: row.get(3)?,
-                    })
-                },
-            )
+            .query_map(params![session_id, before + 1 + after, offset], |row| {
+                Ok(AnchorMessage {
+                    id: row.get(0)?,
+                    role: row.get(1)?,
+                    content: row.get(2)?,
+                    timestamp: row.get(3)?,
+                })
+            })
             .map_err(|e| format!("Failed to query anchored view: {e}"))?
             .filter_map(|r| r.ok())
             .collect();
@@ -436,8 +435,11 @@ mod tests {
 
     fn temp_db() -> (SessionDb, std::path::PathBuf) {
         let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir =
-            std::env::temp_dir().join(format!("dirge-session-db-test-{}-{}", std::process::id(), n));
+        let dir = std::env::temp_dir().join(format!(
+            "dirge-session-db-test-{}-{}",
+            std::process::id(),
+            n
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.db");
@@ -448,14 +450,22 @@ mod tests {
     #[test]
     fn create_and_read_session() {
         let (db, _dir) = temp_db();
-        db.insert_session("sess-1", "cli", "claude-opus", "anthropic", "2025-01-15T10:00:00Z")
-            .unwrap();
+        db.insert_session(
+            "sess-1",
+            "cli",
+            "claude-opus",
+            "anthropic",
+            "2025-01-15T10:00:00Z",
+        )
+        .unwrap();
 
         let count: i64 = db
             .conn
-            .query_row("SELECT COUNT(*) FROM sessions WHERE id = 'sess-1'", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE id = 'sess-1'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
         assert_eq!(count, 1);
     }
@@ -463,8 +473,14 @@ mod tests {
     #[test]
     fn insert_message_and_fts5_search() {
         let (db, _dir) = temp_db();
-        db.insert_session("sess-1", "cli", "claude-opus", "anthropic", "2025-01-15T10:00:00Z")
-            .unwrap();
+        db.insert_session(
+            "sess-1",
+            "cli",
+            "claude-opus",
+            "anthropic",
+            "2025-01-15T10:00:00Z",
+        )
+        .unwrap();
 
         db.insert_message(
             "sess-1",
@@ -477,9 +493,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = db
-            .search_messages("database migrations", None)
-            .unwrap();
+        let results = db.search_messages("database migrations", None).unwrap();
         assert_eq!(results.len(), 1);
         assert!(results[0].content.contains("database migrations"));
     }
@@ -489,8 +503,14 @@ mod tests {
         let (db, _dir) = temp_db();
         db.insert_session("sess-1", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
             .unwrap();
-        db.insert_session("sess-2", "subagent", "claude-sonnet", "anthropic", "2025-01-15T11:00:00Z")
-            .unwrap();
+        db.insert_session(
+            "sess-2",
+            "subagent",
+            "claude-sonnet",
+            "anthropic",
+            "2025-01-15T11:00:00Z",
+        )
+        .unwrap();
 
         let sessions = db.list_sessions_rich(None).unwrap();
         assert_eq!(sessions.len(), 2);
@@ -504,8 +524,14 @@ mod tests {
         let (db, _dir) = temp_db();
         db.insert_session("sess-1", "cli", "gpt-5", "openai", "2025-01-15T10:00:00Z")
             .unwrap();
-        db.insert_session("sess-2", "review-fork", "claude-sonnet", "anthropic", "2025-01-15T11:00:00Z")
-            .unwrap();
+        db.insert_session(
+            "sess-2",
+            "review-fork",
+            "claude-sonnet",
+            "anthropic",
+            "2025-01-15T11:00:00Z",
+        )
+        .unwrap();
 
         let sessions = db.list_sessions_rich(Some(&["review-fork"])).unwrap();
         assert_eq!(sessions.len(), 1);
@@ -541,11 +567,23 @@ mod tests {
             .unwrap();
 
         db.insert_message(
-            "sess-1", "user", "how do we build this", None, None, None, "2025-01-15T10:01:00Z",
+            "sess-1",
+            "user",
+            "how do we build this",
+            None,
+            None,
+            None,
+            "2025-01-15T10:01:00Z",
         )
         .unwrap();
         db.insert_message(
-            "sess-1", "assistant", "run cargo build", None, None, None, "2025-01-15T10:02:00Z",
+            "sess-1",
+            "assistant",
+            "run cargo build",
+            None,
+            None,
+            None,
+            "2025-01-15T10:02:00Z",
         )
         .unwrap();
 
