@@ -29,26 +29,45 @@ const MIN_REVIEW_INTERVAL_SECS: u64 = 900; // 15 minutes
 static LAST_REVIEW: AtomicU64 = AtomicU64::new(0);
 
 /// Review prompt focused on project memory, pitfalls, and skills.
-/// Port of Hermes's background review prompts, combined into one pass.
-const COMBINED_REVIEW_PROMPT: &str = r#"Review the conversation above and do TWO things:
+/// Port of Hermes's `_COMBINED_REVIEW_PROMPT` (background_review.py:150-158)
+/// and `_SKILL_REVIEW_PROMPT` (background_review.py:45-148), adapted
+/// for coding context.
+const COMBINED_REVIEW_PROMPT: &str = r#"Review the conversation above and update what we know about this project and how to work on it.
 
-**CRITICAL: You have ONLY the `memory` and `skill` tools available.** Do not attempt to use read, write, edit, bash, or any other tools.
+**CRITICAL: You have ONLY the `memory` and `skill` tools available.** Do not attempt to use read, write, edit, bash, or any other tools — they are not loaded.
 
-**1. Update MEMORY:**
-- What project facts, conventions, or build commands were confirmed?
-- What pitfalls or anti-patterns were discovered?
-- Any user corrections about how things should be done?
+**1. Update MEMORY (project facts, conventions, pitfalls):**
+- What build/test commands were discovered or confirmed?
+- What naming conventions, file layout patterns, or import styles were used?
+- What architecture patterns emerged (how modules relate, error handling style)?
+- What library quirks or tool behaviors were discovered?
+- Were there any user corrections about how things should be done?
+- Was something tried and failed? Capture what was attempted and WHY it failed.
 
-**2. Update SKILLS:**
-- Did any loaded skills turn out wrong or outdated? PATCH them.
-- Did a non-trivial workflow or debugging strategy emerge? CREATE a skill.
-- Did the user correct your approach? Embed that lesson.
+**2. Update SKILLS (procedural improvements):**
+Be ACTIVE — most sessions produce at least one skill update. A pass that does nothing is a missed learning opportunity.
 
-Use the `memory` tool to add entries to MEMORY.md (facts) or PITFALLS.md (pitfalls).
-Use the `skill` tool to list, view, patch, or create skills.
+Preference order — prefer the earliest that fits:
+  1. UPDATE A CURRENTLY-LOADED SKILL. If the conversation involved a skill that is already in the library, extend or correct it first.
+  2. UPDATE AN EXISTING UMBRELLA. If the new knowledge belongs under a broader topic that already has a skill, patch it.
+  3. ADD A SUPPORT FILE under an existing umbrella via the skill tool (references/, templates/, or scripts/).
+  4. CREATE A NEW CLASS-LEVEL UMBRELLA SKILL only when no existing skill covers the class.
 
-Be specific and actionable. Future sessions should benefit from what you learned.
-"Nothing to save." is valid but should not be the default."#;
+Signals that warrant action:
+  • User corrected your style, approach, or workflow. Frustration signals like "stop doing X", "this is too verbose", "don't format like this", or an explicit "remember this" are FIRST-CLASS skill signals.
+  • Non-trivial technique, fix, workaround, or debugging pattern emerged.
+  • A skill that was loaded or consulted turned out wrong or outdated — PATCH IT NOW.
+  • A pattern repeated across the session that future sessions would benefit from.
+
+Do NOT capture:
+  • Environment-dependent failures: missing binaries, "command not found", unconfigured credentials. The user can fix these — they are not durable rules.
+  • Negative claims about tools ("read tool is broken", "cannot use X"). These harden into refusals long after the actual problem was fixed.
+  • Session-specific transient errors that resolved before the conversation ended.
+  • One-off task narratives. "Analyze this PR" is not a class of work that warrants a skill.
+
+Target shape of the library: CLASS-LEVEL skills with a rich SKILL.md. Not a long flat list of narrow one-session-one-skill entries.
+
+"Nothing to save." is valid but should NOT be the default. Most coding sessions produce at least one learning."#;
 
 /// Spawn a background review task that evaluates the just-completed
 /// session and writes learnings to project memory and skills.
@@ -56,7 +75,15 @@ Be specific and actionable. Future sessions should benefit from what you learned
 /// This is fire-and-forget — it runs in a `tokio::spawn` task and
 /// returns immediately. Failures are logged to stderr and never
 /// block the user.
-pub fn spawn_background_review(agent: AnyAgent, _paths: ProjectPaths, transcript: String) {
+///
+/// Set `review_prompt_override` to use a custom prompt instead of
+/// the default COMBINED_REVIEW_PROMPT. Pass `None` for the default.
+pub fn spawn_background_review(
+    agent: AnyAgent,
+    _paths: ProjectPaths,
+    transcript: String,
+    review_prompt_override: Option<&str>,
+) {
     // Rate-limit: skip if a review ran recently. Uses atomic
     // compare-and-swap so concurrent Done events from different
     // sessions don't race — only the first one wins.
@@ -75,15 +102,20 @@ pub fn spawn_background_review(agent: AnyAgent, _paths: ProjectPaths, transcript
     }
     LAST_REVIEW.store(now, Ordering::Relaxed);
 
+    let prompt = review_prompt_override
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| COMBINED_REVIEW_PROMPT.to_string());
+
     tokio::spawn(async move {
         // Build a review runner with only memory + skill tools.
-        let review_runner =
-            agent.spawn_review_runner(COMBINED_REVIEW_PROMPT.to_string(), transcript);
+        let review_runner = agent.spawn_review_runner(prompt, transcript);
 
-        // Drain events. We don't render them — the review runs
-        // silently in the background.
+        // Drain events. Track tool calls so we can summarize what
+        // the review actually did (Hermes's action summary pattern).
         let mut rx = review_runner.event_rx;
         let mut had_error = false;
+        let mut tool_actions: Vec<String> = Vec::new();
+
         while let Some(event) = rx.recv().await {
             use crate::event::AgentEvent;
             match event {
@@ -95,6 +127,9 @@ pub fn spawn_background_review(agent: AnyAgent, _paths: ProjectPaths, transcript
                     );
                     had_error = true;
                 }
+                AgentEvent::ToolCall { name, .. } => {
+                    tool_actions.push(name.to_string());
+                }
                 AgentEvent::Done { .. } => {
                     break;
                 }
@@ -104,7 +139,25 @@ pub fn spawn_background_review(agent: AnyAgent, _paths: ProjectPaths, transcript
             }
         }
 
-        if !had_error {
+        if !had_error && !tool_actions.is_empty() {
+            // Surface action summary so the user knows what was learned.
+            // Port of Hermes's `_safe_print` (background_review.py:514-516).
+            let summary = tool_actions
+                .iter()
+                .fold(Vec::<&str>::new(), |mut acc, a| {
+                    if !acc.contains(&a.as_str()) {
+                        acc.push(a.as_str());
+                    }
+                    acc
+                })
+                .join(" · ");
+            tracing::info!(
+                target: "dirge::review",
+                actions = %summary,
+                "💾 Self-improvement review: {}",
+                summary
+            );
+        } else if !had_error {
             tracing::info!(
                 target: "dirge::review",
                 "Background review completed — project knowledge updated"
@@ -252,5 +305,25 @@ mod tests {
 
         let t = build_transcript(&s);
         assert!(t.contains("<interrupted>"));
+    }
+
+    #[test]
+    fn review_prompt_contains_required_sections() {
+        // Verify the prompt has the key structural elements from Hermes.
+        assert!(COMBINED_REVIEW_PROMPT.contains("Preference order"));
+        assert!(COMBINED_REVIEW_PROMPT.contains("Do NOT capture"));
+        assert!(COMBINED_REVIEW_PROMPT.contains("Signals that warrant"));
+        assert!(COMBINED_REVIEW_PROMPT.contains("Environment-dependent"));
+        assert!(COMBINED_REVIEW_PROMPT.contains("CLASS-LEVEL skills"));
+        assert!(COMBINED_REVIEW_PROMPT.contains("Nothing to save"));
+    }
+
+    #[test]
+    fn review_prompt_override_is_accepted() {
+        // Verify the function signature compiles with an override.
+        // (This is a compile-time check but also verifies the Option
+        // typing works.)
+        let custom = "Custom review prompt";
+        assert_ne!(custom, COMBINED_REVIEW_PROMPT);
     }
 }

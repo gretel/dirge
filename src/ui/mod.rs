@@ -356,6 +356,80 @@ fn capture_partial_on_abort(
     true
 }
 
+/// Persist the current turn (user prompt + assistant response + tool
+/// calls) to the SQLite session DB for FTS5 search. Called at every
+/// run boundary — Done, Interjected, ContextOverflow, and Error.
+///
+/// Best-effort: failures are silent (DB open/write errors shouldn't
+/// break the session). Session insert is idempotent via INSERT OR IGNORE.
+fn persist_turn_to_db(
+    session: &crate::session::Session,
+    user_prompt: &str,
+    assistant_text: &str,
+    tool_calls: &[crate::session::ToolCallEntry],
+) {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+    let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
+    let db = match crate::extras::session_db::SessionDb::open(&paths.session_db_path()) {
+        Ok(db) => db,
+        Err(_) => return,
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let sid = format!(
+        "dirge-{}",
+        session.id.as_str().chars().take(8).collect::<String>()
+    );
+    let _ = db.insert_session(&sid, "cli", &session.model, &session.provider, &now);
+
+    if !user_prompt.is_empty() {
+        let _ = db.insert_message(&sid, "user", user_prompt, None, None, None, &now);
+    }
+
+    if !assistant_text.is_empty() {
+        // Collect tool names + serialized tool calls for the
+        // assistant message so FTS5 can find them.
+        let tool_names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
+        let tool_name_str = if tool_names.is_empty() {
+            None
+        } else {
+            Some(tool_names.join(" "))
+        };
+        let tool_calls_str = if tool_calls.is_empty() {
+            None
+        } else {
+            serde_json::to_string(tool_calls).ok()
+        };
+        let _ = db.insert_message(
+            &sid,
+            "assistant",
+            assistant_text,
+            tool_name_str.as_deref(),
+            tool_calls_str.as_deref(),
+            None,
+            &now,
+        );
+    }
+
+    // Also insert each tool result as a separate message so
+    // searching for a tool name finds concrete results.
+    for tc in tool_calls {
+        let result_text = match &tc.state {
+            crate::session::ToolCallState::Completed { result } => result.clone(),
+            crate::session::ToolCallState::Interrupted => "[interrupted]".to_string(),
+            crate::session::ToolCallState::Failed { error } => format!("[failed: {}]", error),
+        };
+        let _ = db.insert_message(
+            &sid,
+            "tool",
+            &result_text,
+            Some(&tc.name),
+            None,
+            Some(&tc.id),
+            &now,
+        );
+    }
+}
+
 /// Map a plugin-supplied color string ("cyan", "red", ...) to a
 /// crossterm `Color`. Falls back to dim grey for anything unrecognized
 /// so a typo in plugin code doesn't crash the UI.
@@ -2928,30 +3002,15 @@ pub async fn run_interactive(
                             // session DB for future search. Uses a
                             // stable session id so messages from the
                             // same interactive session are grouped.
-                            if let Ok(db) = crate::extras::session_db::SessionDb::open(
-                                &paths.session_db_path(),
-                            ) {
-                                let now = chrono::Utc::now().to_rfc3339();
-                                let sid = format!("dirge-{}", session.id.as_str().chars().take(8).collect::<String>());
-                                // Best-effort: insert_session is
-                                // idempotent (primary key, duplicates
-                                // silently ignored by rusqlite OR
-                                // IGNORE). We always try to create
-                                // and then append messages.
-                                let _ = db.insert_session(&sid, "cli", &session.model, &session.provider, &now);
-                                if !last_user_prompt.is_empty() {
-                                    let _ = db.insert_message(&sid, "user", &last_user_prompt, None, None, None, &now);
-                                }
-                                if !response.is_empty() {
-                                    let _ = db.insert_message(&sid, "assistant", &response, None, None, None, &now);
-                                }
-                            }
+                            // Includes tool names + results for FTS5.
+                            persist_turn_to_db(session, &last_user_prompt, &response, &tool_calls_buf);
 
                             let transcript = crate::agent::review::build_transcript(session);
                             crate::agent::review::spawn_background_review(
                                 agent.clone(),
                                 paths.clone(),
                                 transcript,
+                                None,
                             );
 
                             // Curator check: run periodic skill maintenance
@@ -3100,6 +3159,10 @@ pub async fn run_interactive(
                         // history. Even truncated, it lets the LLM see what
                         // it had said when the user spoke up.
                         if !partial_response.is_empty() {
+                            // Persist the partial turn to session DB
+                            // before tool_calls_buf is consumed.
+                            persist_turn_to_db(session, &last_user_prompt, &partial_response, &tool_calls_buf);
+
                             // Phase 3: same structured persistence
                             // as the Done branch. Any pending entries
                             // (tool calls without a result yet) keep
@@ -3187,6 +3250,9 @@ pub async fn run_interactive(
                             &format!("context overflow: {}", safe),
                             c_error(),
                         )?;
+                        // Persist what we have so far (partial response
+                        // + tool calls) before tearing down the runner.
+                        persist_turn_to_db(session, &last_user_prompt, &response_buf, &tool_calls_buf);
                         // Tear down the current runner before respawn.
                         if let Some(h) = agent_abort.take() {
                             h.abort();
@@ -3362,6 +3428,11 @@ pub async fn run_interactive(
                         close_tool_chamber_if_open(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
                         let safe = sanitize_output(&e);
                         renderer.write_line(&format!("error: {}", safe), c_error())?;
+
+                        // Persist partial turn (whatever was streamed before
+                        // the error) so it's searchable and the session has
+                        // a record of what went wrong.
+                        persist_turn_to_db(session, &last_user_prompt, &response_buf, &tool_calls_buf);
 
                         #[cfg(feature = "plugin")]
                         if let Some(pm) = plugin_manager {

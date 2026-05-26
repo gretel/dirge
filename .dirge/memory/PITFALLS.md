@@ -1,7 +1,12 @@
-## Bridge drops LoopMessage::User at MessageStart
-
-`src/agent/agent_loop/bridge.rs` line 221-236 originally returned `Vec::new()` for all non-Custom `LoopMessage::User` variants at `MessageStart`. The comment explicitly said "user messages aren't AgentEvents at all." This was the root cause of steering-injected user messages being swallowed — the UI never received an event for them.
-
-Fix: emit `AgentEvent::UserMessage { content }` for `LoopMessage::User` so the UI can display the interjected text in the log and persist it to the session. The bridge's translation table comment and the `message_start_end_are_no_ops` test both encoded the wrong assumption; both needed updating.
+Legacy: run_agent_loop_continue + LoopError removed. New way: mid-run steering via get_steering_messages. Interjected variant IS actively constructed by bridge (rig stream cancellation). Don't mark dead_code.
 §
-Legacy code path: the old `run_agent_loop_continue` and `LoopError` enum were removed. The new way is mid-run steering via `get_steering_messages` + `steering_from_queue`. The `Interjected` variant in `AgentEvent` is actively constructed by the bridge (not legacy) — it's emitted when the rig stream is cancelled via interject signal. Don't mark it dead_code.
+Learning loop gaps: R1 fixed — per-turn session DB writes + FTS5 tool_name/tool_calls indexing + v2 backfill migration. Remaining: compression (fold flag unused), skill usage tracking, fuzzy patches, curator stub, skills in preamble. 14-gap audit in PLAN_LEARNING.md.
+§
+## FTS5 formula migration: 'rebuild' doesn't work
+External-content FTS5: `INSERT INTO fts(fts) VALUES('rebuild')` re-indexes using old trigger formula. To change indexed content (e.g. add tool_name to index), DELETE FROM fts then INSERT INTO fts SELECT id, new_formula FROM messages.
+§
+## #![allow(dead_code)] hides real dead code
+Module-level suppression in agent_loop/mod.rs and lsp/mod.rs concealed ~50 genuinely unused items. Removing it revealed the true extent. Prefer targeted per-item annotations — even many are better than module-wide silence.
+§
+## env::set_var + parallel tests = flaky
+`std::env::set_var` is global/unsafe/unsynchronized. Tests mutating same key race. Fix: static Mutex + RAII EnvGuard that clears on Drop (applied in dirge_paths.rs).

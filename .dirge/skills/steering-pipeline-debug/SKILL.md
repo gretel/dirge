@@ -1,62 +1,41 @@
 ---
 name: steering-pipeline-debug
-description: Debugging why user messages typed during an agent run don't appear in the UI log or reach the model.
+description: Debugging the steering pipeline — user interjection messages being swallowed or not displayed.
+triggers:
+  - "user message swallowed"
+  - "interjection not showing"
+  - "steering message not displayed"
+  - "mid-run message not appearing"
 ---
 
-# Steering Pipeline Debugging
+## Steering pipeline architecture
 
-Use when investigating why user messages typed during an agent run don't appear in the UI log, don't reach the model, or the agent doesn't respond to mid-run interjections.
-
-## The pipeline
+When the user types while the agent is running, the message flows through 8 steps:
 
 ```
-UI input (Enter)
-  → interjection_queue (VecDeque<String>, Mutex-protected)
-    → steering_from_queue() polls at turn boundaries → LoopMessage::User
-      → run.rs inner loop injects → stream.rs/tools.rs emits LoopEvent::MessageStart { message: LoopMessage::User }
-        → bridge.rs translate() → AgentEvent::UserMessage { content }
-          → ui/mod.rs event handler → write_user_lines() + session.add_message()
+UI input → interjection_queue → steering_from_queue → get_steering_messages
+→ LoopMessage::User → LoopEvent::MessageStart → EventBridge.translate()
+→ AgentEvent::UserMessage → UI event handler → write_user_lines + session.add_message
 ```
 
-## Key files and lines
+## Common failure points
 
-1. **`src/ui/mod.rs:1576-1593`** — `#[cfg(feature = "loop")]` path: user types during active loop → queue + display `»` prefix
-2. **`src/ui/mod.rs:1870-1885`** — non-loop path: user types while `is_running` → queue + display `»` prefix
-3. **`src/ui/mod.rs:674`** — `interjection_queue` definition (Arc<Mutex<VecDeque<String>>>)
-4. **`src/agent/agent_loop/steering.rs:1-484`** — `steering_from_queue()` builds `GetSteeringMessagesFn`, wraps with `MID_TURN_STEER_WRAPPER`
-5. **`src/agent/agent_loop/run.rs:237-241`** — initial steering poll before outer loop
-6. **`src/agent/agent_loop/run.rs:587-591`** — steering refresh after each inner iteration
-7. **`src/agent/agent_loop/bridge.rs:221-236`** — `MessageStart` translation: User → UserMessage, Custom → CustomMessage, others → no-op
-8. **`src/event.rs:155-159`** — `AgentEvent::UserMessage { content: CompactString }`
-9. **`src/ui/mod.rs:3488-3492`** — UI handler for `AgentEvent::UserMessage`
+### 1. Bridge drops User messages (MOST COMMON)
+`src/agent/agent_loop/bridge.rs` — `LoopEvent::MessageStart { message }` handler. If the match arm returns `Vec::new()` for `LoopMessage::User`, the message never reaches the UI. Fix: emit `AgentEvent::UserMessage { content }`.
 
-## Common failure modes
+### 2. UI doesn't handle UserMessage
+`src/ui/mod.rs` — the main event handler match. Must have an arm for `AgentEvent::UserMessage { content }` that calls `write_user_lines()` and `session.add_message()`.
 
-### Message queued but never reaches model
-- Check `steering_from_queue` is wired into `LoopConfig.get_steering_messages` (integration.rs:388-390)
-- Check `QueueMode` — `All` drains entire queue per poll, `OneAtATime` drains oldest only
-- Check that the inner loop's `while has_more_tool_calls || !pending_messages.is_empty()` condition is reached
+### 3. Loop-mode path swallows content
+`src/ui/mod.rs` ~line 1576 — the `#[cfg(feature = "loop")]` path. Must display the message content with `»` prefix for each line before showing "(queued...)". The original code only showed "loop active — message queued" without the actual text.
 
-### Message queued but not displayed in UI
-- Check bridge's `MessageStart` handler — originally returned `Vec::new()` for User messages
-- Check UI has arm for `AgentEvent::UserMessage` — added in event handler at ~line 3488
-- Check both UI paths display the `»` lines: loop path (~1576) and non-loop path (~1870)
+### 4. `wrap_steer_user_message` / `MID_TURN_STEER_WRAPPER`
+`src/agent/agent_loop/steering.rs` — the wrapper prefix is prepended so the model treats the message as guidance, not a new task. Verify the prefix is present in the queued content.
 
-### AgentEvent variant added but compile fails
-- See "AgentEvent variant addition checklist" in memory — must update ~7 match arms across the codebase
+## Debugging checklist
 
-## Verification
-
-```bash
-# Bridge tests — verifies translation correctness
-cargo test --bin dirge agent::agent_loop::bridge
-
-# Steering tests — verifies queue polling, sanitization, modes
-cargo test --bin dirge agent::agent_loop::steering
-
-# Integration tests — verifies end-to-end steering injection
-cargo test --bin dirge agent::agent_loop::integration
-
-# Full suite
-cargo test --bin dirge
-```
+1. Set a breakpoint at `bridge.rs` `LoopEvent::MessageStart` — is `LoopMessage::User` reaching it?
+2. Check what `translate()` returns — is it `Vec::new()` or `AgentEvent::UserMessage`?
+3. Check the UI handler — does the `AgentEvent::UserMessage` arm exist and render?
+4. Check `steering_from_queue` — is the interjection_queue being drained?
+5. Check `MID_TURN_STEER_WRAPPER` — is the wrapper being applied?
