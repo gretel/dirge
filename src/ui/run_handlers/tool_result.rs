@@ -24,6 +24,26 @@ pub(crate) async fn handle_tool_result(
     id: String,
     output: String,
 ) -> anyhow::Result<()> {
+    // dirge-5h5: diagnostic for the empty-chambers-on-parallel-reads
+    // bug. Enable with `RUST_LOG=dirge::ui::chamber=trace dirge …`,
+    // reproduce (7 parallel reads), then inspect the trace stream:
+    // each ToolResult logs the id, last_tool_call_id, chamber state,
+    // and output length so it's clear which results entered the
+    // dirge-jzj fresh-chamber path, which ones piggybacked on the
+    // existing chamber, and what their bodies looked like.
+    tracing::trace!(
+        target: "dirge::ui::chamber",
+        event = "tool_result_in",
+        id = %id,
+        last_tool_call_id = ?ctx.last_tool_call_id,
+        tool_chamber_open = *ctx.tool_chamber_open,
+        chamber_top_start = ?ctx.chamber_top_start,
+        chamber_top_end = ?ctx.chamber_top_end,
+        output_len = output.len(),
+        output_trimmed_len = output.trim().len(),
+        "ToolResult handler entry"
+    );
+
     // Phase 3: pair the result with its call.
     // Prefer id-match; fall back to the most-
     // recent Interrupted (pending) entry for
@@ -59,7 +79,17 @@ pub(crate) async fn handle_tool_result(
     // of completion order. The id-matches case (the
     // common sequential path) falls through to the
     // existing render paths below.
-    if !id.is_empty() && ctx.last_tool_call_id.as_deref() != Some(id.as_str()) && show_details {
+    let jzj_path_active =
+        !id.is_empty() && ctx.last_tool_call_id.as_deref() != Some(id.as_str()) && show_details;
+    tracing::trace!(
+        target: "dirge::ui::chamber",
+        event = "tool_result_path_decision",
+        id = %id,
+        jzj_path = jzj_path_active,
+        show_details = show_details,
+        "ToolResult chamber-routing decision"
+    );
+    if jzj_path_active {
         // Close whatever chamber is on screen first,
         // then paint a fresh TOP for this id. We
         // don't reuse the ToolCall handler's TOP-

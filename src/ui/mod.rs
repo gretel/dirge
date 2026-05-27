@@ -1711,6 +1711,20 @@ pub async fn run_interactive(
                         agent_line_started = true;
                     }
                     AgentEvent::ToolCall { id, name, args } => {
+                        // dirge-5h5: log entry state so the parallel-
+                        // read race can be reconstructed offline.
+                        tracing::trace!(
+                            target: "dirge::ui::chamber",
+                            event = "tool_call_in",
+                            id = %id,
+                            name = %name,
+                            last_tool_call_id_before = ?last_tool_call_id,
+                            tool_chamber_open_before = tool_chamber_open,
+                            chamber_top_start_before = ?chamber_top_start,
+                            chamber_top_end_before = ?chamber_top_end,
+                            buffer_len = renderer.buffer_len(),
+                            "ToolCall handler entry"
+                        );
                         was_reasoning = false;
                         // Phase 3: persist as structured entry. Start
                         // in Interrupted state so that if the user
@@ -1798,6 +1812,16 @@ pub async fn run_interactive(
                         renderer.write_line(&header, c_tool())?;
                         chamber_top_end = Some(renderer.buffer_len());
                         tool_chamber_open = true;
+                        tracing::trace!(
+                            target: "dirge::ui::chamber",
+                            event = "tool_call_painted",
+                            id = %id,
+                            name = %name,
+                            chamber_top_start_after = ?chamber_top_start,
+                            chamber_top_end_after = ?chamber_top_end,
+                            buffer_len = renderer.buffer_len(),
+                            "ToolCall TOP painted"
+                        );
 
                         // Note: on-tool-start fires from HookedToolDyn now,
                         // around the actual tool invocation. The UI no
