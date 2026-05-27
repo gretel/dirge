@@ -90,6 +90,12 @@ async fn apply_create(path: &str, content: &str) -> Result<String, String> {
             MAX_APPLY_PATCH_BYTES,
         ));
     }
+    // Phase-2 tree-sitter validation: refuse to create
+    // syntactically-broken files. See docs/AGENTIC_LOOP_PLAN.md §2.
+    #[cfg(feature = "semantic")]
+    if let Err(errors) = crate::semantic::syntax_validator::check_syntax(p, content) {
+        return Err(crate::semantic::syntax_validator::format_errors(p, &errors));
+    }
     crate::fs_atomic::atomic_write(p, content.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;
@@ -152,6 +158,17 @@ async fn apply_update(path: &str, old_text: &str, new_text: &str) -> Result<Stri
     } else {
         updated_normalized
     };
+    // Phase-2 tree-sitter validation on the updated content
+    // before write. See docs/AGENTIC_LOOP_PLAN.md §2.
+    #[cfg(feature = "semantic")]
+    if let Err(errors) =
+        crate::semantic::syntax_validator::check_syntax(std::path::Path::new(path), &to_write)
+    {
+        return Err(crate::semantic::syntax_validator::format_errors(
+            std::path::Path::new(path),
+            &errors,
+        ));
+    }
     crate::fs_atomic::atomic_write(std::path::Path::new(path), to_write.as_bytes())
         .await
         .map_err(|e| format!("write failed: {}", e))?;

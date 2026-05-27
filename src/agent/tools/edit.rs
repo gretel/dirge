@@ -307,6 +307,21 @@ impl Tool for EditTool {
             new_content
         };
 
+        // Phase-2 tree-sitter validation: refuse to write
+        // syntactically-broken edits so the model sees the error
+        // in the same turn. See docs/AGENTIC_LOOP_PLAN.md §2.
+        #[cfg(feature = "semantic")]
+        if let Err(errors) = crate::semantic::syntax_validator::check_syntax(
+            std::path::Path::new(&resolved_path),
+            &output,
+        ) {
+            return Err(ToolError::Msg(
+                crate::semantic::syntax_validator::format_errors(
+                    std::path::Path::new(&resolved_path),
+                    &errors,
+                ),
+            ));
+        }
         #[cfg(feature = "lsp")]
         let write_at = std::time::Instant::now();
         // Atomic write so a mid-write crash leaves the previous

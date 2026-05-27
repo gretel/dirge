@@ -104,6 +104,17 @@ impl Tool for WriteTool {
             check_perm_path_resolve(&self.permission, &self.ask_tx, "write", &args.path).await?;
 
         let path = Path::new(&resolved_path);
+        // Phase-2 tree-sitter validation: refuse to write
+        // syntactically-broken code so the model sees the error
+        // in the SAME turn and self-corrects. No-op for unknown
+        // file types or when no `semantic-<lang>` feature is
+        // built. See docs/AGENTIC_LOOP_PLAN.md §2.
+        #[cfg(feature = "semantic")]
+        if let Err(errors) = crate::semantic::syntax_validator::check_syntax(path, &args.content) {
+            return Err(ToolError::Msg(
+                crate::semantic::syntax_validator::format_errors(path, &errors),
+            ));
+        }
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
