@@ -4,8 +4,8 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 
 ## Features
 
-- **Multi-provider**: OpenRouter, OpenAI, Anthropic, Gemini, DeepSeek, GLM, Ollama, plus custom providers
-- **Standard tools**: read, write, edit, bash, grep, find_files, glob, list_dir, write_todo_list, apply_patch, repo_overview, webfetch, websearch, question, memory, skill, task, task_status
+- **Multi-provider**: OpenRouter, OpenAI, Anthropic, Gemini, DeepSeek, GLM, Ollama, plus custom OpenAI-compatible endpoints. A single `providers` map declares aliases; top-level role keys (`provider`, `review_provider`, `escalation_provider`, `summarization_provider`, `subagent_provider`) point each role at one of those aliases. See [Configuration](#configuration).
+- **Standard tools**: read, write, edit, bash, grep, find_files, glob, list_dir, write_todo_list, apply_patch, repo_overview, session_search, webfetch, websearch, question, memory, skill, task, task_status, tool_search
 - **Line-numbered read output**: `read` tool prefixes each line with right-aligned line numbers (`123: content`)
 - **Environment-aware**: system prompt includes OS, shell, working directory, and git branch for context
 - **Semantic code tools** (tree-sitter): list_symbols, get_symbol_body, find_definition, find_callers, find_callees — supports TypeScript/TSX, Python, Clojure (clj/cljs/cljc/edn/bb), Go, Ruby, Rust, Java, C, and C++
@@ -26,13 +26,27 @@ Minimal coding agent written in Rust, inspired by [pi](https://pi.dev/docs/lates
 - **ACP support** (gated): Agent Communication Protocol server for editor integration. ACP locks the active prompt at launch — use `--prompt <name>` on startup to opt into a restricted mode (the protocol has no mid-session prompt-switch message)
 - **Plugin system** (Janet, on a dedicated worker thread): hooks for the full session/agent/tool lifecycle. Plugins can intercept tool calls (block/mutate/replace), register slash commands, transform user input, post notifications, and prompt the user with blocking `confirm`/`select` dialogs
 
+### Robust agent loop
+
+A multi-phase hardening pass against the failure modes that plague long sessions and weaker models. See [`docs/AGENTIC_LOOP_PLAN.md`](docs/AGENTIC_LOOP_PLAN.md) for the full design.
+
+- **Tool-input repair layer**: catches and fixes common malformed tool calls before they hit the tool — strips `null` optional fields, parses JSON-string arrays, unwraps markdown links in path fields, applies relational defaults declared in the tool's schema. Failed repairs emit a structured `tool_input_invalid` log with the original args.
+- **Schema-aware contract hints** (`dirge-hints`): per-tool schemas can declare `semantic: "absolute_path"`, `relational: [{requires, defaults}]`, etc. The repair layer reads these to drive automatic defaults + agent-facing `Note:` text — removing per-tool hardcoded heuristics.
+- **Tree-sitter pre-write validation**: every `write` / `edit` / `apply_patch` is parsed through the matching tree-sitter grammar before bytes hit disk. Syntactically-broken code is rejected with line/column-precise errors so the model corrects it on the same turn. Languages: Rust, TS/TSX, Python, Go, Ruby, Java, C, C++, Clojure, Bash (each gated on its `semantic-<lang>` feature).
+- **Dynamic `tool_search`** (opt-in via `dynamic_tool_search: true`): ships only `tool_search` + a small always-on set in each request; the model calls `tool_search(query)` to discover and load more tools on demand. ~30% token savings on MCP-heavy sessions.
+- **Disk-backed large-output relay**: `bash` / `webfetch` outputs over an inline budget (default 8 KiB) are written to `~/.dirge/transient/<pid>/<tool>-<ts>.txt` and replaced with a head + ellipsis + tail summary plus a hint to `read` for specifics. Aged cleanup runs on every relay write.
+- **Anthropic prompt-cache positioning**: system prompt + tool defs sit at the start of every request (cache-warm prefix); a `prompt_cache_prefix` tracing event emits per-turn with stable hashes so unexpected prefix drift is observable. See [`docs/PROMPT_CACHE_AUDIT.md`](docs/PROMPT_CACHE_AUDIT.md).
+- **Dual-client tiering** (`escalation_provider` role): when a tool input fails to repair OR generated code fails the tree-sitter pre-write check, the next model call is routed through a more capable provider. One-shot per failure, capped at 3 per session, surfaced as a dim `↑ escalating to <provider>` status line.
+- **Context-depth reminders** (`context_depth_reminder_threshold`): tracks consecutive turns that touch the same file(s); when the streak crosses the threshold (default 8, opt-in), injects a single mid-turn reminder restating the active task + touched files so long runs don't drift.
+- **Tool-loop circuit breaker**: per-tool-call repeat counter trips on the 3rd identical `(tool, input)` within a 32-call window — catches non-progressing loops without needing model cooperation.
+
 **NOTE**: Windows support is not tested, but feel free to try and open an issue if you encounter any bugs.
 
 ## Performance
 
 _dirge_ is one of the smallest and most performant coding agents on the market.
 
-- Lines of code: ~49k LoC
+- Lines of code: ~100k LoC
 - Binary size: 25MB
 - RAM footprint: ~8MB on an empty session, ~15MB when working (vs ~300MB for opencode or other JS-based coding agents)
 
@@ -417,19 +431,49 @@ For custom themes, create `~/.config/dirge/<name>.theme.json` with overrides for
 - Ollama
 - Custom — any OpenAI-compatible endpoint
 
-Custom providers can be configured in `$XDG_CONFIG_HOME/dirge/config.json`:
+Providers are declared once in `$XDG_CONFIG_HOME/dirge/config.json` and referenced by alias from role-assignment keys:
 
 ```json
 {
-  "custom_providers": {
-    "my-provider": {
+  "provider": "deepseek",
+  "review_provider": "glm",
+  "escalation_provider": "anthropic",
+  "subagent_provider": "glm",
+
+  "providers": {
+    "deepseek": {
+      "model": "deepseek-v4-pro"
+    },
+    "glm": {
+      "model": "glm-4.6"
+    },
+    "anthropic": {
+      "model": "claude-opus-4-5"
+    },
+    "ollama": {
       "provider_type": "openai",
-      "base_url": "https://api.example.com/v1",
-      "api_key_env": "MY_API_KEY"
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model": "llama3.1"
     }
   }
 }
 ```
+
+Each `providers` entry accepts `provider_type` (optional — defaults to the entry's alias when that alias matches a built-in name), `base_url`, `model`, `api_key_env`, `allow_insecure`, and `stream_chunk_timeout_secs`. The aliases on the left of the map become the values you write in role-assignment keys.
+
+Role assignments:
+
+| Key | Used for | Falls back to |
+|-----|----------|---------------|
+| `provider` | Default / main loop | (none — required) |
+| `review_provider` | Background session-review pass | `provider` |
+| `escalation_provider` | One-shot retry after repair-exhaustion / pre-write syntax failure | `provider` (no-op when equal) |
+| `summarization_provider` | Context compaction | `provider` |
+| `subagent_provider` | `task` tool subagents | `provider` |
+
+When a role's provider equals `provider` (either explicitly or by fallback), no duplicate client is constructed and the feature has zero overhead — escalation routes, for example, simply don't fire because they'd be a no-op anyway.
+
+> **Note**: dirge no longer reads the legacy top-level `model`, `custom_providers`, or `review_model` keys — starting a session with any of those at the root fails fast with a migration hint. Move `model` inside the active provider's entry, `custom_providers.<name>` entries directly into `providers`, and `review_model` into the entry referenced by `review_provider`.
 
 ## License
 
