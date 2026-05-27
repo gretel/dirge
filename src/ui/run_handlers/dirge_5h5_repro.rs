@@ -23,6 +23,7 @@
 //! per-event chamber state:
 //!   RUST_LOG=dirge::ui::chamber=trace cargo test … -- --nocapture
 
+use ansi_to_tui::IntoText;
 use crossterm::style::Color;
 
 use crate::cli::Cli;
@@ -390,4 +391,332 @@ async fn dirge_5h5_repro_interleaved_baseline() {
     drop(ctx);
     let chambers = collect_chambers(&renderer);
     assert_all_chambers_have_body(&chambers, 7);
+}
+
+/// Scenario G (Layer 4): 7 parallel reads, with `add_chat()` injected
+/// at three points during the burst — before any ToolCall, mid-burst
+/// (after 3 ToolCalls but before any ToolResult), and right after the
+/// last ToolResult. Confirms that creating a subagent ChatSnapshot
+/// while the parent chamber paint is in flight does NOT disturb the
+/// active chat's buffer integrity. If this passes, `add_chat`'s
+/// push-to-snapshot path is innocent and the empty-frames bug must
+/// come from a layer above the renderer (event ordering / scheduling)
+/// or from the on-screen viewport (paint_line dropping body rows).
+#[tokio::test]
+async fn dirge_5h5_repro_add_chat_during_burst() {
+    let (cli, cfg, mut session, mut renderer) = fresh_scaffold();
+    let mut state = State::new();
+    let mut ctx = make_ctx(&mut renderer, &mut session, &mut state, &cli, &cfg);
+
+    // Subagent injected BEFORE the burst — exercises the path where a
+    // chat is created cold and the active buffer should be untouched.
+    let _pre = ctx.renderer.add_chat("subagent-pre");
+    let buffer_len_after_pre = ctx.renderer.buffer_len();
+    assert_eq!(
+        buffer_len_after_pre, 0,
+        "add_chat should not touch active buffer (pre)"
+    );
+
+    for i in 0..7 {
+        let id = format!("call-{i}");
+        simulate_tool_call(
+            &mut ctx,
+            &id,
+            "read",
+            serde_json::json!({"path": format!("/tmp/file{i}.txt")}),
+        );
+        // Inject a subagent mid-burst, right after the 4th ToolCall
+        // (chamber TOP painted, no body yet — most fragile state for
+        // close_tool_chamber_passive's drop-empty heuristic).
+        if i == 3 {
+            let len_before = ctx.renderer.buffer_len();
+            let _mid = ctx.renderer.add_chat("subagent-mid");
+            let len_after = ctx.renderer.buffer_len();
+            assert_eq!(
+                len_before, len_after,
+                "add_chat mid-burst must not mutate active buffer length"
+            );
+        }
+    }
+
+    // Now drain results in dispatch order. add_chat after the last
+    // result is the post-burst subagent-spawn shape.
+    for i in 0..7 {
+        let id = format!("call-{i}");
+        let body = format!("file {i} body line one\nfile {i} body line two");
+        handle_tool_result(&mut ctx, id, body)
+            .await
+            .expect("handle_tool_result");
+    }
+    let _post = ctx.renderer.add_chat("subagent-post");
+
+    drop(ctx);
+    let chambers = collect_chambers(&renderer);
+    assert_all_chambers_have_body(&chambers, 7);
+}
+
+/// Scenario H (Layer 4): write_line returns Ok even when tui_terminal
+/// is None (no TTY in tests). Confirms that the buffer storage path —
+/// push_buffer_line → wrap_line → commit_partial — preserves every
+/// line we ask it to store across a 7-chamber burst of mixed content
+/// (header rows + body rows + bottom rows + blank spacers). Counts
+/// emitted lines vs buffer.len() after the burst.
+#[tokio::test]
+async fn dirge_5h5_repro_buffer_integrity_after_burst() {
+    let (cli, cfg, mut session, mut renderer) = fresh_scaffold();
+    let mut state = State::new();
+    let mut ctx = make_ctx(&mut renderer, &mut session, &mut state, &cli, &cfg);
+
+    for i in 0..7 {
+        let id = format!("call-{i}");
+        simulate_tool_call(
+            &mut ctx,
+            &id,
+            "read",
+            serde_json::json!({"path": format!("/tmp/file{i}.txt")}),
+        );
+    }
+    for i in 0..7 {
+        let id = format!("call-{i}");
+        let body = format!("file {i} body line one\nfile {i} body line two");
+        handle_tool_result(&mut ctx, id, body)
+            .await
+            .expect("handle_tool_result");
+    }
+
+    drop(ctx);
+
+    // Every chamber must have >= 1 body row distinct from TOP and BOTTOM.
+    let chambers = collect_chambers(&renderer);
+    assert_eq!(
+        chambers.len(),
+        7,
+        "expected 7 chambers, got {}",
+        chambers.len()
+    );
+    for (i, c) in chambers.iter().enumerate() {
+        assert!(
+            c.body_rows >= 1,
+            "chamber {i} ({}) lost body rows: {:?}",
+            c.name,
+            c
+        );
+    }
+}
+
+/// Scenario G (Layer 2): simulates the `tokio::select!` race where the
+/// `subagent_chat_rx` arm fires BETWEEN two consecutive parent
+/// `AgentEvent::ToolResult` handlings. Recreates the dirge-5h5 shape
+/// ("4 background subagents running concurrently with the parent")
+/// by:
+///   1. Adding a second (subagent) chat via `renderer.add_chat`.
+///   2. Firing N parent ToolCalls (parent stays on chat 0).
+///   3. Firing N parent ToolResults, but BETWEEN each one calling
+///      `write_line_to_chat(subagent_idx, ...)` exactly as the
+///      `subagent_chat_rx` arm does for `Spawn`/`Complete` events.
+///
+/// If the active-chat's chamber state survives the cross-chat write
+/// untouched, all chambers render bodies. If `write_line_to_chat`
+/// (or any helper it calls) leaks into the active `partial` /
+/// `buffer` / `chamber_top_*` state, the assertion catches the
+/// resulting empty TOP+BOTTOM chambers.
+#[tokio::test]
+async fn dirge_5h5_repro_subagent_writes_between_tool_results() {
+    let (cli, cfg, mut session, mut renderer) = fresh_scaffold();
+
+    // Parent lives on chat 0 (the default). Pre-add a "subagent" chat
+    // at idx 1 so the cross-write target exists. In production this
+    // happens via `renderer.add_chat(name)` inside the
+    // `SubagentChatEvent::Spawn` handler — the call is synchronous
+    // and doesn't touch active chat state.
+    let subagent_idx = renderer.add_chat("task: simulated subagent");
+    assert_eq!(subagent_idx, 1, "subagent chat should be at idx 1");
+
+    let mut state = State::new();
+    let mut ctx = make_ctx(&mut renderer, &mut session, &mut state, &cli, &cfg);
+
+    // Fire 7 parent ToolCalls (parent is active_chat=0).
+    for i in 0..7 {
+        let id = format!("call-{i}");
+        simulate_tool_call(
+            &mut ctx,
+            &id,
+            "read",
+            serde_json::json!({"path": format!("/tmp/file{i}.txt")}),
+        );
+    }
+
+    // Fire 7 parent ToolResults in dispatch order. BETWEEN each pair,
+    // simulate the subagent arm by writing to the inactive chat slot
+    // — exactly as `subagent_chat_rx => write_line_to_chat(idx, ...)`
+    // does in `ui/mod.rs:2884+`. Use the same `theme::user()` /
+    // `theme::dim()` / `c_agent()` colors the production code uses
+    // so any per-color side effects in `write_line_to_chat` would be
+    // exercised here too.
+    use crate::ui::colors::c_agent;
+    use crate::ui::theme;
+    for i in 0..7 {
+        let id = format!("call-{i}");
+        let body = format!("file {i} body line one\nfile {i} body line two");
+        handle_tool_result(&mut ctx, id, body)
+            .await
+            .expect("handle_tool_result");
+        // Cross-chat write, mimicking the subagent arm between events.
+        let _ = ctx.renderer.write_line_to_chat(
+            subagent_idx,
+            "<you> simulated subagent prompt",
+            theme::user(),
+        );
+        let _ = ctx
+            .renderer
+            .write_line_to_chat(subagent_idx, "(subagent running…)", theme::dim());
+        let _ = ctx.renderer.write_line_to_chat(
+            subagent_idx,
+            "<dirge> simulated subagent result",
+            c_agent(),
+        );
+    }
+
+    drop(ctx);
+    let chambers = collect_chambers(&renderer);
+    assert_all_chambers_have_body(&chambers, 7);
+}
+
+// ============================================================
+// Layer 4 follow-up: `paint_line` only renders `text.lines[0]`.
+// If `into_text()` ever produces > 1 line from a chamber-row
+// string, the rest are silently dropped. These tests probe
+// `ansi_to_tui::into_text` behaviour on real chamber-row
+// outputs to confirm/refute that hypothesis.
+// ============================================================
+
+/// Drive `chamber_row` with realistic body content (1-line, plain
+/// text, no SGR) — what `read`'s output looks like row-by-row after
+/// `render_tool_output` slices it into single lines and calls
+/// `chamber_row` on each. Asserts `into_text` produces exactly 1
+/// rendered line per chamber-row string. If this ever returns > 1,
+/// paint_line is silently dropping content.
+#[test]
+fn chamber_row_parses_to_single_line_under_into_text() {
+    let inputs = [
+        "1: hello world",
+        "  fn main() {",
+        "      let x = 42;",
+        "",
+        "    │ already-quoted │",
+        "1: line with     spaces and tabs\t.",
+        "let foo = bar; // comment",
+        "// comment",
+        "    return Ok(())",
+        "}",
+    ];
+    for body in inputs {
+        let row = crate::ui::box_render::row(crate::ui::box_render::BoxStyle::Rounded, body, 80);
+        let parsed = row.as_str().into_text().expect("parse");
+        assert_eq!(
+            parsed.lines.len(),
+            1,
+            "chamber-row for {body:?} parsed to {} lines (paint_line only renders the first!): row={:?} parsed={:#?}",
+            parsed.lines.len(),
+            row,
+            parsed,
+        );
+    }
+}
+
+/// Same as above but for `chamber_row_with_bg` — the edit-diff
+/// rendering path (+/- rows with tinted backgrounds). bg_idx is
+/// embedded as an SGR escape so into_text MUST parse it without
+/// emitting a stray newline.
+#[test]
+fn chamber_row_with_bg_parses_to_single_line() {
+    let inputs = ["+ added line", "- removed line", "  context line"];
+    for body in inputs {
+        let row = crate::ui::box_render::row_with_bg(
+            crate::ui::box_render::BoxStyle::Rounded,
+            body,
+            80,
+            22,
+        );
+        let parsed = row.as_str().into_text().expect("parse");
+        assert_eq!(
+            parsed.lines.len(),
+            1,
+            "chamber_row_with_bg for {body:?} parsed to {} lines: row={:?} parsed={:#?}",
+            parsed.lines.len(),
+            row,
+            parsed,
+        );
+    }
+}
+
+/// Chamber TOP banner from `fit_banner_header` — exactly what the
+/// production path writes for each parallel-read ToolCall. If
+/// this ever parses to > 1 line, the chamber would render with a
+/// blank TOP, not blank body — but worth checking either way.
+#[test]
+fn chamber_top_banner_parses_to_single_line() {
+    for value in [
+        "/tmp/file0.txt",
+        "/tmp/very/long/path/with/many/segments/file.txt",
+        "(no args)",
+        "",
+    ] {
+        let header = fit_banner_header("READ", value, 80);
+        let parsed = header.as_str().into_text().expect("parse");
+        assert_eq!(
+            parsed.lines.len(),
+            1,
+            "banner for value={value:?} parsed to {} lines: header={:?} parsed={:#?}",
+            parsed.lines.len(),
+            header,
+            parsed,
+        );
+    }
+}
+
+/// The spacer row written before each chamber TOP — `write_line("",
+/// Color::White)`. Empty string. Document the actual behaviour.
+#[test]
+fn empty_spacer_into_text_behaviour() {
+    let parsed = "".into_text().expect("parse");
+    assert!(
+        parsed.lines.len() <= 1,
+        "empty string parsed to {} lines",
+        parsed.lines.len()
+    );
+}
+
+/// Real `read`-tool output flattened through `sanitize_output` →
+/// `chamber_row` → `into_text`. Simulates a realistic 7-line file
+/// being rendered as a chamber body.
+#[test]
+fn realistic_read_body_lines_parse_one_each() {
+    let body = "\
+1: use std::fs;
+2:
+3: fn main() {
+4:     let s = fs::read_to_string(\"x\").unwrap();
+5:     println!(\"{}\", s);
+6: }
+7: ";
+    let sanitized = sanitize_output(body).into_string();
+    let lines: Vec<&str> = sanitized.lines().collect();
+    assert_eq!(
+        lines.len(),
+        7,
+        "expected 7 lines after sanitize_output, got {}: {:?}",
+        lines.len(),
+        lines
+    );
+    for line in &lines {
+        let row = crate::ui::box_render::row(crate::ui::box_render::BoxStyle::Rounded, line, 80);
+        let parsed = row.as_str().into_text().expect("parse");
+        assert_eq!(
+            parsed.lines.len(),
+            1,
+            "row {row:?} parsed to {} lines",
+            parsed.lines.len()
+        );
+    }
 }

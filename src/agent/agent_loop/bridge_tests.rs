@@ -505,6 +505,92 @@ fn message_update_end_phases_are_no_ops() {
     }
 }
 
+/// dirge-5h5 layer-1 probe: drive 7 parallel `ToolExecutionStart`
+/// events followed by their `ToolExecutionEnd` events through a
+/// single bridge instance and assert every emitted `ToolResult`
+/// carries non-empty `output`. Mirrors the production parallel-
+/// execute ordering (all Starts first, then all Ends — possibly
+/// out-of-source order). If the bridge ever drops, shadows, or
+/// misroutes content for parallel reads, this test catches it.
+#[test]
+fn parallel_tool_execution_ends_preserve_distinct_content() {
+    let mut bridge = EventBridge::new();
+    let n = 7;
+    // Phase 1: 7 Starts in source order (mirrors tools.rs:843-852).
+    for i in 0..n {
+        let evts = bridge.translate(LoopEvent::ToolExecutionStart {
+            tool_call_id: format!("call-{i}"),
+            tool_name: "read".to_string(),
+            args: serde_json::json!({"path": format!("/f{i}")}),
+        });
+        // ToolCall + ToolStarted = 2 events.
+        assert_eq!(evts.len(), 2, "start {i} should emit 2 events");
+    }
+    // Phase 2: Ends in REVERSE order (simulating completion-order
+    // != source-order — what join_all surfaces in practice).
+    for i in (0..n).rev() {
+        let payload = format!("file-{i}-contents");
+        let evts = bridge.translate(LoopEvent::ToolExecutionEnd {
+            tool_call_id: format!("call-{i}"),
+            tool_name: "read".to_string(),
+            result: LoopToolResult {
+                content: vec![serde_json::json!({"type": "text", "text": payload})],
+                details: serde_json::Value::Null,
+                terminate: None,
+            },
+            is_error: false,
+        });
+        assert_eq!(evts.len(), 1, "end {i} should emit 1 event");
+        match &evts[0] {
+            AgentEvent::ToolResult { id, output, kind } => {
+                assert_eq!(id.as_str(), format!("call-{i}"));
+                assert!(
+                    !output.is_empty(),
+                    "ToolResult for call-{i} had empty output"
+                );
+                assert_eq!(output.as_str(), format!("file-{i}-contents"));
+                assert!(matches!(kind, ToolContent::File));
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+}
+
+/// dirge-5h5 layer-1 probe: an empty `content` Vec in
+/// `LoopToolResult` flattens to an empty string. The bridge does
+/// NOT synthesize a placeholder. Documents the only path by which
+/// `AgentEvent::ToolResult.output` can be empty — and shows it
+/// requires `content: vec![]` upstream, not anything the bridge
+/// itself does.
+#[test]
+fn empty_loop_tool_result_content_produces_empty_output() {
+    let mut bridge = EventBridge::new();
+    let _ = bridge.translate(LoopEvent::ToolExecutionStart {
+        tool_call_id: "c1".to_string(),
+        tool_name: "read".to_string(),
+        args: serde_json::json!({}),
+    });
+    let out = bridge.translate(LoopEvent::ToolExecutionEnd {
+        tool_call_id: "c1".to_string(),
+        tool_name: "read".to_string(),
+        result: LoopToolResult {
+            content: vec![],
+            details: serde_json::Value::Null,
+            terminate: None,
+        },
+        is_error: false,
+    });
+    match &out[0] {
+        AgentEvent::ToolResult { output, .. } => {
+            assert!(
+                output.is_empty(),
+                "empty content Vec must produce empty output (no synthesis)"
+            );
+        }
+        _ => panic!("expected ToolResult"),
+    }
+}
+
 /// `flatten_content` joins multiple text blocks with newlines.
 /// Image / other-type blocks fall back to JSON stringify (not
 /// dropped).
