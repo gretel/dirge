@@ -18,6 +18,7 @@ use tree_sitter::Node;
 /// here aren't load-bearing: an empty symbol name is filtered out
 /// downstream; this log line exists purely so the issue surfaces
 /// when someone is investigating "why is this symbol missing".
+#[allow(dead_code)] // unused with `semantic-bash` alone; consumed by every other language adapter
 pub fn node_text<'a>(node: Node<'a>, source: &'a [u8]) -> &'a str {
     match node.utf8_text(source) {
         Ok(s) => s,
@@ -45,6 +46,7 @@ pub fn node_text<'a>(node: Node<'a>, source: &'a [u8]) -> &'a str {
 /// matches what callers want: a query over the function body is
 /// rooted at the function node, not at its inner block — the query
 /// itself filters to the relevant constructs.
+#[allow(dead_code)] // unused with `semantic-bash` alone; consumed by every other language adapter
 pub fn find_node_at_range<'a>(n: Node<'a>, start: usize, end: usize) -> Option<Node<'a>> {
     if n.start_byte() == start && n.end_byte() == end {
         return Some(n);
@@ -69,6 +71,7 @@ pub fn find_node_at_range<'a>(n: Node<'a>, start: usize, end: usize) -> Option<N
 /// Note: counts CHARS not bytes (UTF-8-safe), but doesn't account
 /// for display width (emoji / CJK). Source code is overwhelmingly
 /// ASCII so the simpler char-count is fine.
+#[allow(dead_code)] // unused with `semantic-bash` alone; consumed by every other language adapter
 pub fn signature_first_line(node: Node, source: &[u8]) -> String {
     let text = node_text(node, source);
     let first = text.lines().next().unwrap_or(text);

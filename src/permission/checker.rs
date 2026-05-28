@@ -386,6 +386,11 @@ impl PermissionChecker {
     /// the only behavioural difference is the post-step that converts
     /// `Ask → Allowed`. Mode coercions, prompt-level deny lists, and
     /// the session allowlist all run through unchanged.
+    ///
+    /// Gated on `feature = "semantic-bash"` to match the only call
+    /// site in `agent::tools::bash` — without that feature the
+    /// method is dead code.
+    #[cfg(feature = "semantic-bash")]
     pub fn check_bash_dev_null_softallow(&mut self, input: &str) -> CheckResult {
         match self.check("bash", input) {
             CheckResult::Ask => CheckResult::Allowed,

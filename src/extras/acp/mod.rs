@@ -197,6 +197,11 @@ async fn run_prompt(
         None::<&crate::extras::mcp::McpClientManager>,
         #[cfg(feature = "semantic")]
         None::<&crate::semantic::SemanticManager>,
+        // dirge-502b: ACP sessions identify themselves via the ACP
+        // protocol's own SessionId. Pass it through so the
+        // SessionSearchTool excludes the live session from its
+        // own search results.
+        Some(session_id.to_string()),
     )
     .await;
 

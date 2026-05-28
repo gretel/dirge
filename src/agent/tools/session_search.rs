@@ -35,7 +35,11 @@ impl SessionSearchTool {
 
     /// Test/diagnostic accessor — the live session id this tool excludes
     /// from its results. `None` means no exclusion (a bug at the
-    /// builder layer; see dirge-502b).
+    /// builder layer; see dirge-502b). Gated `#[cfg(test)]` because
+    /// production code reads the id only through the
+    /// `SessionSearch::with_current_session` builder call.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub fn current_session_id(&self) -> Option<&str> {
         self.current_session_id.as_deref()
     }

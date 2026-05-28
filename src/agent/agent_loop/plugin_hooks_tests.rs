@@ -258,6 +258,7 @@ async fn ywj_before_tool_call_block_prevents_invocation() {
         &tx,
         &factory,
         None,
+        None, // memory_provider — test default
     )
     .await;
     drop(tx);
@@ -322,6 +323,7 @@ async fn ywj_before_tool_call_mutation_threads_through() {
         &tx,
         &factory,
         None,
+        None, // memory_provider — test default
     )
     .await;
 
@@ -374,6 +376,7 @@ async fn ywj_after_tool_call_replaces_result_content() {
         &tx,
         &factory,
         None,
+        None, // memory_provider — test default
     )
     .await;
     drop(tx);
@@ -463,6 +466,7 @@ async fn ywj_prepare_next_turn_returns_turn_update() {
         &tx,
         &factory,
         None,
+        None, // memory_provider — test default
     )
     .await;
 
@@ -534,6 +538,7 @@ async fn ywj_should_stop_after_turn_terminates_loop() {
         &tx,
         &factory,
         None,
+        None, // memory_provider — test default
     )
     .await;
     drop(tx);
@@ -585,6 +590,7 @@ async fn ywj_get_steering_messages_injects_user_message_at_boundary() {
         &tx,
         &factory,
         None,
+        None, // memory_provider — test default
     )
     .await;
 
@@ -650,6 +656,7 @@ async fn ywj_get_followup_messages_reenters_outer_loop() {
         &tx,
         &factory,
         None,
+        None, // memory_provider — test default
     )
     .await;
 

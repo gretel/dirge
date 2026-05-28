@@ -726,10 +726,11 @@ impl AnyModel {
     }
 }
 
-/// dirge-yai1 — pure-function tool-name filter shared between the
-/// review and curator runner code paths. Pulled out so unit tests
-/// can exercise the filter shape without constructing a full
-/// `AnyAgent` with mock `LoopTool` instances.
+/// dirge-yai1 — pure-function tool-name filter used by tests to
+/// exercise the filter shape `spawn_filtered_runner_with_cache`
+/// applies internally. Gated `#[cfg(test)]` because production
+/// code uses the inline filter directly.
+#[cfg(test)]
 pub(crate) fn filter_tool_names<'a>(
     all: impl Iterator<Item = &'a str>,
     allowed: &[&str],
@@ -1157,6 +1158,7 @@ impl AnyAgent {
     /// `spawn_runner` later forwards to the agent loop as
     /// `LoopSpawnConfig::system_prompt`, so an end-to-end test can
     /// assert that the guidance blocks reach the model verbatim.
+    #[cfg(test)]
     pub fn preamble(&self) -> &str {
         &self.preamble
     }
@@ -1337,6 +1339,7 @@ impl AnyAgent {
     /// tool names that would survive the filter, in registration
     /// order. Lets the curator + review tests assert the filter
     /// shape without spawning a real runner.
+    #[cfg(test)]
     pub fn filtered_tool_names(&self, allowed_tools: &[&str]) -> Vec<String> {
         filter_tool_names(self.loop_tools.iter().map(|t| t.name()), allowed_tools)
     }

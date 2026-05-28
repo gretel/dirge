@@ -26,7 +26,6 @@
 //! See dirge-bov5.
 
 use serde_json::Value;
-use std::sync::Arc;
 
 /// Pluggable backend for the `memory` tool. Implementors are stored
 /// behind `Arc<dyn MemoryProvider>` so the tool layer can hold a
@@ -159,11 +158,6 @@ impl MemoryProvider for super::memory_store::MemoryToolStore {
         super::memory_store::MemoryToolStore::remove(self, target, old_text)
     }
 }
-
-/// Boxed-provider alias used by the tool layer. Consumers hold an
-/// `Arc<dyn MemoryProvider>` so the concrete backend can be swapped
-/// at agent construction time without churning the call sites.
-pub type DynMemoryProvider = Arc<dyn MemoryProvider>;
 
 #[cfg(test)]
 mod tests {
