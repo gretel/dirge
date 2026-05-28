@@ -118,6 +118,18 @@ impl StormBreaker {
         // canonical. to_string produces compact form so integer/
         // float differences (1 vs 1.0) are handled by serde's
         // number serialisation.
+        //
+        // dirge-7bwx review-fix #6 (LOW): canonical key order
+        // depends on `serde_json` being built WITHOUT the
+        // `preserve_order` feature. If a future transitive
+        // dependency enables that feature via Cargo feature
+        // unification, Map becomes IndexMap and key order
+        // follows insertion — two parses of `{"a":1,"b":2}`
+        // vs `{"b":2,"a":1}` would yield different signatures
+        // and storm dedupe would silently regress. If that
+        // happens, switch this to a sort-keys serializer (or
+        // reuse `run::canonical_json`). Reasonix has the same
+        // implicit dependency at `repair/index.ts:127`.
         let args = serde_json::to_string(&call.arguments).unwrap_or_default();
 
         let mutating = self.is_mutating.as_ref().map(|f| f(call)).unwrap_or(false);

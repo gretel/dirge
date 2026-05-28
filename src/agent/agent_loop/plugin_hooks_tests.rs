@@ -86,6 +86,7 @@ fn build_config() -> LoopConfig {
         storm_mutating_tools: None,
         storm_exempt_tools: None,
         repair_stats: Arc::new(crate::agent::agent_loop::tool_input_repair::RepairStats::new()),
+        truncation_notes: Arc::new(Mutex::new(std::collections::HashMap::new())),
         tool_def_filter: None,
         dynamic_tool_search: false,
         escalation_stream_fn: None,

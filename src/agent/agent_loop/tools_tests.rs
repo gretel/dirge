@@ -221,6 +221,9 @@ fn build_config() -> LoopConfig {
         repair_stats: std::sync::Arc::new(
             crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
         ),
+        truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         tool_def_filter: None,
         dynamic_tool_search: false,
         escalation_stream_fn: None,
@@ -1170,7 +1173,11 @@ async fn truncation_repair_end_to_end_through_dispatch() {
     // real loop, run.rs does this between scavenge merge and
     // storm filter). The previous in-validator pre-pass was
     // removed — repair now lives at the loop level only.
-    crate::agent::agent_loop::run::apply_truncation_repair(&mut tool_calls, &config.repair_stats);
+    crate::agent::agent_loop::run::apply_truncation_repair(
+        &mut tool_calls,
+        &config.repair_stats,
+        &config.truncation_notes,
+    );
 
     let batch = execute_tool_calls_sequential(
         &context,

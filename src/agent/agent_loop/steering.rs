@@ -375,6 +375,9 @@ mod tests {
             repair_stats: std::sync::Arc::new(
                 crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
             ),
+            truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             tool_def_filter: None,
             dynamic_tool_search: false,
             escalation_stream_fn: None,

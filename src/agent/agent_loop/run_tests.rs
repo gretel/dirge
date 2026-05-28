@@ -81,6 +81,9 @@ fn build_config() -> LoopConfig {
         repair_stats: std::sync::Arc::new(
             crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
         ),
+        truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         tool_def_filter: None,
         dynamic_tool_search: false,
         escalation_stream_fn: None,
@@ -1267,7 +1270,11 @@ fn truncation_repair_canonicalizes_divergent_streams_before_storm() {
     ];
 
     let stats = RepairStats::new();
-    super::apply_truncation_repair(&mut tool_calls, &stats);
+    let notes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        Vec<String>,
+    >::new()));
+    super::apply_truncation_repair(&mut tool_calls, &stats, &notes);
 
     // Truncated A repaired; B was already valid JSON-as-string but
     // parsed-and-replaced.
@@ -1284,6 +1291,11 @@ fn truncation_repair_canonicalizes_divergent_streams_before_storm() {
 /// so `validate_and_repair` downstream surfaces a real validation
 /// error rather than silently dispatching a fabricated value —
 /// matches Reasonix's invariant at `repair/index.ts:93-102`.
+/// Review-fix #1: telemetry STILL records the truncation event
+/// (Reasonix bumps `truncationsFixed` on fallback at
+/// `repair/index.ts:99`) so operators see unrecoverable-rate.
+/// Review-fix #2: notes are emitted with the
+/// `⚠️ TRUNCATION UNRECOVERABLE` prefix Reasonix uses at `:101`.
 #[test]
 fn truncation_repair_preserves_raw_on_hard_fallback() {
     use crate::agent::agent_loop::tool_input_repair::RepairStats;
@@ -1297,7 +1309,11 @@ fn truncation_repair_preserves_raw_on_hard_fallback() {
     }];
 
     let stats = RepairStats::new();
-    super::apply_truncation_repair(&mut tool_calls, &stats);
+    let notes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        Vec<String>,
+    >::new()));
+    super::apply_truncation_repair(&mut tool_calls, &stats, &notes);
 
     // Either preserved as the same Value::String, OR if the
     // closer happened to find a structured interpretation, it
@@ -1315,6 +1331,216 @@ fn truncation_repair_preserves_raw_on_hard_fallback() {
         tool_calls[0].arguments,
         serde_json::json!({}),
         "hard fallback must not silently fabricate an empty object",
+    );
+
+    // dirge-7bwx review-fix #1: Reasonix parity — the counter
+    // bumps on hard-fallback too (`repair/index.ts:99`).
+    assert_eq!(
+        stats.snapshot().truncation_fixed,
+        1,
+        "fallback must still bump truncation_fixed for operator telemetry",
+    );
+
+    // dirge-7bwx review-fix #2: the per-call notes carry the
+    // `⚠️ TRUNCATION UNRECOVERABLE` prefix Reasonix uses at
+    // `repair/index.ts:101`, attributed to the tool name.
+    let sink = notes.lock().unwrap();
+    let entry = sink
+        .get("call_garbage")
+        .expect("notes must be recorded for the fallback call");
+    assert!(
+        entry.iter().any(|n| n.contains("TRUNCATION UNRECOVERABLE")),
+        "expected ⚠️ TRUNCATION UNRECOVERABLE prefix in notes: {entry:?}",
+    );
+    assert!(
+        entry.iter().any(|n| n.contains("[read_file]")),
+        "expected [tool_name] prefix in notes: {entry:?}",
+    );
+}
+
+/// dirge-7bwx review-fix #3+5: end-to-end wiring proof. Drives
+/// `run_agent_loop` with a canned assistant message that emits
+/// THREE tool calls whose raw arg strings differ but heal to
+/// the same canonical form. Default storm threshold is 3, so:
+///   - pre-fix: 3 distinct raw `Value::String`s → 3 distinct
+///     storm signatures → 3 executions, 0 suppressed.
+///   - post-fix: `apply_truncation_repair` heals all three to
+///     identical `Value::Object` BEFORE `storm.filter_calls`,
+///     so storm's third entry hits `count >= threshold-1` and
+///     suppresses → 2 executions + 1 storm-suppress.
+/// This test would FAIL on the pre-hoist code (validate_and_repair
+/// only ran post-storm), proving the wiring fix is live.
+#[tokio::test]
+async fn dirge_7bwx_end_to_end_storm_dedupes_after_truncation_repair() {
+    let echo = std::sync::Arc::new(EchoTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(echo.clone());
+
+    // Three calls whose raws differ but heal to the same form.
+    // `{"v":1` and `{"v": 1` and `{"v":1 ` all heal to {"v":1}.
+    fn truncated(raw: &str) -> serde_json::Value {
+        serde_json::Value::String(raw.to_string())
+    }
+    let response = AssistantMessage::new(
+        vec![
+            ContentBlock::ToolCall {
+                id: "tool-1".to_string(),
+                name: "echo".to_string(),
+                arguments: truncated(r#"{"v":1"#), // tight
+            },
+            ContentBlock::ToolCall {
+                id: "tool-2".to_string(),
+                name: "echo".to_string(),
+                arguments: truncated(r#"{"v": 1"#), // single space
+            },
+            ContentBlock::ToolCall {
+                id: "tool-3".to_string(),
+                name: "echo".to_string(),
+                arguments: truncated(r#"{"v":  1"#), // double space
+            },
+        ],
+        StopReason::ToolUse,
+    );
+    let factory = canned_factory(vec![response, text_response("done")]);
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(128);
+    let config = build_config();
+    let repair_stats = config.repair_stats.clone();
+    let _messages = run_agent_loop(
+        vec![user("echo")],
+        ctx,
+        config,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    // Storm default threshold=3 → first two pass, third is
+    // suppressed. If the truncation hoist hadn't fired, all
+    // three raws would have hashed differently and all three
+    // would have executed.
+    let executed_count = echo.executed.lock().unwrap().len();
+    assert_eq!(
+        executed_count, 2,
+        "storm must catch the 3rd identical-post-repair call; got {executed_count} executions",
+    );
+
+    // Truncation repair recorded for all three.
+    let snap = repair_stats.snapshot();
+    assert_eq!(
+        snap.truncation_fixed, 3,
+        "truncation_fixed must be incremented per truncated call; got {snap:?}",
+    );
+
+    // Event stream: exactly two ToolExecutionEnd events.
+    let events = drain(&mut rx).await;
+    let execution_ends = events
+        .iter()
+        .filter(|e| e.kind() == "tool_execution_end")
+        .count();
+    assert_eq!(
+        execution_ends,
+        2,
+        "expected 2 tool_execution_end events; got events={:?}",
+        events.iter().map(|e| e.kind()).collect::<Vec<_>>(),
+    );
+}
+
+/// dirge-ngic review-fix #3: end-to-end wiring proof for the
+/// scavenge-source fix. Drives `run_agent_loop` with a canned
+/// assistant message containing a DSML invoke ONLY in
+/// `ContentBlock::Text` (no Thinking block, no declared
+/// ToolCall). The loop must build the scavenge corpus from
+/// Text (build_scavenge_source includes both Thinking and Text)
+/// and dispatch the recovered call. Pre-fix this orphan would
+/// not be recovered and zero executions would happen.
+#[tokio::test]
+async fn dirge_ngic_end_to_end_orphan_dsml_in_text_dispatches() {
+    let echo = std::sync::Arc::new(EchoTool::new());
+    let mut ctx = empty_context();
+    ctx.tools.push(echo.clone());
+
+    // DSML invoke in Text only, no declared tool_calls. Empty
+    // ToolUse-stopped message means scavenge is the ONLY path
+    // to dispatch.
+    let dsml = r#"<|DSML|invoke name="echo"><|DSML|parameter name="v" string="false">1</|DSML|parameter></|DSML|invoke>"#;
+    let response = AssistantMessage::new(
+        vec![ContentBlock::Text {
+            text: dsml.to_string(),
+        }],
+        StopReason::ToolUse,
+    );
+    let factory = canned_factory(vec![response, text_response("done")]);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(128);
+    let config = build_config();
+    let _messages = run_agent_loop(
+        vec![user("echo")],
+        ctx,
+        config,
+        AbortSignal::new(),
+        &tx,
+        &factory,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    // Pre-fix: scavenge_source only had Thinking → empty
+    // corpus → no scavenged call → 0 executions. Post-fix:
+    // Text is included → DSML recovered → 1 execution.
+    let executed = echo.executed.lock().unwrap();
+    assert_eq!(
+        executed.len(),
+        1,
+        "orphan DSML in Text must be recovered and dispatched (post-dirge-ngic); got {} executions",
+        executed.len(),
+    );
+}
+
+/// dirge-7bwx review-fix #2: successful repair also forwards
+/// notes (without the unrecoverable prefix) so the model sees
+/// what was fixed. Reasonix parity at `repair/index.ts:106`.
+#[test]
+fn truncation_repair_forwards_notes_on_successful_repair() {
+    use crate::agent::agent_loop::tool_input_repair::RepairStats;
+    use crate::agent::agent_loop::tools::ToolCall;
+
+    let truncated = r#"{"path": "/tmp/x"#; // unterminated string
+    let mut tool_calls = vec![ToolCall {
+        id: "call_ok".to_string(),
+        name: "read_file".to_string(),
+        arguments: serde_json::Value::String(truncated.to_string()),
+    }];
+
+    let stats = RepairStats::new();
+    let notes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        Vec<String>,
+    >::new()));
+    super::apply_truncation_repair(&mut tool_calls, &stats, &notes);
+
+    // Args were promoted to the parsed form.
+    assert_eq!(tool_calls[0].arguments["path"], "/tmp/x");
+    // Counter bumped on success too.
+    assert_eq!(stats.snapshot().truncation_fixed, 1);
+    // Notes attributed to the tool, WITHOUT the unrecoverable
+    // prefix.
+    let sink = notes.lock().unwrap();
+    let entry = sink
+        .get("call_ok")
+        .expect("notes must be recorded for the successful repair");
+    assert!(entry.iter().any(|n| n.contains("[read_file]")));
+    assert!(
+        entry
+            .iter()
+            .all(|n| !n.contains("TRUNCATION UNRECOVERABLE")),
+        "successful repair must not carry the unrecoverable prefix: {entry:?}",
     );
 }
 
@@ -1334,7 +1560,11 @@ fn truncation_repair_leaves_already_parsed_args_alone() {
     }];
 
     let stats = RepairStats::new();
-    super::apply_truncation_repair(&mut tool_calls, &stats);
+    let notes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        Vec<String>,
+    >::new()));
+    super::apply_truncation_repair(&mut tool_calls, &stats, &notes);
 
     assert_eq!(tool_calls[0].arguments, already_parsed);
     assert_eq!(

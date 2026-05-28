@@ -812,18 +812,17 @@ pub fn validate_and_repair(
     let mut notes: Vec<String> = Vec::new();
 
     // dirge-7bwx: truncation pre-pass previously lived here.
-    // Hoisted to `run.rs` between scavenge merge and storm filter
-    // so storm sees post-repair signatures (Reasonix pipeline
-    // parity — `repair/index.ts:88-121`). If args still arrive
-    // here as `Value::String` it means the upstream closer
-    // hard-fellback or wasn't run (test paths bypassing the loop);
-    // validate_and_repair returns Err in that case, matching
-    // Reasonix's "leave the original truncated args untouched"
-    // invariant at `repair/index.ts:93-102`. The
-    // `try_truncation_repair` helper below remains as
-    // defense-in-depth — invoked here only as a no-op so the
-    // dead-code lint doesn't trip; the actual repair happens
-    // upstream.
+    // Hoisted to `run.rs::apply_truncation_repair`, called between
+    // scavenge merge and storm filter (Reasonix parity at
+    // `repair/index.ts:88-121`). If args still arrive here as
+    // `Value::String` it means the upstream closer hard-fellback
+    // or wasn't run (test paths bypassing the loop); the
+    // validate-and-return-Err contract below surfaces the failure
+    // to the dispatcher, matching Reasonix's "leave the original
+    // truncated args untouched" invariant at
+    // `repair/index.ts:93-102`. The standalone
+    // `try_truncation_repair` helper was removed — direct callers
+    // can use `repair_truncated_json` instead.
 
     // 1. Content normalizers (run regardless of validation status).
     //    These fix well-known model output quirks that don't cause
@@ -931,73 +930,6 @@ fn strip_null_optionals(
 }
 
 /// Walk the value tree for null-stripping at deeper levels (inside arrays).
-/// dirge-du5k — bridge from `validate_and_repair` to
-/// `repair_truncated_json`. Detects the truncation failure mode
-/// ("args is a JSON-string fragment that the schema says should
-/// be an object") and runs the brace-closer. Returns `Some(new_value)`
-/// when truncation repair successfully parsed; `None` when the
-/// pre-pass had nothing to do or the closer fell back to `{}`
-/// (validation will then error out and the call will be rejected,
-/// which is the right outcome — fabricating an empty object would
-/// mask the truncation from the model).
-///
-/// dirge-7bwx: the truncation repair primary path is now in
-/// `run.rs` between scavenge merge and storm filter. This helper
-/// is retained as defense-in-depth for code paths that bypass the
-/// loop (direct unit tests of `validate_and_repair`, plus any
-/// future caller that wants the all-in-one validate-then-repair
-/// shape). Public so the bypass tests can drive it directly.
-#[allow(dead_code)]
-pub(crate) fn try_truncation_repair(
-    schema: &Value,
-    args: &Value,
-    kinds: &mut Vec<RepairKind>,
-    notes: &mut Vec<String>,
-) -> Option<Value> {
-    // Only consider Value::String inputs — Object / Array / scalar
-    // are already structured.
-    let Value::String(raw) = args else {
-        return None;
-    };
-    // Only consider object-typed schemas. If the schema expects a
-    // bare string at the top level, the BareStringToArray /
-    // JsonStringToArray repair paths handle it.
-    let expects_object = schema
-        .get("type")
-        .and_then(|v| v.as_str())
-        .map(|t| t == "object")
-        .unwrap_or(false);
-    if !expects_object {
-        return None;
-    }
-    // Fast path: parses fine. No truncation repair needed; just
-    // promote the parsed value so subsequent repair passes see an
-    // Object instead of a String.
-    if let Ok(parsed) = serde_json::from_str::<Value>(raw)
-        && parsed.is_object()
-    {
-        return Some(parsed);
-    }
-    // Parse failed — try the closer.
-    let result = repair_truncated_json(raw);
-    if result.fallback {
-        // Hard fallback. Don't apply — validation will reject and
-        // the model will see the structured error rather than a
-        // fabricated `{}`.
-        return None;
-    }
-    // Closer succeeded. Parse and apply.
-    if let Ok(parsed) = serde_json::from_str::<Value>(&result.repaired)
-        && parsed.is_object()
-    {
-        kinds.push(RepairKind::TruncationFixed);
-        // Surface the closer's notes to the model so it adapts.
-        notes.extend(result.notes);
-        return Some(parsed);
-    }
-    None
-}
-
 fn strip_null_recursive(value: &mut Value, schema: &Value, kinds: &mut Vec<RepairKind>) {
     match value {
         Value::Object(obj) => {
@@ -1928,45 +1860,6 @@ mod tests {
             );
             assert!(preview_note.contains("…"));
         }
-    }
-
-    /// dirge-du5k integration test 1: validate_and_repair fires
-    /// the truncation pre-pass when args is a Value::String and
-    /// the schema expects an object. dirge-7bwx hoist: the
-    /// primary repair path now runs in `run.rs` between scavenge
-    /// merge and storm filter, so by the time
-    /// `validate_and_repair` sees the args they're already
-    /// post-repair. Direct callers (test paths bypassing the
-    /// loop) can still drive `try_truncation_repair` themselves
-    /// as defense-in-depth — this test asserts that helper still
-    /// works as documented for bypass paths.
-    #[test]
-    fn integration_truncation_helper_repairs_string_to_object_post_hoist() {
-        let schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "path": { "type": "string" }
-            },
-            "required": ["path"]
-        });
-        // Simulates rig accumulating a streamed arg string that
-        // got cut off mid-call.
-        let args = Value::String(r#"{"path": "/tmp/cut"#.to_string());
-        let mut kinds = Vec::new();
-        let mut notes = Vec::new();
-        let repaired = try_truncation_repair(&schema, &args, &mut kinds, &mut notes)
-            .expect("closer should engage");
-        assert!(kinds.contains(&RepairKind::TruncationFixed));
-        assert_eq!(repaired["path"], "/tmp/cut");
-        // The closer's notes are surfaced so the model can see
-        // what the loop fixed.
-        assert!(
-            notes
-                .iter()
-                .any(|n| n.contains("closed unterminated string")),
-            "expected note about closed string in: {:?}",
-            notes
-        );
     }
 
     /// dirge-7bwx post-hoist contract: when args arrive at

@@ -307,6 +307,19 @@ pub struct LoopConfig {
     /// null-strip), 0 invalid" at session close.
     pub repair_stats: std::sync::Arc<super::tool_input_repair::RepairStats>,
 
+    /// dirge-7bwx review-fix #2: per-call notes from the
+    /// loop-level truncation closer (`apply_truncation_repair` in
+    /// `run.rs`). Keyed by tool_call_id. `prepare_tool_call`
+    /// drains the entry for its call and prepends each note to
+    /// the tool result content so the model sees the repair
+    /// ("[read_file] closed unterminated string" or
+    /// "[read_file] ⚠️ TRUNCATION UNRECOVERABLE: …").
+    /// Mirrors Reasonix `repair/index.ts:100-101, :106` which
+    /// forwards `r.notes` into `report.notes` → next-turn assistant
+    /// context.
+    pub truncation_notes:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>>,
+
     /// Phase-3 dynamic-tool-search: per-session "loaded" tool set.
     /// When `Some`, the request builder filters tool defs sent to
     /// the model to (a) the always-on set
@@ -507,6 +520,7 @@ impl Clone for LoopConfig {
             storm_mutating_tools: self.storm_mutating_tools.clone(),
             storm_exempt_tools: self.storm_exempt_tools.clone(),
             repair_stats: self.repair_stats.clone(),
+            truncation_notes: self.truncation_notes.clone(),
             tool_def_filter: self.tool_def_filter.clone(),
             dynamic_tool_search: self.dynamic_tool_search,
             escalation_stream_fn: self.escalation_stream_fn.clone(),

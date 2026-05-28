@@ -496,6 +496,9 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         repair_stats: std::sync::Arc::new(
             crate::agent::agent_loop::tool_input_repair::RepairStats::new(),
         ),
+        truncation_notes: std::sync::Arc::new(std::sync::Mutex::new(
+            std::collections::HashMap::new(),
+        )),
         tool_def_filter: cfg.tool_def_filter.clone(),
         dynamic_tool_search: cfg.dynamic_tool_search,
         escalation_stream_fn: cfg.escalation_stream_fn.clone(),

@@ -377,6 +377,24 @@ async fn prepare_tool_call(
         }
     };
 
+    // dirge-7bwx review-fix #2: drain truncation-repair notes
+    // for this call_id and append to repair_notes. The loop-level
+    // closer (`apply_truncation_repair` in `run.rs`) ran before
+    // dispatch; its per-call notes live keyed by call_id on
+    // `config.truncation_notes`. Reasonix surfaces these in
+    // `report.notes` (`repair/index.ts:100-101, :106`); we attach
+    // them to the per-call result so the model sees the repair in
+    // the same turn rather than waiting for next-turn context.
+    {
+        let mut sink = config
+            .truncation_notes
+            .lock()
+            .expect("truncation_notes poisoned");
+        if let Some(notes) = sink.remove(&tool_call.id) {
+            repair_notes.extend(notes);
+        }
+    }
+
     // beforeToolCall. Pi lines 581-605.
     if let Some(hook) = &config.before_tool_call {
         let hook_ctx = BeforeToolCallContext {

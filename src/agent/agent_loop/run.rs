@@ -654,7 +654,11 @@ pub async fn run_loop(
             // as a real validation error rather than silently
             // dispatching a fabricated `{}` — same invariant
             // Reasonix maintains at `repair/index.ts:93-102`.
-            apply_truncation_repair(&mut tool_calls, &config.repair_stats);
+            apply_truncation_repair(
+                &mut tool_calls,
+                &config.repair_stats,
+                &config.truncation_notes,
+            );
 
             let mut tool_results: Vec<ToolResultMessage> = Vec::new();
             has_more_tool_calls = false;
@@ -1020,6 +1024,9 @@ pub(crate) fn build_scavenge_source(blocks: &[ContentBlock]) -> String {
 pub(crate) fn apply_truncation_repair(
     tool_calls: &mut [crate::agent::agent_loop::ToolCall],
     repair_stats: &crate::agent::agent_loop::tool_input_repair::RepairStats,
+    truncation_notes: &std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, Vec<String>>>,
+    >,
 ) {
     use crate::agent::agent_loop::tool_input_repair::{RepairKind, repair_truncated_json};
     for tc in tool_calls.iter_mut() {
@@ -1027,17 +1034,48 @@ pub(crate) fn apply_truncation_repair(
             // Already-valid JSON-as-string: promote to its parsed
             // form so the storm filter's canonical signature matches
             // any peer that arrived as a real Object/Array. No
-            // repair stat — nothing was healed.
+            // repair stat — nothing was healed. (Dirge-only
+            // compensation; Reasonix args are always strings so it
+            // has no equivalent.)
             if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(raw) {
                 tc.arguments = parsed;
                 continue;
             }
             // Truncated / malformed: run the brace-closer.
             let r = repair_truncated_json(raw);
+            if !r.changed {
+                continue;
+            }
+            // dirge-7bwx review-fix #1: Reasonix bumps
+            // `truncationsFixed` on BOTH success
+            // (`repair/index.ts:105`) AND hard-fallback (`:99`).
+            // Operators care most about the unrecoverable rate —
+            // dropping it from telemetry would hide the cases that
+            // most need attention.
+            repair_stats.record(RepairKind::TruncationFixed);
+            // dirge-7bwx review-fix #2: forward the closer's notes
+            // (Reasonix `repair/index.ts:100-101, :106`). Stored
+            // per call-id; `prepare_tool_call` plucks them and
+            // prepends to the tool result so the model sees what
+            // was repaired.
+            let prefix = if r.fallback {
+                format!("[{}] ⚠️ TRUNCATION UNRECOVERABLE", tc.name)
+            } else {
+                format!("[{}]", tc.name)
+            };
+            let mut sink = truncation_notes.lock().expect("truncation_notes poisoned");
+            let entry = sink.entry(tc.id.clone()).or_default();
+            for n in &r.notes {
+                entry.push(format!("{prefix} {n}"));
+            }
+            drop(sink);
+            // On success only, replace args with the parsed form.
+            // Hard-fallback leaves the raw string so
+            // validate_and_repair surfaces a real validation
+            // error (Reasonix invariant `repair/index.ts:93-102`).
             if !r.fallback {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&r.repaired) {
                     tc.arguments = parsed;
-                    repair_stats.record(RepairKind::TruncationFixed);
                 }
             }
         }
