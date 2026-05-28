@@ -530,16 +530,33 @@ pub(crate) async fn handle_done(
             None,
         );
 
-        // Curator check: run periodic skill maintenance
-        // if the interval has elapsed. Fire-and-forget.
+        // Curator check: run periodic skill maintenance if the
+        // interval has elapsed. Fire-and-forget. The mechanical
+        // age-based transitions run unconditionally; the LLM
+        // umbrella-consolidation pass (dirge-odv3) follows on a
+        // separate task so the user-facing turn never blocks.
+        let curator_agent = agent.clone();
+        let curator_paths = paths.clone();
         tokio::spawn(async move {
-            if let Ok(mut curator) = crate::extras::skills::curator::Curator::new(&paths)
+            if let Ok(mut curator) = crate::extras::skills::curator::Curator::new(&curator_paths)
                 && curator.should_run_now()
             {
-                let _ = tokio::task::spawn_blocking(move || {
+                let curator_paths_for_usage = curator_paths.clone();
+                let candidate_list = tokio::task::spawn_blocking(move || {
                     let _ = curator.apply_automatic_transitions();
+                    // Render the candidate list AFTER mechanical
+                    // transitions so newly-stale skills are included.
+                    crate::extras::skills::usage::UsageStore::load(&curator_paths_for_usage)
+                        .ok()
+                        .map(|store| crate::extras::skills::curator::render_candidate_list(&store))
                 })
-                .await;
+                .await
+                .ok()
+                .flatten();
+
+                if let Some(candidates) = candidate_list {
+                    crate::agent::review::spawn_curator_review(curator_agent, candidates);
+                }
             }
         });
     }

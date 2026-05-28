@@ -210,6 +210,80 @@ pub fn spawn_background_review(
     });
 }
 
+/// Spawn the curator's LLM consolidation pass — fire-and-forget.
+/// Reuses `spawn_review_runner` (memory + skill tools), but injects
+/// the curator-specific prompt and the agent-created candidate list
+/// so the model can build umbrellas. The curator prompt instructs
+/// the model to only use the `skill` tool; we don't filter out the
+/// `memory` tool at the runner level since the existing review-runner
+/// infrastructure ships both. See dirge-odv3.
+///
+/// `candidate_list` is the rendered output of
+/// `crate::extras::skills::curator::render_candidate_list` — the
+/// caller assembles it from the project's `UsageStore`.
+///
+/// Skips entirely (logs at debug) when the candidate list contains
+/// the "No agent-created skills" sentinel — there's nothing to
+/// consolidate.
+pub fn spawn_curator_review(agent: AnyAgent, candidate_list: String) {
+    if candidate_list.contains("No agent-created skills") {
+        tracing::debug!(
+            target: "dirge::curator",
+            "Skipping curator LLM pass — no agent-created candidates"
+        );
+        return;
+    }
+
+    let prompt = format!(
+        "{}\n\n{}",
+        crate::extras::skills::curator::CURATOR_PROMPT,
+        candidate_list
+    );
+
+    tokio::spawn(async move {
+        let runner = agent.spawn_review_runner(prompt, String::new());
+        let mut rx = runner.event_rx;
+        let mut tool_actions: Vec<String> = Vec::new();
+        let mut had_error = false;
+        while let Some(event) = rx.recv().await {
+            use crate::event::AgentEvent;
+            match event {
+                AgentEvent::Error(msg) => {
+                    tracing::warn!(
+                        target: "dirge::curator",
+                        error = %msg,
+                        "Curator LLM pass encountered an error"
+                    );
+                    had_error = true;
+                }
+                AgentEvent::ToolCall { name, .. } => {
+                    tool_actions.push(name.to_string());
+                }
+                AgentEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+
+        if !had_error && !tool_actions.is_empty() {
+            let summary = tool_actions
+                .iter()
+                .fold(Vec::<&str>::new(), |mut acc, a| {
+                    if !acc.contains(&a.as_str()) {
+                        acc.push(a.as_str());
+                    }
+                    acc
+                })
+                .join(" · ");
+            tracing::info!(
+                target: "dirge::curator",
+                actions = %summary,
+                "🗂  Skill curator pass: {}",
+                summary
+            );
+        }
+    });
+}
+
 /// Build a human-readable transcript from session messages for
 /// background review. Includes user text, assistant text, tool
 /// call names+args, and tool results. Compaction summaries are
