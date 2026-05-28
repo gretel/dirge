@@ -36,7 +36,7 @@ mod semantic_tests {
     #[cfg(feature = "semantic-ts")]
     fn find_callers_respects_word_boundaries() {
         let registry = mk_registry();
-        let mut index = SymbolIndex::new(registry);
+        let index = SymbolIndex::new(registry);
 
         let _file = fixtures_dir().join("callers_test.ts");
 
@@ -67,7 +67,7 @@ mod semantic_tests {
     #[cfg(feature = "semantic-ts")]
     fn find_callees_works_on_tsx() {
         let registry = mk_registry();
-        let mut index = SymbolIndex::new(registry);
+        let index = SymbolIndex::new(registry);
 
         let file = fixtures_dir().join("component.tsx");
 
@@ -85,7 +85,7 @@ mod semantic_tests {
     #[cfg(feature = "semantic-ts")]
     fn ts_extract_does_not_panic_on_imports() {
         let registry = mk_registry();
-        let mut index = SymbolIndex::new(registry);
+        let index = SymbolIndex::new(registry);
 
         let file = fixtures_dir().join("component.tsx");
 
@@ -109,7 +109,7 @@ mod semantic_tests {
     #[cfg(feature = "semantic-python")]
     fn python_extracts_decorated_functions() {
         let registry = mk_registry();
-        let mut index = SymbolIndex::new(registry);
+        let index = SymbolIndex::new(registry);
 
         let file = fixtures_dir().join("decorated.py");
 
@@ -139,7 +139,7 @@ mod semantic_tests {
     #[cfg(feature = "semantic-ts")]
     fn cold_cache_auto_initializes() {
         let registry = mk_registry();
-        let mut index = SymbolIndex::new(registry);
+        let index = SymbolIndex::new(registry);
 
         // Cache is cold but find_definition auto-initializes from cwd.
         // Verify it doesn't error — it may find symbols or return empty.
@@ -152,7 +152,7 @@ mod semantic_tests {
     #[cfg(feature = "semantic-ts")]
     fn ensure_file_skips_binary_gracefully() {
         let registry = mk_registry();
-        let mut index = SymbolIndex::new(registry);
+        let index = SymbolIndex::new(registry);
 
         let bin_path = fixtures_dir().join("not_a_ts_file.bin");
         std::fs::write(&bin_path, b"\x00\x01\x02").unwrap();

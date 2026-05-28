@@ -550,7 +550,7 @@ mod tests {
     /// Compaction records persist through save/load.
     #[test]
     fn roundtrip_compaction_persists() {
-        use crate::session::{Compaction, MessageRole, Session};
+        use crate::session::{MessageRole, Session};
         let id = unique_test_id("roundtrip-compact");
         let mut s = Session::new("p", "m", 100_000);
         s.id = compact_str::CompactString::from(id.clone());

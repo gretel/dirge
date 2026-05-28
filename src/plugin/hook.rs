@@ -66,7 +66,7 @@ impl HookedToolDyn {
 
     /// Wrap with an explicit manager, bypassing the global. Used by tests
     /// and by callers that hold their own PluginManager.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)] // retained for future callers; tests stopped using it
     pub fn with_manager(inner: Box<dyn ToolDyn>, pm: Option<Arc<Mutex<PluginManager>>>) -> Self {
         HookedToolDyn { inner, pm }
     }

@@ -8,7 +8,6 @@
 
 use super::*;
 use crate::ui::search_rewind::update_search;
-use unicode_width::UnicodeWidthStr;
 
 // ============================================================
 // apply_subagent_panel_event — left-panel cleanup

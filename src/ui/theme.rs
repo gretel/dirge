@@ -454,6 +454,7 @@ mod tests {
         assert!(is_bright(Color::AnsiValue(255)));
     }
 
+    #[test]
     fn presets_are_distinct() {
         assert_ne!(Theme::phosphor().agent, Theme::plain().agent);
         assert_ne!(Theme::phosphor().accent, Theme::plain().accent);

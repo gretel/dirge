@@ -1153,16 +1153,6 @@ impl AnyAgent {
     ///
     /// Returns immediately with `AgentRunner`; the loop runs on
     /// a spawned tokio task.
-    /// dirge-1ati — test accessor for the assembled system prompt
-    /// that `build_agent_inner` produced. Returns the same string
-    /// `spawn_runner` later forwards to the agent loop as
-    /// `LoopSpawnConfig::system_prompt`, so an end-to-end test can
-    /// assert that the guidance blocks reach the model verbatim.
-    #[cfg(test)]
-    pub fn preamble(&self) -> &str {
-        &self.preamble
-    }
-
     /// Return the provider name as a static string (matches the
     /// CLI / config naming: "openai", "anthropic", ..., "glm",
     /// "ollama", "openrouter", "custom"). Used to populate
@@ -1332,16 +1322,6 @@ impl AnyAgent {
         let (runner, _isolated_cache) =
             self.spawn_filtered_runner_with_cache(prompt, transcript, ToolCache::new(), &["skill"]);
         runner
-    }
-
-    /// dirge-yai1 — test/diagnostic accessor for the tool allow-list
-    /// applied by `spawn_filtered_runner_with_cache`. Returns the
-    /// tool names that would survive the filter, in registration
-    /// order. Lets the curator + review tests assert the filter
-    /// shape without spawning a real runner.
-    #[cfg(test)]
-    pub fn filtered_tool_names(&self, allowed_tools: &[&str]) -> Vec<String> {
-        filter_tool_names(self.loop_tools.iter().map(|t| t.name()), allowed_tools)
     }
 
     /// Internal review-runner constructor with an explicit

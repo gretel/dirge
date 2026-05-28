@@ -15,7 +15,12 @@ use crossterm::terminal::{Clear, ClearType};
 /// fd 1 — see `TerminalGuard`'s fd redirection); falls back to
 /// stdout when there's no controlling terminal (CI tests).
 pub enum BackendWriter {
+    // In test builds the constructor is stubbed (cfg(test) at the
+    // factory below returns None), so the variants are never
+    // constructed — but the `impl Write` arms still need them.
+    #[cfg_attr(test, allow(dead_code))]
     Tty(std::fs::File),
+    #[cfg_attr(test, allow(dead_code))]
     Stdout(std::io::Stdout),
 }
 

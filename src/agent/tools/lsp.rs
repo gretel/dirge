@@ -364,6 +364,7 @@ mod tests {
                 response: std::sync::Mutex::new(response),
             }
         }
+        #[allow(dead_code)] // helper retained for future tests that need to assert dispatch order
         fn seen_methods(&self) -> Vec<String> {
             self.seen_methods.lock().unwrap().clone()
         }
