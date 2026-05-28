@@ -65,8 +65,26 @@ pub trait MemoryProvider: Send + Sync {
     /// Notify the provider that a memory write just happened via
     /// the tool layer. Use to mirror the write to a secondary
     /// backend (e.g. a vector store), audit log, or analytics
-    /// sink. `action` is one of `"add"`, `"replace"`, `"remove"`.
-    fn on_memory_write(&self, _action: &str, _target: &str, _content: &str) {}
+    /// sink.
+    ///
+    /// `action` is one of `"add"`, `"replace"`, `"remove"`.
+    ///
+    /// `payload` carries action-specific data — the semantics
+    /// differ by action, NOT a generic "new content" field:
+    /// - `"add"` → the entry text being appended.
+    /// - `"replace"` → the NEW entry text (what's being written).
+    /// - `"remove"` → the `old_text` substring that identified
+    ///   the deleted entry (no new content; this is the only
+    ///   information the tool has about what just disappeared).
+    ///
+    /// Providers that mirror writes to another store MUST check
+    /// `action` before treating `payload` as "the new value" —
+    /// dirge-ix7n made the asymmetry explicit so a plugin author
+    /// can't accidentally persist `payload` as the latest content
+    /// after a remove. The single-param shape mirrors hermes's
+    /// `on_memory_write(action, target, content, metadata)` minus
+    /// the metadata bag (dirge doesn't ship structured metadata).
+    fn on_memory_write(&self, _action: &str, _target: &str, _payload: &str) {}
 
     /// Notify the provider that the live session ended. Use for
     /// end-of-session fact extraction, queue flushing, or
@@ -203,6 +221,42 @@ mod tests {
             "providers must NOT self-fire on_memory_write \
              (the tool layer does); got: {:?}",
             *writes
+        );
+    }
+
+    /// dirge-ix7n — the `on_memory_write` `payload` parameter has
+    /// action-specific semantics (new content for add/replace,
+    /// old_text identifier for remove). The trait doc must spell
+    /// this out so plugin authors don't conflate them. Test
+    /// guards the doc against silent regression — if someone
+    /// removes the contract from the doc, the test fails.
+    #[test]
+    fn on_memory_write_contract_is_documented() {
+        let src = include_str!("memory_provider.rs");
+        // Find the docstring block immediately above the trait
+        // method declaration.
+        let anchor = "fn on_memory_write";
+        let pos = src
+            .find(anchor)
+            .expect("trait method on_memory_write must exist");
+        // The docstring lives in the ~30 lines preceding the
+        // method line. Look for the action-asymmetry markers.
+        let preamble = &src[pos.saturating_sub(2000)..pos];
+        assert!(
+            preamble.contains("payload"),
+            "doc must rename the third param meaning to 'payload'"
+        );
+        assert!(
+            preamble.contains("`\"remove\"`"),
+            "doc must describe the remove case"
+        );
+        assert!(
+            preamble.contains("old_text"),
+            "doc must say payload is old_text on remove"
+        );
+        assert!(
+            preamble.contains("NOT a generic") || preamble.contains("not a generic"),
+            "doc must warn that payload is NOT a generic new-value field"
         );
     }
 

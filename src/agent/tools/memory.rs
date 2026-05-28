@@ -115,6 +115,12 @@ ACTIONS:
             // which provider impl handled the call. Providers are
             // forbidden from calling the hook themselves to avoid
             // double-firing through wrappers.
+            //
+            // dirge-ix7n: the third hook arg carries action-specific
+            // semantics — `content` for add/replace, `old_text` for
+            // remove. The trait doc on `on_memory_write` calls this
+            // out as `payload` to avoid the "always a new value"
+            // misreading.
             "add" => {
                 let content = args
                     .content
