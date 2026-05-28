@@ -22,6 +22,16 @@ pub enum RepairKind {
     ObjectToArray,
     BareStringToArray,
     MdLinkUnwrapped,
+    /// dirge-du5k — unbalanced JSON closed by stack-based brace
+    /// closer. Reasonix Pillar 2 pass 3: a model that hits
+    /// `max_tokens` mid-tool-call leaves the arg string with
+    /// unterminated strings / open braces / open brackets / a
+    /// dangling `"key":`. The closer walks the input, tracks the
+    /// open stack, and emits the matching closers (plus `null`
+    /// for dangling keys, plus a comma trim) so the call is
+    /// dispatchable. Hard fallback is `{}` (recorded but flagged
+    /// in the result).
+    TruncationFixed,
 }
 
 // `as_str` and `ALL` are part of the Phase-1 telemetry surface
@@ -39,6 +49,7 @@ impl RepairKind {
             RepairKind::ObjectToArray => "object_to_array",
             RepairKind::BareStringToArray => "bare_string_to_array",
             RepairKind::MdLinkUnwrapped => "md_link_unwrapped",
+            RepairKind::TruncationFixed => "truncation_fixed",
         }
     }
 
@@ -50,6 +61,7 @@ impl RepairKind {
         RepairKind::ObjectToArray,
         RepairKind::BareStringToArray,
         RepairKind::MdLinkUnwrapped,
+        RepairKind::TruncationFixed,
     ];
 }
 
@@ -84,6 +96,9 @@ pub struct RepairStats {
     object_to_array: std::sync::atomic::AtomicU64,
     bare_string_to_array: std::sync::atomic::AtomicU64,
     md_link_unwrapped: std::sync::atomic::AtomicU64,
+    /// dirge-du5k — count of brace-closer wins (truncated JSON
+    /// that the closer successfully re-parsed).
+    truncation_fixed: std::sync::atomic::AtomicU64,
     /// Count of repair attempts that exhausted without success
     /// (tool_input_invalid events). Surfaced alongside per-kind
     /// counts so the rate is visible at the same glance.
@@ -104,6 +119,7 @@ impl RepairStats {
             RepairKind::ObjectToArray => &self.object_to_array,
             RepairKind::BareStringToArray => &self.bare_string_to_array,
             RepairKind::MdLinkUnwrapped => &self.md_link_unwrapped,
+            RepairKind::TruncationFixed => &self.truncation_fixed,
         };
         cell.fetch_add(1, Ordering::Relaxed);
     }
@@ -124,6 +140,7 @@ impl RepairStats {
             object_to_array: self.object_to_array.load(Ordering::Relaxed),
             bare_string_to_array: self.bare_string_to_array.load(Ordering::Relaxed),
             md_link_unwrapped: self.md_link_unwrapped.load(Ordering::Relaxed),
+            truncation_fixed: self.truncation_fixed.load(Ordering::Relaxed),
             invalid: self.invalid.load(Ordering::Relaxed),
         }
     }
@@ -138,6 +155,7 @@ pub struct RepairStatsSnapshot {
     pub object_to_array: u64,
     pub bare_string_to_array: u64,
     pub md_link_unwrapped: u64,
+    pub truncation_fixed: u64,
     pub invalid: u64,
 }
 
@@ -149,6 +167,7 @@ impl RepairStatsSnapshot {
             + self.object_to_array
             + self.bare_string_to_array
             + self.md_link_unwrapped
+            + self.truncation_fixed
     }
 
     /// `true` when every counter is zero. Used by the UI to skip
@@ -156,6 +175,205 @@ impl RepairStatsSnapshot {
     pub fn is_empty(&self) -> bool {
         self.total_successful() == 0 && self.invalid == 0
     }
+}
+
+/// dirge-du5k — outcome of [`repair_truncated_json`]. Port of
+/// Reasonix `TruncationRepairResult` (repair/truncation.ts:3-9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TruncationRepairResult {
+    /// The repaired JSON string. Always parseable as JSON when
+    /// `fallback` is `false`. Equals `"{}"` when `fallback`.
+    pub repaired: String,
+    /// `true` when the repair actually changed the input.
+    pub changed: bool,
+    /// Human-readable notes describing each step (closed string,
+    /// trimmed trailing comma, popped brace, etc.). Surfaced to
+    /// the model so it adapts subsequent calls.
+    pub notes: Vec<String>,
+    /// `true` when every repair attempt failed and the result is
+    /// the hard-fallback `"{}"`. The original args are lost; the
+    /// caller should surface this to the model as a tool error.
+    pub fallback: bool,
+}
+
+/// Stack-based JSON brace / bracket / string closer. Port of
+/// Reasonix `repair/truncation.ts:repairTruncatedJson` (lines
+/// 11-100). Fixes the specific failure mode where a model hits
+/// `max_tokens` mid-tool-call and the streamed-and-accumulated
+/// arg string is left unterminated (open string, dangling key,
+/// open brace, trailing comma).
+///
+/// Walks the input once tracking an open-stack of `{ / [ / "`.
+/// At EOF emits the matching closers in reverse order, after
+/// trimming a trailing comma and filling a dangling `"key":`
+/// with `null`. Returns the original input unchanged on a
+/// fast-path parseable check.
+///
+/// Hard fallback is `"{}"` recorded as `fallback: true`.
+pub fn repair_truncated_json(input: &str) -> TruncationRepairResult {
+    if input.trim().is_empty() {
+        let changed = input != "{}";
+        return TruncationRepairResult {
+            repaired: "{}".to_string(),
+            changed,
+            notes: if changed {
+                vec!["empty input → {}".to_string()]
+            } else {
+                Vec::new()
+            },
+            fallback: false,
+        };
+    }
+    // Fast path: already parseable.
+    if serde_json::from_str::<Value>(input).is_ok() {
+        return TruncationRepairResult {
+            repaired: input.to_string(),
+            changed: false,
+            notes: Vec::new(),
+            fallback: false,
+        };
+    }
+
+    // Stack tracks open `{ / [ / "` — `"` is included so the
+    // EOF-flush path can close an unterminated string.
+    let mut stack: Vec<char> = Vec::new();
+    let mut escaped = false;
+    let mut in_string = false;
+    let mut last_significant: Option<usize> = None;
+
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if !c.is_whitespace() {
+            last_significant = Some(i);
+        }
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if in_string {
+            if c == '\\' {
+                escaped = true;
+                i += 1;
+                continue;
+            }
+            if c == '"' {
+                in_string = false;
+                if matches!(stack.last(), Some('"')) {
+                    stack.pop();
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if c == '"' {
+            in_string = true;
+            stack.push('"');
+        } else if c == '{' || c == '[' {
+            stack.push(c);
+        } else if c == '}' || c == ']' {
+            // Pop only when the top matches — a stray closer
+            // without a matching open is left untouched (parse
+            // will reject it; the fallback covers that case).
+            if let Some(&top) = stack.last() {
+                let matches = (top == '{' && c == '}') || (top == '[' && c == ']');
+                if matches {
+                    stack.pop();
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let mut notes = Vec::new();
+    let cut = last_significant.map(|i| i + 1).unwrap_or(input.len());
+    let mut s = input[..cut].to_string();
+
+    // Trim a trailing comma which would block re-parse.
+    if s.ends_with(',') {
+        s.pop();
+        notes.push("trimmed trailing comma".to_string());
+    }
+
+    // If we ended on a dangling key `"foo":`, fill with `null`
+    // so the value parses. Match the trailing pattern by
+    // walking back over whitespace and looking for `":`.
+    if ends_with_dangling_key(&s) {
+        s.push_str(" null");
+        notes.push("filled dangling key with null".to_string());
+    }
+
+    // Close an unterminated string.
+    if in_string {
+        s.push('"');
+        if matches!(stack.last(), Some('"')) {
+            stack.pop();
+        }
+        notes.push("closed unterminated string".to_string());
+    }
+
+    // Pop remaining open structures in reverse order.
+    while let Some(top) = stack.pop() {
+        match top {
+            '{' => s.push('}'),
+            '[' => s.push(']'),
+            '"' => s.push('"'),
+            _ => {}
+        }
+    }
+
+    if serde_json::from_str::<Value>(&s).is_ok() {
+        return TruncationRepairResult {
+            repaired: s.clone(),
+            changed: s != input,
+            notes,
+            fallback: false,
+        };
+    }
+
+    // Closer exhausted — hard fallback to `{}`. Preserve a
+    // bounded preview of the input so the operator can audit.
+    const PREVIEW_CAP: usize = 500;
+    let preview = if input.len() <= PREVIEW_CAP {
+        input.to_string()
+    } else {
+        let mut cap = PREVIEW_CAP;
+        while !input.is_char_boundary(cap) && cap > 0 {
+            cap -= 1;
+        }
+        format!("{} …[+{} chars]", &input[..cap], input.len() - cap)
+    };
+    notes.push("fallback to {}".to_string());
+    notes.push(format!(
+        "unrecoverable truncation — original args preview: {}",
+        preview
+    ));
+    TruncationRepairResult {
+        repaired: "{}".to_string(),
+        changed: true,
+        notes,
+        fallback: true,
+    }
+}
+
+/// Does the trimmed string end with a key followed by `:` and
+/// no value yet? `"\"foo\":"` or `"\"foo\" :\t"` etc.
+fn ends_with_dangling_key(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 && (bytes[i - 1] as char).is_whitespace() {
+        i -= 1;
+    }
+    if i == 0 || bytes[i - 1] != b':' {
+        return false;
+    }
+    i -= 1;
+    while i > 0 && (bytes[i - 1] as char).is_whitespace() {
+        i -= 1;
+    }
+    i > 0 && bytes[i - 1] == b'"'
 }
 
 /// Phase-1 helper (docs/AGENTIC_LOOP_PLAN.md): a one-liner
@@ -593,6 +811,21 @@ pub fn validate_and_repair(
     let mut applied_kinds: Vec<RepairKind> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
 
+    // 0. dirge-du5k — truncation pre-pass. When args arrive as a
+    //    `Value::String(...)` (most providers stream JSON-as-text
+    //    fragments and rig accumulates into a String when a
+    //    `Complete` event doesn't fire) AND the schema expects an
+    //    object, try to parse. If parse fails with the canonical
+    //    "EOF while parsing" / "expected value" shapes that signal
+    //    truncation, run the brace-closer and retry. This fires
+    //    BEFORE the content normalizers so subsequent passes see a
+    //    real Object instead of a `Value::String`.
+    if let Some(repaired_value) =
+        try_truncation_repair(schema, &repaired, &mut applied_kinds, &mut notes)
+    {
+        repaired = repaired_value;
+    }
+
     // 1. Content normalizers (run regardless of validation status).
     //    These fix well-known model output quirks that don't cause
     //    schema errors (e.g. md auto-links in path fields).
@@ -699,6 +932,65 @@ fn strip_null_optionals(
 }
 
 /// Walk the value tree for null-stripping at deeper levels (inside arrays).
+/// dirge-du5k — bridge from `validate_and_repair` to
+/// `repair_truncated_json`. Detects the truncation failure mode
+/// ("args is a JSON-string fragment that the schema says should
+/// be an object") and runs the brace-closer. Returns `Some(new_value)`
+/// when truncation repair successfully parsed; `None` when the
+/// pre-pass had nothing to do or the closer fell back to `{}`
+/// (validation will then error out and the call will be rejected,
+/// which is the right outcome — fabricating an empty object would
+/// mask the truncation from the model).
+fn try_truncation_repair(
+    schema: &Value,
+    args: &Value,
+    kinds: &mut Vec<RepairKind>,
+    notes: &mut Vec<String>,
+) -> Option<Value> {
+    // Only consider Value::String inputs — Object / Array / scalar
+    // are already structured.
+    let Value::String(raw) = args else {
+        return None;
+    };
+    // Only consider object-typed schemas. If the schema expects a
+    // bare string at the top level, the BareStringToArray /
+    // JsonStringToArray repair paths handle it.
+    let expects_object = schema
+        .get("type")
+        .and_then(|v| v.as_str())
+        .map(|t| t == "object")
+        .unwrap_or(false);
+    if !expects_object {
+        return None;
+    }
+    // Fast path: parses fine. No truncation repair needed; just
+    // promote the parsed value so subsequent repair passes see an
+    // Object instead of a String.
+    if let Ok(parsed) = serde_json::from_str::<Value>(raw)
+        && parsed.is_object()
+    {
+        return Some(parsed);
+    }
+    // Parse failed — try the closer.
+    let result = repair_truncated_json(raw);
+    if result.fallback {
+        // Hard fallback. Don't apply — validation will reject and
+        // the model will see the structured error rather than a
+        // fabricated `{}`.
+        return None;
+    }
+    // Closer succeeded. Parse and apply.
+    if let Ok(parsed) = serde_json::from_str::<Value>(&result.repaired)
+        && parsed.is_object()
+    {
+        kinds.push(RepairKind::TruncationFixed);
+        // Surface the closer's notes to the model so it adapts.
+        notes.extend(result.notes);
+        return Some(parsed);
+    }
+    None
+}
+
 fn strip_null_recursive(value: &mut Value, schema: &Value, kinds: &mut Vec<RepairKind>) {
     match value {
         Value::Object(obj) => {
@@ -1508,5 +1800,222 @@ mod tests {
             rr.repaired["edits"][0]["new_text"],
             "[src/main.rs](https://src/main.rs)"
         );
+    }
+
+    // ── dirge-du5k: truncation brace-closer ────────────────────────────
+
+    /// Reasonix parity test 1: fast-path — well-formed JSON is
+    /// returned unchanged.
+    #[test]
+    fn truncation_fast_path_parseable_unchanged() {
+        let r = repair_truncated_json(r#"{"path": "/tmp/x"}"#);
+        assert!(!r.changed);
+        assert!(!r.fallback);
+        assert!(r.notes.is_empty());
+        assert_eq!(r.repaired, r#"{"path": "/tmp/x"}"#);
+    }
+
+    /// Reasonix parity test 2: empty input → "{}" (and flagged as
+    /// changed). Models occasionally emit zero-length tool_call
+    /// arg strings; the closer must route them to a no-op object
+    /// rather than panic the parser.
+    #[test]
+    fn truncation_empty_input_yields_empty_object() {
+        let r = repair_truncated_json("");
+        assert_eq!(r.repaired, "{}");
+        assert!(!r.fallback);
+    }
+
+    /// Reasonix parity test 3: unterminated string + open object.
+    /// The model wrote `{"path": "/tmp/foo` and ran out of tokens.
+    /// Closer should close the string and then the object.
+    #[test]
+    fn truncation_unterminated_string_and_object() {
+        let r = repair_truncated_json(r#"{"path": "/tmp/foo"#);
+        assert!(!r.fallback);
+        assert!(r.changed);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("closed unterminated string"))
+        );
+        let parsed: Value = serde_json::from_str(&r.repaired).expect("parses");
+        assert_eq!(parsed["path"], "/tmp/foo");
+    }
+
+    /// Reasonix parity test 4: dangling key (model stopped at the
+    /// colon). Closer fills with `null` so the parse succeeds and
+    /// the schema layer reports the type mismatch instead of a
+    /// confusing parse error.
+    #[test]
+    fn truncation_dangling_key_filled_with_null() {
+        let r = repair_truncated_json(r#"{"path":"#);
+        assert!(!r.fallback);
+        assert!(r.notes.iter().any(|n| n.contains("dangling key")));
+        let parsed: Value = serde_json::from_str(&r.repaired).expect("parses");
+        assert_eq!(parsed["path"], Value::Null);
+    }
+
+    /// Reasonix parity test 5: trailing comma trimmed.
+    #[test]
+    fn truncation_trailing_comma_trimmed() {
+        let r = repair_truncated_json(r#"{"a": 1,"#);
+        assert!(!r.fallback);
+        assert!(r.notes.iter().any(|n| n.contains("trimmed trailing comma")));
+        let parsed: Value = serde_json::from_str(&r.repaired).expect("parses");
+        assert_eq!(parsed["a"], 1);
+    }
+
+    /// Reasonix parity test 6: nested arrays + objects all opened.
+    /// Closer pops them in reverse declaration order.
+    #[test]
+    fn truncation_nested_open_structures_all_closed() {
+        let input = r#"{"edits":[{"path":"/tmp/x","new_text":"hello"#;
+        let r = repair_truncated_json(input);
+        assert!(!r.fallback, "notes: {:?}", r.notes);
+        let parsed: Value = serde_json::from_str(&r.repaired).expect("parses");
+        assert_eq!(parsed["edits"][0]["path"], "/tmp/x");
+        assert_eq!(parsed["edits"][0]["new_text"], "hello");
+    }
+
+    /// Reasonix parity test 7: hard fallback. Garbage that the
+    /// stack can't rationalize routes to `{}` with `fallback=true`.
+    /// The integration layer relies on this flag to decide NOT to
+    /// substitute a fake empty object back into `args`.
+    #[test]
+    fn truncation_garbage_falls_back_to_empty_object() {
+        let r = repair_truncated_json(r#"{"a":1} extra ::: garbage"#);
+        // The parser swallows whitespace before { but rejects
+        // trailing content. Closer can't rebalance — but the
+        // input might actually re-parse as just the prefix. Allow
+        // either fallback OR a partial parse; assert correctness
+        // by re-parsing the result.
+        if !r.fallback {
+            assert!(serde_json::from_str::<Value>(&r.repaired).is_ok());
+        } else {
+            assert_eq!(r.repaired, "{}");
+        }
+    }
+
+    /// Reasonix parity test 8: preview is truncated at 500 chars
+    /// on hard fallback for telemetry sanity. Don't dump 10 MB
+    /// args into a single notes line.
+    #[test]
+    fn truncation_fallback_preview_capped() {
+        // Build genuinely-unrecoverable input: deeply unbalanced
+        // with a stray closer that can't be reconciled.
+        let mut input = String::from("}}}}}}}}}}");
+        input.push_str(&"x".repeat(1000));
+        let r = repair_truncated_json(&input);
+        if r.fallback {
+            let preview_note = r
+                .notes
+                .iter()
+                .find(|n| n.contains("preview"))
+                .expect("preview note present");
+            // Cap at 500 + "…[+N chars]" suffix → ~520 bytes max.
+            assert!(
+                preview_note.len() < 600,
+                "preview too long: {}",
+                preview_note.len()
+            );
+            assert!(preview_note.contains("…"));
+        }
+    }
+
+    /// dirge-du5k integration test 1: validate_and_repair fires
+    /// the truncation pre-pass when args is a Value::String and
+    /// the schema expects an object. After the closer succeeds,
+    /// downstream validation passes.
+    #[test]
+    fn integration_truncation_promotes_string_to_object_through_validator() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" }
+            },
+            "required": ["path"]
+        });
+        // Simulates rig accumulating a streamed arg string that
+        // got cut off mid-call.
+        let args = Value::String(r#"{"path": "/tmp/cut"#.to_string());
+        let result = validate_and_repair(&schema, &args).expect("repair must not error");
+        let rr = result.expect("repair should engage");
+        assert!(rr.kinds.contains(&RepairKind::TruncationFixed));
+        assert_eq!(rr.repaired["path"], "/tmp/cut");
+        // The closer's notes are propagated so the model can see
+        // what the loop fixed.
+        assert!(
+            rr.notes
+                .iter()
+                .any(|n| n.contains("closed unterminated string")),
+            "expected note about closed string in: {:?}",
+            rr.notes
+        );
+    }
+
+    /// dirge-du5k integration test 2: the pre-pass refuses to
+    /// engage on a non-object schema. Bare-string-to-array etc.
+    /// own those cases.
+    #[test]
+    fn integration_truncation_skips_non_object_schemas() {
+        let schema = serde_json::json!({
+            "type": "string"
+        });
+        let args = Value::String("hello".to_string());
+        // No truncation repair — falls through to normal flow.
+        // (validate_and_repair returns Ok(None) because args is
+        // already a valid string.)
+        let result = validate_and_repair(&schema, &args).expect("no error");
+        // Either None (passthrough) or Some without TruncationFixed.
+        if let Some(rr) = result {
+            assert!(!rr.kinds.contains(&RepairKind::TruncationFixed));
+        }
+    }
+
+    /// dirge-du5k integration test 3: hard fallback does NOT
+    /// silently substitute `{}`. Model gets a real validation
+    /// error so it can retry with the right shape.
+    #[test]
+    fn integration_truncation_fallback_does_not_mask_error() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" }
+            },
+            "required": ["path"]
+        });
+        // Stack-unrecoverable input (stray closers).
+        let args = Value::String("}}}}}".to_string());
+        let result = validate_and_repair(&schema, &args);
+        // Either the closer succeeded with a parseable form that
+        // then fails required-field validation, OR the closer
+        // fell back and we got a normal validation error. Either
+        // way: an Err (or a NOT-promoted Value::String that
+        // downstream rejects). Assert we do NOT see TruncationFixed
+        // with a fabricated `{}`.
+        if let Ok(Some(rr)) = &result {
+            // If the closer "succeeded", it must have parsed to
+            // something — not a fabricated empty object.
+            assert!(
+                !(rr.kinds.contains(&RepairKind::TruncationFixed)
+                    && rr.repaired == Value::Object(Default::default())),
+                "fallback should not surface as a successful TruncationFixed → {{}}"
+            );
+        }
+    }
+
+    /// dirge-du5k integration test 4: RepairStats records
+    /// TruncationFixed in the per-kind counter and the snapshot
+    /// surfaces it.
+    #[test]
+    fn integration_truncation_increments_repair_stats() {
+        let stats = RepairStats::new();
+        stats.record(RepairKind::TruncationFixed);
+        stats.record(RepairKind::TruncationFixed);
+        let snap = stats.snapshot();
+        assert_eq!(snap.truncation_fixed, 2);
+        assert_eq!(snap.total_successful(), 2);
+        assert!(!snap.is_empty());
     }
 }

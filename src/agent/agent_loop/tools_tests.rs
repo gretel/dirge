@@ -1124,3 +1124,239 @@ async fn aborted_tool_returns_aborted_error_promptly() {
     );
     assert!(batch.messages[0].is_error);
 }
+
+// ── dirge-du5k: truncation brace-closer end-to-end ────────────────
+
+/// dirge-du5k end-to-end: a tool call arriving with a truncated
+/// arguments string (the canonical `max_tokens`-mid-call failure
+/// mode) is healed by the truncation pre-pass inside
+/// `validate_and_repair`, the tool executes with the parsed args,
+/// AND the per-run `RepairStats` records the TruncationFixed
+/// kind. Proves the brace-closer is wired through the actual
+/// dispatch pipeline, not just the validator unit.
+#[tokio::test]
+async fn truncation_repair_end_to_end_through_dispatch() {
+    use crate::agent::agent_loop::tool_input_repair::RepairKind;
+
+    let echo = Arc::new(EchoTool::new("echo"));
+    let context = build_context(echo.clone());
+
+    // Simulates rig accumulating a streamed arg string that got
+    // cut off after the second quote — model hit max_tokens
+    // mid-tool-call. Note: this is Value::String, not
+    // Value::Object, because the accumulator path in
+    // rig_stream::apply_tool_call_delta keeps the running buffer
+    // as a string until either a Complete event lands or the
+    // stream ends.
+    let truncated = r#"{"value": "hello"#;
+    let assistant_msg = AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "tool-1".to_string(),
+            name: "echo".to_string(),
+            arguments: serde_json::Value::String(truncated.to_string()),
+        }],
+        StopReason::ToolUse,
+    );
+    let tool_calls = extract_tool_calls(&assistant_msg);
+    assert_eq!(tool_calls.len(), 1);
+
+    let (tx, mut rx) = mpsc::channel::<LoopEvent>(64);
+    let config = build_config();
+    let signal = AbortSignal::new();
+
+    let batch = execute_tool_calls_sequential(
+        &context,
+        &assistant_msg,
+        &tool_calls,
+        &config,
+        &signal,
+        &tx,
+        &InflightSet::new(),
+    )
+    .await;
+    drop(tx);
+
+    // 1. Tool was called — args reached `execute` AS A PARSED
+    //    OBJECT, not the raw truncated string.
+    let recorded = echo.executed_args.lock().unwrap();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "tool must have been invoked exactly once"
+    );
+    let received = &recorded[0];
+    assert!(
+        received.is_object(),
+        "args must reach execute as an Object, not Value::String; got: {received:?}",
+    );
+    assert_eq!(
+        received["value"], "hello",
+        "the closer must have closed the unterminated string preserving its content",
+    );
+    drop(recorded);
+
+    // 2. Batch is non-error, non-terminating (the call succeeded).
+    assert_eq!(batch.messages.len(), 1);
+    assert!(
+        !batch.messages[0].is_error,
+        "truncation-repaired call must dispatch as a normal success: {:?}",
+        batch.messages[0],
+    );
+    assert!(!batch.terminate);
+
+    // 3. Per-run RepairStats records the TruncationFixed counter.
+    let snap = config.repair_stats.snapshot();
+    assert_eq!(
+        snap.truncation_fixed, 1,
+        "RepairStats.truncation_fixed must increment by 1; got snapshot {:?}",
+        snap,
+    );
+    // No spurious increments on other kinds.
+    assert_eq!(snap.null_stripped, 0);
+    assert_eq!(snap.json_string_to_array, 0);
+    assert_eq!(snap.invalid, 0);
+
+    // 4. The repair-kind is in the per-call telemetry too.
+    //    (Sanity check that the stats snapshot reflects the same
+    //    fact as the per-call hot path.)
+    assert!(
+        RepairKind::ALL.contains(&RepairKind::TruncationFixed),
+        "TruncationFixed must appear in RepairKind::ALL for telemetry iteration",
+    );
+
+    // Drain the event stream — should look like a normal
+    // execution (start/end/message_start/message_end), with no
+    // error events injected by the repair pass.
+    let mut kinds = Vec::new();
+    while let Some(e) = rx.recv().await {
+        kinds.push(e.kind().to_string());
+    }
+    assert_eq!(
+        kinds,
+        vec![
+            "tool_execution_start",
+            "tool_execution_end",
+            "message_start",
+            "message_end",
+        ],
+        "event sequence must match a non-truncated success path",
+    );
+}
+
+/// dirge-du5k end-to-end (negative case): a truly unrecoverable
+/// args string (the closer hard-fallback path) is NOT silently
+/// substituted with `{}` — the model sees a real validation
+/// error so it can retry with a correctly-shaped call.
+///
+/// This is the safety property that distinguishes the brace
+/// closer from "always succeed by lying": fabricating empty
+/// args would let `read_file()` succeed against an empty path
+/// and mask the real failure from the model.
+#[tokio::test]
+async fn truncation_hard_fallback_does_not_fabricate_args() {
+    // Custom tool whose schema REQUIRES a `path` field. EchoTool's
+    // {"type": "object"} would happily accept an empty {} and let
+    // the test pass by accident.
+    use crate::agent::agent_loop::tool::LoopTool;
+    use std::sync::OnceLock;
+
+    #[derive(Debug)]
+    struct StrictPathTool {
+        name: String,
+        executed: Arc<Mutex<Vec<Value>>>,
+    }
+    impl LoopTool for StrictPathTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "needs path"
+        }
+        fn label(&self) -> &str {
+            "strict"
+        }
+        fn parameters(&self) -> &Value {
+            static SCHEMA: OnceLock<Value> = OnceLock::new();
+            SCHEMA.get_or_init(|| {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                })
+            })
+        }
+        fn execute<'a>(
+            &'a self,
+            _id: &'a str,
+            args: Value,
+            _signal: AbortSignal,
+            _on_update: LoopToolUpdate,
+        ) -> Pin<Box<dyn std::future::Future<Output = Result<LoopToolResult, String>> + Send + 'a>>
+        {
+            let executed = self.executed.clone();
+            Box::pin(async move {
+                executed.lock().unwrap().push(args);
+                Ok(LoopToolResult {
+                    content: vec![serde_json::json!({"type": "text", "text": "ok"})],
+                    details: serde_json::Value::Null,
+                    terminate: None,
+                })
+            })
+        }
+    }
+
+    let tool = Arc::new(StrictPathTool {
+        name: "strict".to_string(),
+        executed: Arc::new(Mutex::new(Vec::new())),
+    });
+    let context = build_context(tool.clone());
+
+    // Stack-unrecoverable garbage. Stray closers with no matching
+    // opens — closer flips to fallback={}.
+    let assistant_msg = AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "tool-1".to_string(),
+            name: "strict".to_string(),
+            arguments: serde_json::Value::String("}}}}}".to_string()),
+        }],
+        StopReason::ToolUse,
+    );
+    let tool_calls = extract_tool_calls(&assistant_msg);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(64);
+    let config = build_config();
+    let signal = AbortSignal::new();
+
+    let batch = execute_tool_calls_sequential(
+        &context,
+        &assistant_msg,
+        &tool_calls,
+        &config,
+        &signal,
+        &tx,
+        &InflightSet::new(),
+    )
+    .await;
+
+    // The strict tool must NOT have been called with a fabricated
+    // empty object — the closer's hard fallback must propagate as
+    // a tool_input_invalid error, not a silent success.
+    let executed = tool.executed.lock().unwrap();
+    assert!(
+        executed.is_empty(),
+        "strict tool must NOT receive fabricated args; got: {:?}",
+        *executed,
+    );
+
+    // Result is an error batch.
+    assert_eq!(batch.messages.len(), 1);
+    assert!(
+        batch.messages[0].is_error,
+        "hard-fallback must dispatch as an error so the model sees the failure",
+    );
+
+    // RepairStats records the invalid, NOT a TruncationFixed.
+    let snap = config.repair_stats.snapshot();
+    assert_eq!(snap.truncation_fixed, 0);
+    assert_eq!(snap.invalid, 1);
+}
