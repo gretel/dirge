@@ -223,7 +223,7 @@ pub async fn handle_compress(
     let provider_insights = agent.memory_provider().map(|p| {
         let pre_compress_transcript =
             crate::agent::review::build_transcript_from_slice(messages_to_summarize);
-        p.on_pre_compress(&pre_compress_transcript)
+        crate::agent::review::fire_pre_compress(p.as_ref(), &pre_compress_transcript)
     });
     let augmented_instructions: Option<String> = match (instructions, provider_insights) {
         (Some(user), Some(extra)) if !extra.trim().is_empty() => {

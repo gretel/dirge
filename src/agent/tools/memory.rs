@@ -128,7 +128,12 @@ ACTIONS:
                     .filter(|c| !c.trim().is_empty())
                     .ok_or_else(|| ToolError::Msg("content is required for 'add'".to_string()))?;
                 let resp = self.store.add(target, content).map_err(ToolError::Msg)?;
-                self.store.on_memory_write("add", target, content);
+                crate::agent::review::fire_memory_write(
+                    self.store.as_ref(),
+                    "add",
+                    target,
+                    content,
+                );
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
@@ -151,7 +156,12 @@ ACTIONS:
                     .store
                     .replace(target, old_text, content)
                     .map_err(ToolError::Msg)?;
-                self.store.on_memory_write("replace", target, content);
+                crate::agent::review::fire_memory_write(
+                    self.store.as_ref(),
+                    "replace",
+                    target,
+                    content,
+                );
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
@@ -167,7 +177,12 @@ ACTIONS:
                     .store
                     .remove(target, old_text)
                     .map_err(ToolError::Msg)?;
-                self.store.on_memory_write("remove", target, old_text);
+                crate::agent::review::fire_memory_write(
+                    self.store.as_ref(),
+                    "remove",
+                    target,
+                    old_text,
+                );
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
