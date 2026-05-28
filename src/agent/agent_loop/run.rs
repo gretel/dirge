@@ -128,9 +128,12 @@ fn build_augmented_focus(
     provider: Option<&std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
     middle: &[serde_json::Value],
 ) -> Option<String> {
+    // Lazy transcript build: only walk the middle slice when a
+    // provider is attached. The common no-provider case
+    // short-circuits without paying the format cost.
     let insights = provider.map(|p| {
         let transcript = transcript_from_value_slice(middle);
-        p.on_pre_compress(&transcript)
+        crate::agent::review::fire_pre_compress(p.as_ref(), &transcript)
     });
     match (
         focus_topic.map(str::trim),

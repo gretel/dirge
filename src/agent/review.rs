@@ -359,6 +359,56 @@ pub fn maybe_fire_session_end(
     provider.on_session_end(&transcript);
 }
 
+/// dirge-m1id — fire `on_pre_compress` on a memory provider over
+/// a pre-built transcript of the soon-to-be-discarded message
+/// slice. Returns the provider's insight string (which gets
+/// folded into the compression prompt by the caller).
+///
+/// Takes `&dyn MemoryProvider` (not an Option) for the same
+/// reason as `fire_memory_write` — letting callers compose
+/// the Option themselves keeps the perf-sensitive site in
+/// `build_augmented_focus` able to short-circuit transcript
+/// construction without paying the format cost when no
+/// provider is attached. The two call sites
+/// (`agent_loop::run::build_augmented_focus` and the
+/// `/compact` slash handler) build their transcripts from
+/// different shapes (`&[Value]` vs `&[SessionMessage]`), so the
+/// helper accepts the pre-built transcript rather than the raw
+/// messages.
+///
+/// Lives here alongside `maybe_fire_session_end` /
+/// `maybe_fire_session_switch` / `fire_memory_write` so every
+/// memory-provider hook has a single named entry point —
+/// adding a fifth hook means adding a fifth function here, not
+/// hunting callsites across the codebase.
+pub fn fire_pre_compress(
+    provider: &dyn crate::extras::memory_provider::MemoryProvider,
+    transcript: &str,
+) -> String {
+    provider.on_pre_compress(transcript)
+}
+
+/// dirge-m1id — fire `on_memory_write` on the memory provider
+/// after a successful CRUD. Unlike the other `maybe_fire_*`
+/// helpers this one takes `&dyn MemoryProvider` directly
+/// (not an Option) — at the only callsite (the `memory` tool's
+/// CRUD arms) the provider is the tool's own store, always
+/// present. The Option-aware shape would just push the unwrap
+/// onto the caller for no benefit.
+///
+/// `payload` semantics per `dirge-5feg`: for `add`/`replace`
+/// it's the new content, for `remove` it's the old_text being
+/// removed. The helper itself does NOT interpret the action —
+/// providers / plugins do.
+pub fn fire_memory_write(
+    provider: &dyn crate::extras::memory_provider::MemoryProvider,
+    action: &str,
+    target: &str,
+    payload: &str,
+) {
+    provider.on_memory_write(action, target, payload);
+}
+
 /// dirge-5gn6 — fire `on_session_switch` when the live session id
 /// is changing mid-process. Compaction is the only path today that
 /// rotates the id (the post-compact session gets a fresh id with
@@ -855,6 +905,132 @@ mod tests {
             winners.load(Ordering::Relaxed),
             1,
             "exactly one concurrent caller must win the claim"
+        );
+    }
+
+    // ============================================================
+    // dirge-m1id — central hook dispatcher coverage
+    // ============================================================
+
+    /// `fire_pre_compress`: forwards the transcript to the
+    /// provider's `on_pre_compress` and returns the insight
+    /// string verbatim. Takes `&dyn MemoryProvider` (not an
+    /// Option) so callers can compose Option-handling alongside
+    /// their lazy transcript build.
+    #[test]
+    fn fire_pre_compress_returns_provider_insight_verbatim() {
+        #[derive(Default)]
+        struct PreCompressProvider;
+        impl MemoryProvider for PreCompressProvider {
+            fn name(&self) -> &str {
+                "pre-compress"
+            }
+            fn view(&self, _: &str) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+            fn add(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn replace(&self, _: &str, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn remove(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn on_pre_compress(&self, transcript: &str) -> String {
+                format!("saw {} chars", transcript.len())
+            }
+        }
+        let provider = PreCompressProvider;
+        let insight = fire_pre_compress(&provider, "hello world");
+        assert_eq!(insight, "saw 11 chars");
+    }
+
+    /// `fire_pre_compress` against a default-impl provider (one
+    /// that doesn't override `on_pre_compress`) returns the
+    /// trait's default empty-string. Documents the contract for
+    /// providers that don't care about pre-compress events.
+    #[test]
+    fn fire_pre_compress_returns_empty_for_default_impl_provider() {
+        #[derive(Default)]
+        struct MinimalProvider;
+        impl MemoryProvider for MinimalProvider {
+            fn name(&self) -> &str {
+                "minimal"
+            }
+            fn view(&self, _: &str) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+            fn add(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn replace(&self, _: &str, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn remove(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            // No on_pre_compress override → trait default returns "".
+        }
+        let provider = MinimalProvider;
+        assert_eq!(fire_pre_compress(&provider, "anything"), "");
+    }
+
+    /// `fire_memory_write` forwards `(action, target, payload)`
+    /// verbatim. Action arg can be `add`/`replace`/`remove`; for
+    /// `add` and `replace` the payload is the new content, for
+    /// `remove` it's the old_text (dirge-5feg semantics). The
+    /// helper itself doesn't interpret the action — it just
+    /// forwards. Provider impls / plugins are responsible for
+    /// interpretation.
+    #[test]
+    fn fire_memory_write_forwards_action_target_and_payload() {
+        #[derive(Default)]
+        struct RecordingWriteProvider {
+            writes: Mutex<Vec<(String, String, String)>>,
+        }
+        impl MemoryProvider for RecordingWriteProvider {
+            fn name(&self) -> &str {
+                "recording-write"
+            }
+            fn view(&self, _: &str) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+            fn add(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn replace(&self, _: &str, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn remove(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn on_memory_write(&self, action: &str, target: &str, payload: &str) {
+                self.writes
+                    .lock()
+                    .unwrap()
+                    .push((action.into(), target.into(), payload.into()));
+            }
+        }
+        let provider = Arc::new(RecordingWriteProvider::default());
+        let dyn_provider: &dyn MemoryProvider = provider.as_ref();
+        fire_memory_write(dyn_provider, "add", "memory", "new fact");
+        fire_memory_write(dyn_provider, "replace", "pitfalls", "new pitfall");
+        fire_memory_write(dyn_provider, "remove", "memory", "old fact substring");
+
+        let writes = provider.writes.lock().unwrap();
+        assert_eq!(
+            *writes,
+            vec![
+                ("add".into(), "memory".into(), "new fact".into()),
+                ("replace".into(), "pitfalls".into(), "new pitfall".into()),
+                (
+                    "remove".into(),
+                    "memory".into(),
+                    "old fact substring".into()
+                ),
+            ],
+            "fire_memory_write must forward (action, target, payload) verbatim in order",
         );
     }
 }
