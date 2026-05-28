@@ -24,6 +24,22 @@ use crate::sandbox::Sandbox;
 use crate::semantic::SemanticManager;
 use crate::skill::{self, Skill};
 
+/// Append a memory provider's prompt block to the assembled preamble.
+/// Goes through `MemoryProvider::format_for_system_prompt`
+/// (trait-dispatched) so a non-default backend's block lands in the
+/// preamble too — pre-fix `builder.rs` called the concrete
+/// `MemoryToolStore::format_for_system_prompt` directly, which broke
+/// any future plugin provider's prompt contribution. See dirge-fmau.
+pub(crate) fn append_memory_to_preamble(
+    preamble: &mut String,
+    provider: &std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>,
+) {
+    let block = provider.format_for_system_prompt();
+    if !block.is_empty() {
+        preamble.push_str(&block);
+    }
+}
+
 /// Assemble the always-on base preamble — `SYSTEM_PROMPT`,
 /// `TODO_TOOLS_PROMPT`, and the in-session `SKILLS_GUIDANCE`
 /// (dirge-xxun, mirroring hermes `SKILLS_GUIDANCE`). Other contextual
@@ -206,14 +222,17 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         })
         .await
         .unwrap_or_else(|_| Err("spawn_blocking join failed".to_string()));
-    let memory_store: Option<Arc<crate::extras::memory_store::MemoryToolStore>> =
+    // dirge-fmau: route the preamble snapshot through the
+    // `MemoryProvider` trait so a non-default backend's prompt block
+    // appears too. The unsizing coercion from `Arc<MemoryToolStore>`
+    // to `Arc<dyn MemoryProvider>` is the only call-site change.
+    let memory_store: Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
         match memory_load_result {
             Ok(store) => {
-                let mem_text = store.format_for_system_prompt();
-                if !mem_text.is_empty() {
-                    preamble.push_str(&mem_text);
-                }
-                Some(Arc::new(store))
+                let provider: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
+                    Arc::new(store);
+                append_memory_to_preamble(&mut preamble, &provider);
+                Some(provider)
             }
             Err(_) => None,
         };
@@ -646,14 +665,20 @@ pub async fn build_loop_tools(
 
     // dirge-dktb: same synchronous-I/O fix as `build_agent_inner`.
     // Off-load the disk read to the blocking pool so a slow
-    // filesystem can't stall the async runtime worker.
-    let memory_store: Option<Arc<crate::extras::memory_store::MemoryToolStore>> =
+    // filesystem can't stall the async runtime worker. dirge-fmau:
+    // returns `Arc<dyn MemoryProvider>` so plugin backends can plug
+    // in without churning the call sites.
+    let memory_store: Option<Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
         if let Ok(c) = std::env::current_dir() {
             let paths = crate::extras::dirge_paths::ProjectPaths::new(&c);
             tokio::task::spawn_blocking(move || {
                 crate::extras::memory_store::MemoryToolStore::load(&paths)
                     .ok()
-                    .map(Arc::new)
+                    .map(|s| {
+                        let arc: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
+                            Arc::new(s);
+                        arc
+                    })
             })
             .await
             .unwrap_or_default()
@@ -1210,6 +1235,72 @@ mod reminder_tests {
         assert!(
             p.contains("## Skill creation and maintenance"),
             "missing heading"
+        );
+    }
+
+    /// dirge-fmau — the memory-preamble injection path goes through
+    /// the `MemoryProvider` trait, so a non-default backend's prompt
+    /// block lands in the preamble too. Recording provider verifies
+    /// the trait method is called exactly once and its output appears.
+    #[test]
+    fn memory_preamble_injection_uses_trait_dispatch() {
+        use crate::extras::memory_provider::MemoryProvider;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RecordingProvider {
+            calls: AtomicUsize,
+            block: String,
+        }
+        impl MemoryProvider for RecordingProvider {
+            fn name(&self) -> &str {
+                "recording"
+            }
+            fn format_for_system_prompt(&self) -> String {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.block.clone()
+            }
+            fn view(&self, _: &str) -> serde_json::Value {
+                serde_json::Value::Null
+            }
+            fn add(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn replace(&self, _: &str, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+            fn remove(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+                Ok(serde_json::Value::Null)
+            }
+        }
+
+        let provider: Arc<dyn MemoryProvider> = Arc::new(RecordingProvider {
+            calls: AtomicUsize::new(0),
+            block: "\n\n## RecordingProviderBlock\n\nplugin-supplied prompt text\n".into(),
+        });
+
+        let mut preamble = String::from("base");
+        append_memory_to_preamble(&mut preamble, &provider);
+
+        assert!(
+            preamble.contains("## RecordingProviderBlock"),
+            "plugin provider's prompt heading must appear: {preamble}"
+        );
+        assert!(
+            preamble.contains("plugin-supplied prompt text"),
+            "plugin provider's body must appear: {preamble}"
+        );
+
+        // Empty block must not append anything.
+        let empty: Arc<dyn MemoryProvider> = Arc::new(RecordingProvider {
+            calls: AtomicUsize::new(0),
+            block: String::new(),
+        });
+        let mut preamble2 = String::from("base2");
+        append_memory_to_preamble(&mut preamble2, &empty);
+        assert_eq!(
+            preamble2, "base2",
+            "empty provider block must not append anything"
         );
     }
 
