@@ -1,0 +1,6 @@
+spikes/doltlite/vendor/doltlite-lib-*/
+spikes/doltlite/vendor/*.zip
+
+# doltlite spike binaries
+vendor/doltlite-lib-*/
+vendor/doltlite-lib-*.zip
