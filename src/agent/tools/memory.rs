@@ -5,17 +5,21 @@ use rig::tool::Tool;
 use serde::Deserialize;
 
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
-use crate::extras::memory_store::MemoryToolStore;
+use crate::extras::memory_provider::MemoryProvider;
 
 pub struct MemoryTool {
     pub permission: Option<PermCheck>,
     pub ask_tx: Option<AskSender>,
-    store: Arc<MemoryToolStore>,
+    // dirge-bov5: dyn-dispatched provider so alternative backends
+    // (vector store, MCP, remote sync) can plug in without churning
+    // the call sites. `Arc<MemoryToolStore>` is the default and
+    // coerces to this trait object via unsizing.
+    store: Arc<dyn MemoryProvider>,
 }
 
 impl MemoryTool {
     pub fn new(
-        store: Arc<MemoryToolStore>,
+        store: Arc<dyn MemoryProvider>,
         permission: Option<PermCheck>,
         ask_tx: Option<AskSender>,
     ) -> Self {
@@ -175,18 +179,19 @@ fn validate_target(target: &str) -> Result<&str, ToolError> {
 mod tests {
     use super::*;
     use crate::extras::dirge_paths::ProjectPaths;
+    use crate::extras::memory_store::MemoryToolStore;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
 
-    fn temp_store() -> (Arc<MemoryToolStore>, std::path::PathBuf) {
+    fn temp_store() -> (Arc<dyn MemoryProvider>, std::path::PathBuf) {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
         let dir =
             std::env::temp_dir().join(format!("dirge-mem-tool-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let paths = ProjectPaths::new(&dir);
-        let store = Arc::new(MemoryToolStore::load(&paths).unwrap());
+        let store: Arc<dyn MemoryProvider> = Arc::new(MemoryToolStore::load(&paths).unwrap());
         (store, dir)
     }
 
@@ -376,6 +381,102 @@ mod tests {
         let def = rt.block_on(tool.definition(String::new()));
         assert!(def.description.contains("memory"));
         assert!(def.description.contains("pitfalls"));
+    }
+
+    /// dirge-bov5 — `MemoryTool` routes through the `MemoryProvider`
+    /// trait so an alternative backend (vector store, MCP-backed,
+    /// etc.) receives every call. Verifies a custom recording
+    /// provider sees both writes and reads.
+    #[test]
+    fn integration_tool_routes_calls_through_custom_provider() {
+        use crate::extras::memory_provider::MemoryProvider;
+        use serde_json::json;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct RecordingProvider {
+            calls: Mutex<Vec<String>>,
+        }
+        impl MemoryProvider for RecordingProvider {
+            fn name(&self) -> &str {
+                "recording"
+            }
+            fn view(&self, target: &str) -> serde_json::Value {
+                self.calls.lock().unwrap().push(format!("view:{}", target));
+                json!({ "entries": [], "count": 0 })
+            }
+            fn add(&self, target: &str, content: &str) -> Result<serde_json::Value, String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("add:{}:{}", target, content));
+                Ok(json!({ "success": true, "entry_count": 1 }))
+            }
+            fn replace(
+                &self,
+                target: &str,
+                old: &str,
+                content: &str,
+            ) -> Result<serde_json::Value, String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("replace:{}:{}:{}", target, old, content));
+                Ok(json!({ "success": true }))
+            }
+            fn remove(&self, target: &str, old: &str) -> Result<serde_json::Value, String> {
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(format!("remove:{}:{}", target, old));
+                Ok(json!({ "success": true }))
+            }
+        }
+
+        let provider = Arc::new(RecordingProvider::default());
+        let tool = MemoryTool::new(provider.clone() as Arc<dyn MemoryProvider>, None, None);
+        let rt = make_runtime();
+
+        rt.block_on(tool.call(Args {
+            action: "add".into(),
+            target: "memory".into(),
+            content: Some("from-tool".into()),
+            old_text: None,
+        }))
+        .unwrap();
+        rt.block_on(tool.call(Args {
+            action: "view".into(),
+            target: "memory".into(),
+            content: None,
+            old_text: None,
+        }))
+        .unwrap();
+        rt.block_on(tool.call(Args {
+            action: "replace".into(),
+            target: "memory".into(),
+            content: Some("new".into()),
+            old_text: Some("from-tool".into()),
+        }))
+        .unwrap();
+        rt.block_on(tool.call(Args {
+            action: "remove".into(),
+            target: "memory".into(),
+            content: None,
+            old_text: Some("new".into()),
+        }))
+        .unwrap();
+
+        let calls = provider.calls.lock().unwrap();
+        assert_eq!(
+            *calls,
+            vec![
+                "add:memory:from-tool".to_string(),
+                "view:memory".to_string(),
+                "replace:memory:from-tool:new".to_string(),
+                "remove:memory:new".to_string(),
+            ],
+            "custom provider must receive every tool call verbatim"
+        );
     }
 
     /// End-to-end: every action the SYSTEM_PROMPT names for the memory
