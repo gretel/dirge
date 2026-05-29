@@ -113,7 +113,9 @@ impl Engine {
         // Per resource: (effect, binding-trace-entry).
         let mut per_resource: Vec<(Effect, Option<TraceEntry>)> = Vec::new();
 
-        for (ri, resource) in req.resources.iter().enumerate() {
+        for (ri, claim) in req.claims.iter().enumerate() {
+            let op = claim.op;
+            let resource = &claim.resource;
             if let Resource::Path { resolved, .. } = resource {
                 resolved_paths.push(resolved.clone());
             }
@@ -122,7 +124,7 @@ impl Engine {
             let mut base = Effect::Ask; // defensive default; DefaultActionPolicy normally claims
             let mut binding: Option<TraceEntry> = None;
             for d in &self.deciders {
-                if !d.applies_to(req.op, resource) {
+                if !d.applies_to(op, resource) {
                     trace.push(TraceEntry {
                         policy: d.id(),
                         resource: ri,
@@ -132,7 +134,7 @@ impl Engine {
                     });
                     continue;
                 }
-                match d.decide(req, resource, &self.ctx) {
+                match d.decide(req, op, resource, &self.ctx) {
                     Some(v) => {
                         let entry = TraceEntry {
                             policy: d.id(),
@@ -168,7 +170,7 @@ impl Engine {
             // excluded.
             if req.mode == crate::permission::SecurityMode::Accept
                 && base == Effect::Ask
-                && accept_eligible(req.op, resource)
+                && accept_eligible(op, resource)
             {
                 base = Effect::Allow;
                 let entry = TraceEntry {
@@ -185,7 +187,7 @@ impl Engine {
             // ---- Stage B: modifiers, monotone tighten ----
             let mut eff = base;
             for m in &self.modifiers {
-                if !m.applies_to(req.op, resource) {
+                if !m.applies_to(op, resource) {
                     trace.push(TraceEntry {
                         policy: m.id(),
                         resource: ri,
@@ -195,7 +197,7 @@ impl Engine {
                     });
                     continue;
                 }
-                let refined = m.refine(req, resource, eff, &self.ctx);
+                let refined = m.refine(req, op, resource, eff, &self.ctx);
                 if refined.by.is_some() {
                     let entry = TraceEntry {
                         policy: refined.by.unwrap(),
@@ -248,8 +250,8 @@ impl Engine {
     /// Allowed/denied requests don't accumulate retry pressure.
     pub fn commit(&mut self, req: &AccessRequest, decision: &Decision) {
         if decision.effect == Effect::Ask {
-            for resource in &req.resources {
-                self.ctx.repeat.record(req.op, resource.match_key());
+            for claim in &req.claims {
+                self.ctx.repeat.record(claim.op, claim.resource.match_key());
             }
         }
     }
@@ -284,7 +286,13 @@ mod tests {
         fn applies_to(&self, _: Operation, _: &Resource) -> bool {
             self.2
         }
-        fn decide(&self, _: &AccessRequest, _: &Resource, _: &PolicyCtx) -> Option<Verdict> {
+        fn decide(
+            &self,
+            _: &AccessRequest,
+            _: Operation,
+            _: &Resource,
+            _: &PolicyCtx,
+        ) -> Option<Verdict> {
             Some(Verdict::new(self.1, "stub"))
         }
     }
@@ -296,16 +304,25 @@ mod tests {
         fn applies_to(&self, _: Operation, _: &Resource) -> bool {
             true
         }
-        fn refine(&self, _: &AccessRequest, _: &Resource, cur: Effect, _: &PolicyCtx) -> Refined {
+        fn refine(
+            &self,
+            _: &AccessRequest,
+            _: Operation,
+            _: &Resource,
+            cur: Effect,
+            _: &PolicyCtx,
+        ) -> Refined {
             Refined::tighten(cur, self.1, self.0, "stub tighten")
         }
     }
 
     fn req(resources: Vec<Resource>) -> AccessRequest {
         AccessRequest {
-            op: Operation::Execute,
             tool: "test".to_string(),
-            resources,
+            claims: resources
+                .into_iter()
+                .map(|r| Claim::new(Operation::Execute, r))
+                .collect(),
             mode: SecurityMode::Standard,
             display_input: "test".to_string(),
         }
@@ -391,7 +408,13 @@ mod tests {
             fn applies_to(&self, _: Operation, _: &Resource) -> bool {
                 true
             }
-            fn decide(&self, _: &AccessRequest, r: &Resource, _: &PolicyCtx) -> Option<Verdict> {
+            fn decide(
+                &self,
+                _: &AccessRequest,
+                _: Operation,
+                r: &Resource,
+                _: &PolicyCtx,
+            ) -> Option<Verdict> {
                 let eff = if r.match_key().contains("bad") {
                     Effect::Deny
                 } else {

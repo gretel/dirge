@@ -257,9 +257,11 @@ mod tests {
         resources: Vec<Resource>,
     ) -> AccessRequest {
         AccessRequest {
-            op,
             tool: tool.to_string(),
-            resources,
+            claims: resources
+                .into_iter()
+                .map(|r| crate::permission::engine::types::Claim::new(op, r))
+                .collect(),
             mode,
             display_input: String::new(),
         }

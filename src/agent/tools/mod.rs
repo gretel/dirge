@@ -334,6 +334,46 @@ pub async fn enforce(
     }
 }
 
+/// Authorize a pre-built, possibly multi-claim [`AccessRequest`]
+/// atomically: ONE decision, at most ONE prompt. This is the entry
+/// point for tools (bash) that decompose a single invocation into
+/// several claims (command segments + redirect/mutation targets) — the
+/// per-resource effects fold most-restrictive-wins, so the whole
+/// command is allowed/denied/prompted as a unit instead of gate-by-gate.
+///
+/// On `Ask`, the single prompt shows the request's `display_input` (the
+/// whole command); "allow always" allowlists that command. In-cwd write
+/// targets are builtin-allowed and don't re-prompt; external targets are
+/// (correctly) re-scrutinized on the next run.
+pub async fn enforce_request(
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    req: crate::permission::engine::types::AccessRequest,
+) -> Result<(), ToolError> {
+    use crate::permission::engine::types::Effect;
+    let Some(perm) = permission else {
+        return Ok(()); // no checker (ACP / --no-tools) → pass through
+    };
+    let (effect, reason) = {
+        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
+        let decision = guard.authorize_request(&req);
+        (decision.effect, decision.reason())
+    };
+    match effect {
+        Effect::Allow => Ok(()),
+        Effect::Deny => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
+        Effect::Ask => {
+            let Some(tx) = ask_tx else {
+                return Err(ToolError::Msg(
+                    "Permission denied (non-interactive mode)".to_string(),
+                ));
+            };
+            handle_ask_inner(tx, perm, &req.tool, &req.display_input).await?;
+            Ok(())
+        }
+    }
+}
+
 /// Back-compat wrapper for the legacy non-path check. Delegates to
 /// [`enforce`] with [`Scope::Raw`]. New code should call `enforce`
 /// directly.

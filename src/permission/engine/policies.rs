@@ -66,8 +66,8 @@ pub struct Rule {
 }
 
 impl Rule {
-    fn matches(&self, req: &AccessRequest, resource: &Resource) -> bool {
-        self.op.matches(req.op)
+    fn matches(&self, req: &AccessRequest, op: Operation, resource: &Resource) -> bool {
+        self.op.matches(op)
             && self.tool.as_deref().is_none_or(|t| t == req.tool)
             && resource
                 .match_candidates()
@@ -93,7 +93,13 @@ impl Decider for PromptDenyPolicy {
     fn applies_to(&self, _: Operation, _: &Resource) -> bool {
         true
     }
-    fn decide(&self, req: &AccessRequest, resource: &Resource, ctx: &PolicyCtx) -> Option<Verdict> {
+    fn decide(
+        &self,
+        req: &AccessRequest,
+        _op: Operation,
+        resource: &Resource,
+        ctx: &PolicyCtx,
+    ) -> Option<Verdict> {
         let denied = |name: &str| ctx.prompt_deny.iter().any(|d| d.eq_ignore_ascii_case(name));
         let hit =
             denied(&req.tool) || matches!(resource, Resource::Mcp { name, .. } if denied(name));
@@ -119,7 +125,13 @@ impl Decider for YoloPolicy {
     fn applies_to(&self, _: Operation, _: &Resource) -> bool {
         true
     }
-    fn decide(&self, req: &AccessRequest, _: &Resource, _: &PolicyCtx) -> Option<Verdict> {
+    fn decide(
+        &self,
+        req: &AccessRequest,
+        _op: Operation,
+        _: &Resource,
+        _: &PolicyCtx,
+    ) -> Option<Verdict> {
         (req.mode == SecurityMode::Yolo).then(|| Verdict::new(Effect::Allow, "yolo mode"))
     }
 }
@@ -136,11 +148,17 @@ impl Decider for SessionAllowlistPolicy {
     fn applies_to(&self, _: Operation, _: &Resource) -> bool {
         true
     }
-    fn decide(&self, req: &AccessRequest, resource: &Resource, ctx: &PolicyCtx) -> Option<Verdict> {
+    fn decide(
+        &self,
+        _req: &AccessRequest,
+        op: Operation,
+        resource: &Resource,
+        ctx: &PolicyCtx,
+    ) -> Option<Verdict> {
         resource
             .match_candidates()
             .iter()
-            .any(|k| ctx.allowlist.allows(req.op, k))
+            .any(|k| ctx.allowlist.allows(op, k))
             .then(|| Verdict::new(Effect::Allow, "allowed for this session"))
     }
 }
@@ -163,10 +181,16 @@ impl Decider for ConfiguredRulePolicy {
             .iter()
             .any(|r| r.op.matches(op) && cands.iter().any(|k| r.pattern.matches(k)))
     }
-    fn decide(&self, req: &AccessRequest, resource: &Resource, _: &PolicyCtx) -> Option<Verdict> {
+    fn decide(
+        &self,
+        req: &AccessRequest,
+        op: Operation,
+        resource: &Resource,
+        _: &PolicyCtx,
+    ) -> Option<Verdict> {
         self.rules
             .iter()
-            .filter(|r| r.matches(req, resource))
+            .filter(|r| r.matches(req, op, resource))
             .next_back() // last match wins
             .map(|r| Verdict::new(r.effect, format!("rule {:?} → {:?}", r.original, r.effect)))
     }
@@ -179,9 +203,9 @@ pub struct BuiltinAllowPolicy;
 
 impl BuiltinAllowPolicy {
     /// The effect this policy would contribute, or `None` to pass.
-    fn effect_for(req: &AccessRequest, resource: &Resource) -> Option<Effect> {
+    fn effect_for(op: Operation, req: &AccessRequest, resource: &Resource) -> Option<Effect> {
         let restrictive = req.mode == SecurityMode::Restrictive;
-        match req.op {
+        match op {
             // Observation is always transparent — even in Restrictive,
             // even outside the cwd (the old global `read **` allow).
             Operation::Read => Some(Effect::Allow),
@@ -189,8 +213,7 @@ impl BuiltinAllowPolicy {
             // Memory/skill: reads always allowed; writes allowed except
             // under Restrictive, where they confirm.
             Operation::Memory | Operation::Skill => {
-                let is_read =
-                    matches!(resource, Resource::Bareword(a) if is_read_action(req.op, a));
+                let is_read = matches!(resource, Resource::Bareword(a) if is_read_action(op, a));
                 if is_read || !restrictive {
                     Some(Effect::Allow)
                 } else {
@@ -241,8 +264,14 @@ impl Decider for BuiltinAllowPolicy {
                 | (Operation::Edit, Resource::Path { dev_null: true, .. })
         )
     }
-    fn decide(&self, req: &AccessRequest, resource: &Resource, _: &PolicyCtx) -> Option<Verdict> {
-        Self::effect_for(req, resource).map(|e| {
+    fn decide(
+        &self,
+        req: &AccessRequest,
+        op: Operation,
+        resource: &Resource,
+        _: &PolicyCtx,
+    ) -> Option<Verdict> {
+        Self::effect_for(op, req, resource).map(|e| {
             let why = match e {
                 Effect::Allow => "built-in allow",
                 _ => "restrictive mode confirms writes",
@@ -289,14 +318,20 @@ impl Decider for ExternalDirPolicy {
         // reads are already allowed by BuiltinAllow (higher precedence).
         matches!(op, Operation::Edit) && Self::is_external_path(resource)
     }
-    fn decide(&self, req: &AccessRequest, resource: &Resource, _: &PolicyCtx) -> Option<Verdict> {
+    fn decide(
+        &self,
+        req: &AccessRequest,
+        op: Operation,
+        resource: &Resource,
+        _: &PolicyCtx,
+    ) -> Option<Verdict> {
         if !Self::is_external_path(resource) {
             return None;
         }
         let matched = self
             .rules
             .iter()
-            .filter(|r| r.matches(req, resource))
+            .filter(|r| r.matches(req, op, resource))
             .next_back();
         match matched {
             Some(r) => Some(Verdict::new(
@@ -321,7 +356,13 @@ impl Decider for DefaultActionPolicy {
     fn applies_to(&self, _: Operation, _: &Resource) -> bool {
         true
     }
-    fn decide(&self, req: &AccessRequest, _: &Resource, _: &PolicyCtx) -> Option<Verdict> {
+    fn decide(
+        &self,
+        req: &AccessRequest,
+        _op: Operation,
+        _: &Resource,
+        _: &PolicyCtx,
+    ) -> Option<Verdict> {
         let eff = if req.mode == SecurityMode::Restrictive && self.default == Effect::Allow {
             Effect::Ask
         } else {
@@ -355,6 +396,7 @@ impl Modifier for LoopGuardPolicy {
     fn refine(
         &self,
         req: &AccessRequest,
+        op: Operation,
         resource: &Resource,
         current: Effect,
         ctx: &PolicyCtx,
@@ -364,7 +406,7 @@ impl Modifier for LoopGuardPolicy {
         if current != Effect::Ask {
             return Refined::noop(current);
         }
-        let prior = ctx.repeat.prior(req.op, resource.match_key());
+        let prior = ctx.repeat.prior(op, resource.match_key());
         if prior >= self.threshold {
             let preview: String = resource.match_key().chars().take(60).collect();
             Refined::tighten(
@@ -406,9 +448,11 @@ mod tests {
 
     fn req(op: Operation, mode: SecurityMode, resources: Vec<Resource>) -> AccessRequest {
         AccessRequest {
-            op,
             tool: format!("{op:?}").to_lowercase(),
-            resources,
+            claims: resources
+                .into_iter()
+                .map(|r| crate::permission::engine::types::Claim::new(op, r))
+                .collect(),
             mode,
             display_input: String::new(),
         }

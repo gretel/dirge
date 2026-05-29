@@ -131,8 +131,15 @@ pub trait Decider: Send + Sync {
     fn applies_to(&self, op: Operation, resource: &Resource) -> bool;
 
     /// Claim the resource with a verdict, or `None` to pass to the
-    /// next decider. Reads `ctx` but never mutates it.
-    fn decide(&self, req: &AccessRequest, resource: &Resource, ctx: &PolicyCtx) -> Option<Verdict>;
+    /// next decider. `op` is the current claim's operation. Reads
+    /// `ctx` but never mutates it.
+    fn decide(
+        &self,
+        req: &AccessRequest,
+        op: Operation,
+        resource: &Resource,
+        ctx: &PolicyCtx,
+    ) -> Option<Verdict>;
 }
 
 /// Stage B. A modifier may only tighten the running effect for a
@@ -144,10 +151,12 @@ pub trait Modifier: Send + Sync {
     fn applies_to(&self, op: Operation, resource: &Resource) -> bool;
 
     /// Refine the current effect. Must return [`Refined::tighten`] or
-    /// [`Refined::noop`] — it cannot loosen `current`.
+    /// [`Refined::noop`] — it cannot loosen `current`. `op` is the
+    /// current claim's operation.
     fn refine(
         &self,
         req: &AccessRequest,
+        op: Operation,
         resource: &Resource,
         current: Effect,
         ctx: &PolicyCtx,
