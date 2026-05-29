@@ -494,6 +494,11 @@ pub async fn run_loop(
     // starts at 0 (IMPROVEMENTS_PLAN #1).
     let mut compaction_failures: u32 = 0;
 
+    // Tokens the pre-send snip freed this iteration. If it freed enough
+    // headroom, the post-response NORMAL fold is skipped
+    // (IMPROVEMENTS_PLAN #4). Reset after each post-usage decision.
+    let mut snip_tokens_freed: u64 = 0;
+
     // Pi line 167: initial steering poll.
     // Phase 4 part 2: composes with the file-touch tracker's
     // reminder poll when configured.
@@ -630,10 +635,15 @@ pub async fn run_loop(
                 crate::agent::compression::estimate_messages_tokens(&current_context.messages);
             let result_cap =
                 crate::agent::compression::tiered_result_cap(cap_estimate, cap_ctx_max);
-            current_context.messages = crate::agent::compression::cap_oversized_tool_results(
+            // Counted variant (IMPROVEMENTS_PLAN #4): track how much the
+            // snip freed so the post-response fold can be skipped if it
+            // bought enough headroom.
+            let (capped, freed) = crate::agent::compression::cap_oversized_tool_results_counted(
                 &current_context.messages,
                 result_cap,
             );
+            current_context.messages = capped;
+            snip_tokens_freed = snip_tokens_freed.saturating_add(freed);
 
             // Pi lines 192-194: LLM call.
             let (assistant_msg, token_usage) = stream_assistant_response(
@@ -883,32 +893,51 @@ pub async fn run_loop(
                 match decision.kind {
                     PostUsageDecisionKind::Fold if !folded_this_turn => {
                         folded_this_turn = true;
-                        tracing::info!(
-                            target: "dirge::agent_loop",
-                            ratio = %decision.ratio,
-                            aggressive = decision.aggressive,
-                            tail_budget = ?decision.tail_budget,
-                            "context-manager: fold recommended ({})",
-                            if decision.aggressive { "aggressive" } else { "normal" },
-                        );
+                        // IMPROVEMENTS_PLAN #4: if the pre-send snip
+                        // already freed enough headroom, skip a NORMAL
+                        // fold this turn (aggressive folds still fire).
+                        if crate::agent::compression::snip_bought_enough(
+                            snip_tokens_freed,
+                            ctx_max,
+                            decision.aggressive,
+                        ) {
+                            tracing::info!(
+                                target: "dirge::agent_loop",
+                                freed = snip_tokens_freed,
+                                ratio = %decision.ratio,
+                                "snip freed {snip_tokens_freed} tokens — sufficient, skipping fold",
+                            );
+                        } else {
+                            tracing::info!(
+                                target: "dirge::agent_loop",
+                                ratio = %decision.ratio,
+                                aggressive = decision.aggressive,
+                                tail_budget = ?decision.tail_budget,
+                                "context-manager: fold recommended ({})",
+                                if decision.aggressive { "aggressive" } else { "normal" },
+                            );
 
-                        // Context compaction: prune old tool results and
-                        // compress the middle section of the conversation.
-                        // Port of Hermes's compression pass.
-                        if let Some(prompt_tokens) = token_usage.map(|u| u.input_tokens)
-                            && crate::agent::compression::should_compress(prompt_tokens, ctx_max)
-                        {
-                            let outcome = run_compaction_pass(
-                                &mut current_context,
-                                &summarize_fn,
-                                5, // protect last 5 messages
-                                compaction_failures,
-                                &memory_provider,
-                                config.compaction_hooks.as_ref(),
-                                emit,
-                            )
-                            .await;
-                            record_compaction_outcome(&mut compaction_failures, outcome);
+                            // Context compaction: prune old tool results and
+                            // compress the middle section of the conversation.
+                            // Port of Hermes's compression pass.
+                            if let Some(prompt_tokens) = token_usage.map(|u| u.input_tokens)
+                                && crate::agent::compression::should_compress(
+                                    prompt_tokens,
+                                    ctx_max,
+                                )
+                            {
+                                let outcome = run_compaction_pass(
+                                    &mut current_context,
+                                    &summarize_fn,
+                                    5, // protect last 5 messages
+                                    compaction_failures,
+                                    &memory_provider,
+                                    config.compaction_hooks.as_ref(),
+                                    emit,
+                                )
+                                .await;
+                                record_compaction_outcome(&mut compaction_failures, outcome);
+                            }
                         }
                     }
                     PostUsageDecisionKind::ExitWithSummary => {
@@ -934,6 +963,10 @@ pub async fn run_loop(
                     }
                     _ => {}
                 }
+                // Snip credit is per-iteration: it informed THIS post-usage
+                // decision; clear it so a later iteration's fold isn't
+                // suppressed by a stale snip (IMPROVEMENTS_PLAN #4).
+                snip_tokens_freed = 0;
             }
 
             // Pi lines 220-239: prepareNextTurn.

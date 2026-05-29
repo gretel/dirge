@@ -100,6 +100,19 @@ pub fn tiered_result_cap(estimate_tokens: u64, ctx_max: u64) -> u64 {
     }
 }
 
+/// When the pre-send snip (`cap_oversized_tool_results`) frees at least
+/// this fraction of the context window, a NORMAL post-response fold can
+/// be skipped — the snip already bought enough headroom
+/// (IMPROVEMENTS_PLAN #4).
+pub const SNIP_SUFFICIENT_FRACTION: f64 = 0.10;
+
+/// Whether a snip that freed `freed` tokens bought enough headroom to
+/// skip a normal fold this turn. Aggressive / force-summary folds always
+/// proceed regardless — at 80%+ you need the summary. Pure for testing.
+pub fn snip_bought_enough(freed: u64, ctx_max: u64, aggressive: bool) -> bool {
+    !aggressive && (freed as f64 / ctx_max.max(1) as f64) > SNIP_SUFFICIENT_FRACTION
+}
+
 /// Chars-per-token rough estimate. Port of Hermes's _CHARS_PER_TOKEN.
 const CHARS_PER_TOKEN: u64 = 4;
 
@@ -243,6 +256,23 @@ pub fn cap_oversized_tool_results(messages: &[Value], max_tokens: u64) -> Vec<Va
             }
         })
         .collect()
+}
+
+/// Like [`cap_oversized_tool_results`] but also reports how many tokens
+/// the capping freed (IMPROVEMENTS_PLAN #4), measured with the same
+/// estimator the fold decision uses — so the loop can tell whether the
+/// snip already bought enough headroom to skip a fold. Delegates to the
+/// unchanged capper so its behavior (and every existing caller) is
+/// untouched.
+pub fn cap_oversized_tool_results_counted(
+    messages: &[Value],
+    max_tokens: u64,
+) -> (Vec<Value>, u64) {
+    let before = estimate_messages_tokens(messages);
+    let capped = cap_oversized_tool_results(messages, max_tokens);
+    let after = estimate_messages_tokens(&capped);
+    let freed = before.saturating_sub(after);
+    (capped, freed)
 }
 
 /// Minimum per-block content budget when splitting `max_chars`
@@ -714,6 +744,40 @@ mod tests {
         );
         // Degenerate ctx_max doesn't panic (div-by-zero guard).
         let _ = tiered_result_cap(100, 0);
+    }
+
+    // IMPROVEMENTS_PLAN #4: snip feedback loop.
+    #[test]
+    fn snip_bought_enough_gates_normal_folds_only() {
+        let ctx = 128_000u64;
+        // > 10% freed, normal fold → enough.
+        assert!(snip_bought_enough((ctx as f64 * 0.11) as u64, ctx, false));
+        // < 10% freed → not enough.
+        assert!(!snip_bought_enough((ctx as f64 * 0.05) as u64, ctx, false));
+        // Aggressive fold always proceeds, even if a lot was freed.
+        assert!(!snip_bought_enough(ctx, ctx, true));
+        // div-by-zero guard.
+        assert!(!snip_bought_enough(0, 0, false));
+    }
+
+    #[test]
+    fn cap_counted_reports_freed_tokens() {
+        // One oversized tool result.
+        let big = "x".repeat(40_000); // ~10k tokens
+        let msgs = vec![serde_json::json!({"role": "tool", "content": big})];
+        let (capped, freed) = cap_oversized_tool_results_counted(&msgs, 1000);
+        // Same result as the uncounted capper.
+        assert_eq!(capped, cap_oversized_tool_results(&msgs, 1000));
+        // It freed a meaningful number of tokens (oversized → trimmed).
+        assert!(
+            freed > 5_000,
+            "expected substantial freed tokens, got {freed}"
+        );
+
+        // A result already under the cap frees nothing.
+        let small = vec![serde_json::json!({"role": "tool", "content": "ok"})];
+        let (_, freed0) = cap_oversized_tool_results_counted(&small, 1000);
+        assert_eq!(freed0, 0);
     }
 
     // ── should_compress ─────────────────────────────────
