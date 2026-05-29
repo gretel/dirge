@@ -430,6 +430,26 @@ impl PermissionChecker {
         decision
     }
 
+    /// Authorize a pre-built (possibly multi-claim) request and commit
+    /// it. Used by tools — bash especially — that decompose one
+    /// invocation into several claims (command segments + redirect /
+    /// mutation targets) and want ONE atomic decision + at most one
+    /// prompt instead of N independent `enforce` calls.
+    pub fn authorize_request(
+        &mut self,
+        req: &engine::types::AccessRequest,
+    ) -> engine::types::Decision {
+        let decision = self.engine.authorize(req);
+        self.engine.commit(req, &decision);
+        decision
+    }
+
+    /// The checker's working directory — tools building their own
+    /// multi-claim requests need it to classify path resources.
+    pub fn working_dir(&self) -> &str {
+        &self.working_dir
+    }
+
     /// Dry-run a decision and render its full audit trail (which
     /// policy decided and why, plus every applicable policy's vote).
     /// Pure: no commit, no loop-guard accounting. Backs the `/why`
@@ -475,13 +495,13 @@ impl PermissionChecker {
                 _ => Resource::Bareword(input.to_string()),
             }
         };
-        engine::types::AccessRequest {
-            op: engine::tool_operation(tool),
-            tool: tool.to_string(),
-            resources: vec![resource],
-            mode: self.mode,
-            display_input: input.to_string(),
-        }
+        engine::types::AccessRequest::single(
+            tool,
+            engine::tool_operation(tool),
+            resource,
+            self.mode,
+            input,
+        )
     }
 
     /// Install the current prompt's deny-list. Called when the

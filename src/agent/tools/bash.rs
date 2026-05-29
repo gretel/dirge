@@ -5,7 +5,7 @@ use tokio::time::Duration;
 
 use crate::agent::agent_loop::tool_input_repair::with_contract_hint;
 use crate::agent::tools::cache::ToolCache;
-use crate::agent::tools::{AskSender, BashArgs, PermCheck, Scope, ToolError, enforce};
+use crate::agent::tools::{AskSender, BashArgs, PermCheck, ToolError, enforce_request};
 
 use crate::sandbox::Sandbox;
 #[cfg(feature = "semantic-bash")]
@@ -369,187 +369,111 @@ impl Tool for BashTool {
     }
 }
 
-/// dirge-mzs4: bash-segment check with `Ask → Allow` soft-allow
-/// for segments whose only filesystem-touching effect is a redirect
-/// to `/dev/null`. Deny rules and the doom-loop detector still fire
-/// — the only divergence from the normal `enforce(..., "bash", ...)`
-/// path is that an `Ask` outcome is converted to `Allowed` instead
-/// of prompting the user.
-///
-/// Routes through `PermissionChecker::check_bash_dev_null_softallow`
-/// rather than the generic `enforce` chokepoint because the
-/// Ask-upgrade is intentionally scoped to ONE call site (the bash
-/// segment loop after the dev-null parser flagged the segment) and
-/// MUST NOT leak into other tools.
-#[cfg(feature = "semantic-bash")]
-async fn check_bash_segment_dev_null(
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    segment: &str,
-) -> Result<(), ToolError> {
-    use crate::permission::checker::CheckResult;
-
-    let Some(perm) = permission else {
-        return Ok(());
-    };
-
-    let result = {
-        let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        guard.check_bash_dev_null_softallow(segment)
-    };
-
-    match result {
-        CheckResult::Allowed => Ok(()),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        // Unreachable: `check_bash_dev_null_softallow` converts Ask
-        // to Allowed before returning. Fall back to the standard
-        // enforce chokepoint defensively — if a future refactor
-        // breaks the conversion, behaviour degrades to "prompt the
-        // user", which is the conservative default.
-        CheckResult::Ask => enforce(permission, ask_tx, "bash", Scope::Raw(segment))
-            .await
-            .map(|_| ()),
-    }
-}
-
 async fn check_bash_segments(
     permission: &Option<PermCheck>,
     ask_tx: &Option<AskSender>,
     command: &str,
 ) -> Result<(), ToolError> {
-    // M3 (dirge-6ab): every bash permission decision routes through
-    // the `enforce` chokepoint. Each compound-statement segment is
-    // checked independently so `git diff && rm -rf /` gets BOTH `git`
-    // AND `rm` checked against the user's bash rules — not just the
-    // leading command. Redirect targets (`> file`) additionally route
-    // through the `write` tool rules so write/edit path rules apply,
-    // closing the C4 audit gap where targets hit bash rules with
-    // path-string inputs and fell through to default Allow.
+    // ATOMIC bash authorization (Phase 3): one bash invocation becomes
+    // ONE multi-claim AccessRequest — an Execute claim per command
+    // segment plus an Edit claim per redirect target / mutation path —
+    // authorized as a unit so the whole command is allowed/denied/
+    // prompted ONCE, not gate-by-gate. (Replaces the old per-call
+    // `enforce` loop that could fire several sequential prompts.)
+    //
+    // Semantics preserved by the engine, not bespoke code here:
+    //   - each compound segment is checked, so `git diff && rm -rf /`
+    //     denies on the `rm` segment (Execute deny rule);
+    //   - redirect/mutation targets route through Edit (the write rules
+    //     + external-dir gate apply, closing the C4 audit gap);
+    //   - `/dev/null` targets are auto-allowed by BuiltinAllow on the
+    //     Edit claim — but the command itself still needs Execute
+    //     permission, so an UNFAMILIAR `cmd > /dev/null` still prompts
+    //     (more correct than the old blanket command soft-allow).
+    let Some(perm) = permission else {
+        return Ok(()); // no checker (ACP / --no-tools) → pass through
+    };
+    let mode = {
+        let g = perm.lock().unwrap_or_else(|e| e.into_inner());
+        g.mode()
+    };
+    use crate::permission::engine::types::{AccessRequest, Claim, Operation, Resource};
+    let cmd_claim = |seg: &str| {
+        Claim::new(
+            Operation::Execute,
+            Resource::Command {
+                raw: seg.to_string(),
+                head: seg.split_whitespace().next().unwrap_or("").to_string(),
+            },
+        )
+    };
+    let mut claims: Vec<Claim> = Vec::new();
+
     #[cfg(feature = "semantic-bash")]
     {
-        // dirge-mzs4: use the dev-null-aware parser. Each segment is
-        // paired with a boolean flag indicating whether its enclosing
-        // `redirected_statement` had at least one file_redirect AND
-        // all those redirects targeted `/dev/null`. Segments with the
-        // flag set get an `Ask → Allow` soft-allow on the bash rule
-        // check — writing to /dev/null has no observable side effect
-        // so prompting on `<cmd> > /dev/null` is pure noise. Deny
-        // rules (default `rm -rf /**` etc.) still fire, and the
-        // doom-loop tracker still runs.
+        let working_dir = {
+            let g = perm.lock().unwrap_or_else(|e| e.into_inner());
+            g.working_dir().to_string()
+        };
+        let path_claim = |p: &str| {
+            Claim::new(
+                Operation::Edit,
+                crate::permission::engine::classify_path(p, &working_dir),
+            )
+        };
         let (segments_with_flag, complex) = bash::parse_bash_segments_with_dev_null(command)
             .unwrap_or_else(|_| (vec![(command.to_string(), false)], false));
-
         if complex {
-            // Subshell / command substitution / process substitution /
-            // arithmetic expansion: tree-sitter declined to split.
-            // Force a prompt on the WHOLE command so the user
-            // confirms the unfamiliar shape. Maki does the same
-            // (maki-agent/src/permissions.rs:441-455).
-            //
-            // PERM-6: even when complex, still extract redirect
-            // targets and mutation paths so that `echo "$(rm /etc/passwd)"`
-            // doesn't slip through when the outer `echo` is allowed.
-            for target in bash::extract_redirect_targets(command) {
-                enforce(permission, ask_tx, "write", Scope::PathResolve(&target)).await?;
-            }
-            for path in bash::extract_mutation_paths(command) {
-                enforce(permission, ask_tx, "write", Scope::PathResolve(&path)).await?;
-            }
-            enforce(permission, ask_tx, "bash", Scope::Raw(command)).await?;
-            return Ok(());
-        }
-
-        for (segment, dev_null_only) in &segments_with_flag {
-            if *dev_null_only {
-                check_bash_segment_dev_null(permission, ask_tx, segment).await?;
-            } else {
-                enforce(permission, ask_tx, "bash", Scope::Raw(segment)).await?;
+            // Subshell / command substitution / etc.: tree-sitter
+            // declined to split — check the whole command as one
+            // Execute claim so the user confirms the unfamiliar shape.
+            claims.push(cmd_claim(command));
+        } else {
+            for (segment, _dev_null) in &segments_with_flag {
+                claims.push(cmd_claim(segment));
             }
         }
-
-        // M3 fix to the C4 redirect-target gap: route targets through
-        // the `write` tool name (not `bash`), since redirection
-        // semantically writes files. Previously this was routed as
-        // `check_perm_path(tool="bash", path=&target)`, looking the
-        // target up in BASH rules — command-style globs that don't
-        // match path strings, falling through to default Allow. With
-        // `tool="write"` the user's write rules govern: deny lists
-        // (`/etc/**`, `~/.ssh/**`, `~/.aws/credentials`) now fire on
-        // bash redirects too. Falsely-prompting `< file` (read-side)
-        // is acceptable; the `extract_redirect_targets` walker
-        // intentionally skips heredoc / herestring and only emits
-        // write-side targets (`>`, `>>`, `&>`, `1>`, `2>`).
+        // PERM-6 / C4 / F1: redirect targets AND file-mutating command
+        // path args (rm/cp/mv/mkdir/touch/chmod/…) both route through
+        // Edit so write deny-lists + the external-dir gate govern them.
         for target in bash::extract_redirect_targets(command) {
-            enforce(permission, ask_tx, "write", Scope::PathResolve(&target)).await?;
+            claims.push(path_claim(&target));
         }
-        // F1 (dirge-dvy): route positional path arguments to
-        // file-mutating commands (rm / cp / mv / mkdir / rmdir /
-        // touch / chmod / chown / ln / tee / dd) through the write
-        // rules too. Without this, a permissive bash rule like
-        // `rm *: allow` silently allowed `rm /etc/passwd` because
-        // the path-side write deny never saw the argument. Ported
-        // from opencode shell.ts:30-51 (`FILES` set) + :191-221
-        // (`pathArgs` filter logic). The extractor skips flags
-        // (`-r`, `--recursive`), chmod permission specs (`+x`),
-        // and chmod/chown's first positional arg (mode / owner).
         for path in bash::extract_mutation_paths(command) {
-            enforce(permission, ask_tx, "write", Scope::PathResolve(&path)).await?;
+            claims.push(path_claim(&path));
         }
-        Ok(())
     }
     #[cfg(not(feature = "semantic-bash"))]
     {
-        // Best-effort coarse split when tree-sitter isn't compiled in.
-        // Without it, a command like `safe_cmd && rm -rf /` would be
-        // checked as a single string against the bash rules and might
-        // squeak through if `safe_cmd && rm` doesn't match any deny.
-        // Split on the unambiguous compound separators (`&&`, `;`,
-        // `||`) so each segment is checked individually.
-        //
-        // F10: the splitter now respects shell quoting. The naive
-        // `command.split(";")` split inside quoted strings, so
-        // `echo "; rm -rf /"` produced segments `echo "` and
-        // `rm -rf /"` — the second matched the bash rule for `rm`
-        // and could trigger a deny that the user thought was safe.
-        // The fixed splitter walks character-by-character and only
-        // emits a boundary when not inside `'…'`, `"…"`, or after
-        // a backslash escape.
-        let segments = quote_aware_split(command);
-
-        // Flag command substitution / subshell constructs / ANSI-C
-        // quoting that need a full parser. Surface as one
-        // whole-command check so the user sees the unfamiliar form
-        // before any segment runs.
-        //
-        // `$'...'` ANSI-C quoting was missing from the original
-        // check, leaving a small bypass: `echo $'hi\nrm -rf /; ls'`
-        // (with embedded literal newlines via `\n`) treated the body
-        // as one quoted token, so `quote_aware_split` didn't see the
-        // `;` as a separator. Adding `$'` to the substitution list
-        // makes the whole command get checked as a single string —
-        // the rules can still match the safe form, but the LLM
-        // doesn't get a free pass on obscure quoting.
+        // Coarse, quote-aware split when tree-sitter isn't compiled in;
+        // command-substitution / heredoc / ANSI-C quoting are checked as
+        // one whole-command claim.
         let has_substitution = command.contains("$(")
             || command.contains('`')
             || command.contains("<(")
             || command.contains(">(")
             || command.contains("$'")
-            // PERM-5: heredocs (`<<` / `<<-`). The heredoc body
-            // is invisible to `quote_aware_split` — the redirect
-            // operator is one token but the body starting on the
-            // next line can contain any command. Treat as complex.
             || command.contains("<<");
         if has_substitution {
-            enforce(permission, ask_tx, "bash", Scope::Raw(command)).await?;
-            return Ok(());
+            claims.push(cmd_claim(command));
+        } else {
+            for segment in quote_aware_split(command) {
+                claims.push(cmd_claim(&segment));
+            }
         }
-        for segment in &segments {
-            enforce(permission, ask_tx, "bash", Scope::Raw(segment)).await?;
-        }
-        Ok(())
     }
+
+    if claims.is_empty() {
+        claims.push(cmd_claim(command));
+    }
+
+    let req = AccessRequest {
+        tool: "bash".to_string(),
+        claims,
+        mode,
+        display_input: command.to_string(),
+    };
+    enforce_request(permission, ask_tx, req).await
 }
 
 /// Split a shell command on `;`, `&&`, `||` separators that appear
@@ -1065,34 +989,48 @@ mod tests {
     // only behavioural change is `Ask → Allow` for the bash segment
     // check.
 
-    /// Each of the 5 whitelisted patterns must pass without prompting,
-    /// even when the underlying command (`unfamiliar_cmd`) doesn't
-    /// match any default bash allow rule and would otherwise route
-    /// to `Ask` (and fail in `--no-ask-tx` test mode).
+    /// The `/dev/null` redirect TARGET is auto-allowed (a harmless
+    /// bit-bucket), so it never adds a prompt of its own. Phase 3
+    /// behavior change: the COMMAND still needs its own Execute
+    /// permission — an unfamiliar command redirected to /dev/null
+    /// still prompts (more correct than the old blanket command
+    /// soft-allow). So an ALLOWED command (`git status -s`) redirected
+    /// to /dev/null passes without prompting; the /dev/null target
+    /// contributes no extra gate.
     #[cfg(feature = "semantic-bash")]
     #[tokio::test]
-    async fn bash_redirects_to_dev_null_auto_allowed() {
+    async fn bash_dev_null_target_adds_no_prompt() {
         use crate::permission::{PermissionConfig, SecurityMode, checker::PermissionChecker};
 
-        let cases = [
-            "unfamiliar_cmd > /dev/null",
-            "unfamiliar_cmd 2> /dev/null",
-            "unfamiliar_cmd &> /dev/null",
-            "unfamiliar_cmd > /dev/null 2>&1",
-            "unfamiliar_cmd &>/dev/null",
+        // `git status` is a default-allowed bash command; redirecting
+        // it to /dev/null must not introduce a prompt.
+        let allowed_cases = [
+            "git status -s > /dev/null",
+            "git status -s 2> /dev/null",
+            "git status -s &> /dev/null",
+            "git status -s > /dev/null 2>&1",
         ];
-
-        for cmd in &cases {
-            let config = PermissionConfig::default();
-            let checker = PermissionChecker::new(&config, SecurityMode::Standard, None);
+        for cmd in &allowed_cases {
+            let checker =
+                PermissionChecker::new(&PermissionConfig::default(), SecurityMode::Standard, None);
             let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
-
             let result = check_bash_segments(&Some(perm), &None, cmd).await;
             assert!(
                 result.is_ok(),
-                "{cmd:?}: /dev/null redirect should auto-allow without prompting; got {result:?}",
+                "{cmd:?}: allowed command + /dev/null target must not prompt; got {result:?}",
             );
         }
+
+        // An UNFAMILIAR command redirected to /dev/null still needs
+        // command permission → prompts (Err in non-interactive test).
+        let checker =
+            PermissionChecker::new(&PermissionConfig::default(), SecurityMode::Standard, None);
+        let perm = std::sync::Arc::new(std::sync::Mutex::new(checker));
+        let result = check_bash_segments(&Some(perm), &None, "unfamiliar_cmd > /dev/null").await;
+        assert!(
+            result.is_err(),
+            "unfamiliar command still needs Execute permission even redirecting to /dev/null; got {result:?}",
+        );
     }
 
     /// Compound redirects (one to /dev/null, one to a real file) must

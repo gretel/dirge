@@ -125,20 +125,55 @@ impl Resource {
     }
 }
 
+/// A single (operation, resource) the agent wants to perform. A bash
+/// command decomposes into many claims with DIFFERENT operations
+/// (command segments → Execute, redirect/mutation targets → Edit),
+/// which is why the operation lives per-claim, not per-request.
+#[derive(Debug, Clone)]
+pub struct Claim {
+    pub op: Operation,
+    pub resource: Resource,
+}
+
+impl Claim {
+    pub fn new(op: Operation, resource: Resource) -> Self {
+        Claim { op, resource }
+    }
+}
+
 /// One logical operation the agent wants to perform. A single bash
-/// invocation produces ONE request holding many resources (command
+/// invocation produces ONE request holding many claims (command
 /// segments + redirect targets + mutation paths), so it is authorized
 /// atomically and prompts at most once — never the old N separate
 /// `enforce()` calls.
 #[derive(Debug, Clone)]
 pub struct AccessRequest {
-    pub op: Operation,
     /// Concrete tool name, for display and the decision trace.
     pub tool: String,
-    pub resources: Vec<Resource>,
+    pub claims: Vec<Claim>,
     pub mode: crate::permission::SecurityMode,
     /// Raw text shown in the Ask prompt.
     pub display_input: String,
+}
+
+impl AccessRequest {
+    /// Convenience constructor for a single-claim request (the common
+    /// case: one tool, one resource).
+    pub fn single(
+        tool: impl Into<String>,
+        op: Operation,
+        resource: Resource,
+        mode: crate::permission::SecurityMode,
+        display_input: impl Into<String>,
+    ) -> Self {
+        let display_input = display_input.into();
+        AccessRequest {
+            tool: tool.into(),
+            claims: vec![Claim::new(op, resource)],
+            mode,
+            display_input,
+        }
+    }
 }
 
 /// The authorization lattice. Ordering IS the combination algebra:
