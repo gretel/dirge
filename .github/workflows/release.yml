@@ -12,14 +12,21 @@ jobs:
     name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+          # Static musl build — portable across Linux distros (no glibc
+          # version coupling). Works because TLS is rustls, not OpenSSL.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
           - os: macos-13
             target: x86_64-apple-darwin
           - os: macos-latest
             target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v4
@@ -29,18 +36,37 @@ jobs:
         with:
           target: ${{ matrix.target }}
 
+      # musl needs the cross linker/toolchain.
+      - name: Install musl tools
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package binary
+      # Package the `dirge` binary (named via [[bin]] regardless of the
+      # `dirge-agent` crate name). Windows → .zip, Unix → .tar.gz; emit a
+      # sha256 alongside so users can verify the download.
+      - name: Package (Unix)
+        if: matrix.os != 'windows-latest'
         run: |
-          tar czf dirge-${{ matrix.target }}.tar.gz -C target/${{ matrix.target }}/release dirge
+          archive=dirge-${{ matrix.target }}.tar.gz
+          tar czf "$archive" -C "target/${{ matrix.target }}/release" dirge
+          shasum -a 256 "$archive" > "$archive.sha256"
 
-      - name: Upload release asset
+      - name: Package (Windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $archive = "dirge-${{ matrix.target }}.zip"
+          Compress-Archive -Path "target/${{ matrix.target }}/release/dirge.exe" -DestinationPath $archive
+          (Get-FileHash $archive -Algorithm SHA256).Hash | Out-File -Encoding ascii "$archive.sha256"
+
+      - name: Upload release assets
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: dirge-${{ matrix.target }}.tar.gz
-          asset_name: dirge-${{ matrix.target }}.tar.gz
+          file: dirge-${{ matrix.target }}.*
+          file_glob: true
           tag: ${{ github.ref }}
           overwrite: true

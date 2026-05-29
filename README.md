@@ -60,19 +60,25 @@ Transient API errors (network, rate limits, Anthropic `overloaded_error`) are au
 
 ## Installation
 
+> The crate is published as **`dirge-agent`** (the short `dirge` name was
+> already taken on crates.io). The installed command is still `dirge`.
+
 ```bash
-# Default — MCP, loop, and git-worktree included
-cargo install dirge
+# Default — MCP, loop, LSP, and git-worktree included
+cargo install dirge-agent
 
 # With semantic code tools (tree-sitter)
-cargo install dirge --features "semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,semantic-go,semantic-ruby,semantic-rust,semantic-java,semantic-c,semantic-cpp"
+cargo install dirge-agent --features "semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,semantic-go,semantic-ruby,semantic-rust,semantic-java,semantic-c,semantic-cpp"
 
 # With ACP (Agent Communication Protocol) support for editor integration
-cargo install dirge --features acp
+cargo install dirge-agent --features acp
 
 # All features
-cargo install dirge --features "acp,loop,git-worktree,mcp,semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,semantic-go,semantic-ruby,semantic-rust,semantic-java,semantic-c,semantic-cpp,plugin"
+cargo install dirge-agent --features "acp,loop,git-worktree,mcp,lsp,semantic,semantic-ts,semantic-python,semantic-bash,semantic-clojure,semantic-go,semantic-ruby,semantic-rust,semantic-java,semantic-c,semantic-cpp,plugin"
 ```
+
+Prebuilt binaries for Linux (glibc + static musl), macOS (Intel + Apple
+Silicon), and Windows are attached to each [GitHub Release](https://github.com/dirge-code/dirge/releases).
 
 ### Optional: sandbox mode
 

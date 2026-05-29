@@ -1,14 +1,41 @@
 [package]
-name = "dirge"
+# Crate (crates.io) name is `dirge-agent` — the short `dirge` was already
+# taken on crates.io. The installed BINARY is still `dirge` (see [[bin]]),
+# so users run: `cargo install dirge-agent` then the `dirge` command.
+name = "dirge-agent"
 version = "1.0.0"
 edition = "2024"
+# edition 2024 was stabilized in Rust 1.85; pin the MSRV so older
+# toolchains get a clear error instead of a cryptic edition failure.
+rust-version = "1.85"
 authors = ["Giuseppe Della Vedova"]
 description = "Minimalistic coding agent written in Rust, optimized for memory footprint and performance"
 license = "GPL-3.0-only"
-homepage = "https://github.com/yogthos/dirge"
-repository = "https://github.com/yogthos/dirge"
+homepage = "https://github.com/dirge-code/dirge"
+repository = "https://github.com/dirge-code/dirge"
 readme = "README.md"
-keywords = ["ai", "cli", "dev"]
+keywords = ["ai", "cli", "agent", "llm", "tui"]
+categories = ["command-line-utilities", "development-tools"]
+# Keep the published package small (crates.io caps at 10 MiB compressed).
+# Exclude vendored native libs, images, and local tooling state; the
+# compile-time-embedded `prompts/` (include_dir!) is deliberately NOT
+# excluded — it must ship.
+exclude = [
+    "spikes/",
+    "img/",
+    "docs/",
+    ".beads/",
+    ".dirge/",
+    ".github/",
+]
+
+# The crate is `dirge-agent` but the command users invoke stays `dirge`.
+# Also keeps the binary crate's name `dirge`, so `module_path!()` (and
+# thus the `dirge=…` RUST_LOG filter + explicit `dirge::…` tracing
+# targets) are unchanged by the package rename.
+[[bin]]
+name = "dirge"
+path = "src/main.rs"
 
 [package.metadata.cargo-machete]
 # rig-core is a direct dep solely to pin feature flags (reqwest,

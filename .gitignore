@@ -49,3 +49,6 @@ model-prompts/
 # and clojure-lsp drop caches in these dirs). Local-only.
 .clj-kondo/.cache/
 .lsp/.cache/
+
+# Local experiment vendored libs — never published
+spikes/
