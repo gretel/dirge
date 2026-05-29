@@ -8,6 +8,7 @@
 use crate::permission::engine;
 use crate::permission::pattern::Pattern;
 
+#[allow(dead_code)] // Phase 4: legacy session-allowlist match
 pub(crate) fn is_allowed(allowlist: &[(String, Pattern)], tool: &str, input: &str) -> bool {
     allowlist
         .iter()

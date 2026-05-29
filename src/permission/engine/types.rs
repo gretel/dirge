@@ -22,12 +22,10 @@ pub enum Operation {
     /// Read-only observation of a file (read, grep, list_dir, lsp,
     /// the semantic readers).
     Read,
-    /// Whole-file creation/overwrite (the `write` tool, bash redirect
-    /// targets, bash mutation paths).
-    Write,
-    /// In-place modification (`edit` / `apply_patch`). Write/Edit/
-    /// apply_patch all normalize here so one rule governs the trio —
-    /// the old F2 aliasing dissolves.
+    /// File mutation — the `write` and `edit`/`apply_patch` tools plus
+    /// bash redirect targets and mutation paths all normalize here, so
+    /// one rule governs them all (the old F2 write↔edit↔apply_patch
+    /// aliasing dissolves into a single operation).
     Edit,
     /// Shell command execution (one segment of a bash invocation).
     Execute,
@@ -39,9 +37,15 @@ pub enum Operation {
     Memory,
     /// Skill load/list (read) or create/edit/patch/delete (write).
     Skill,
-    /// Internal/meta tools with no external effect (write_todo_list,
-    /// task_status, question, task).
+    /// Recursive sub-agent execution (the `task` tool). High-risk —
+    /// not builtin-allowed and not coerced by Accept mode.
+    Agent,
+    /// Internal tools with no external effect (write_todo_list,
+    /// task_status, question) — builtin-allowed.
     Meta,
+    /// Uncategorized / plugin tools. Not builtin-allowed; falls to the
+    /// configured rules or the default (Ask), and IS Accept-coercible.
+    Other,
 }
 
 impl Operation {
@@ -51,11 +55,11 @@ impl Operation {
     pub fn is_side_effecting(self) -> bool {
         matches!(
             self,
-            Operation::Write
-                | Operation::Edit
+            Operation::Edit
                 | Operation::Execute
                 | Operation::Network
                 | Operation::Mcp
+                | Operation::Agent
         )
     }
 }
@@ -102,6 +106,21 @@ impl Resource {
             Resource::Mcp { raw, .. } => raw,
             Resource::Url(u) => u,
             Resource::Bareword(b) => b,
+        }
+    }
+
+    /// Every string form a configured pattern should be tested
+    /// against. Paths expose BOTH the canonical resolved form and the
+    /// raw input, so a user rule written against either (literal
+    /// `/etc/**`, a symlinked root, or a relative path) matches —
+    /// mirroring the old `check_path` `matches(abs) || matches(raw)`.
+    pub fn match_candidates(&self) -> Vec<&str> {
+        match self {
+            Resource::Path { raw, resolved, .. } => {
+                let r = resolved.to_str().unwrap_or(raw);
+                if r == raw { vec![r] } else { vec![r, raw] }
+            }
+            _ => vec![self.match_key()],
         }
     }
 }
@@ -312,7 +331,6 @@ mod tests {
 
     #[test]
     fn side_effecting_classification() {
-        assert!(Operation::Write.is_side_effecting());
         assert!(Operation::Edit.is_side_effecting());
         assert!(Operation::Execute.is_side_effecting());
         assert!(Operation::Network.is_side_effecting());

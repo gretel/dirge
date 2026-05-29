@@ -38,6 +38,8 @@ pub mod policies;
 pub mod policy;
 pub mod types;
 
+pub use build::{classify_path, tool_operation};
+
 // Re-export the classification helpers so existing call sites
 // (`engine::pattern_for_tool`, `engine::is_path_tool_name`,
 // `engine::is_high_risk_non_path_tool`) keep resolving unchanged.
@@ -46,6 +48,26 @@ pub use classify::{is_path_tool_name, pattern_for_tool};
 
 use policy::{Decider, Modifier, PolicyCtx};
 use types::{AccessRequest, Decision, Effect, Operation, Resource, TraceEntry};
+
+/// Whether Accept mode may coerce a base `Ask` to `Allow` for this
+/// (op, resource): low-risk operations (not shell/mcp/network/agent)
+/// on a non-external resource. "trust the agent in cwd" doesn't
+/// generalize to external code execution or out-of-tree paths.
+fn accept_eligible(op: Operation, resource: &Resource) -> bool {
+    let high_risk = matches!(
+        op,
+        Operation::Execute | Operation::Mcp | Operation::Network | Operation::Agent
+    );
+    let external_path = matches!(
+        resource,
+        Resource::Path {
+            in_cwd: false,
+            dev_null: false,
+            ..
+        }
+    );
+    !high_risk && !external_path
+}
 
 /// The registered-policy authorization engine. Holds the ordered
 /// decider/modifier sets and the mutable [`PolicyCtx`].
@@ -132,6 +154,32 @@ impl Engine {
                         applied: true,
                     }),
                 }
+            }
+
+            // ---- Mode coercion (Accept): the one place a mode
+            // LOOSENS. Accept turns a base `Ask` into `Allow` for
+            // low-risk, in-tree operations, regardless of whether the
+            // Ask came from a rule or the default. It lives here in the
+            // base layer (not as a tighten-only Stage-B modifier) and
+            // applies AFTER Stage A so it can relax a rule's Ask —
+            // matching the legacy Accept semantics. Deny is never
+            // touched (only `Ask` is coerced); high-risk ops
+            // (Execute/Mcp/Network/Agent) and external paths are
+            // excluded.
+            if req.mode == crate::permission::SecurityMode::Accept
+                && base == Effect::Ask
+                && accept_eligible(req.op, resource)
+            {
+                base = Effect::Allow;
+                let entry = TraceEntry {
+                    policy: "accept-mode",
+                    resource: ri,
+                    effect: Some(Effect::Allow),
+                    why: "accept mode coerced Ask→Allow".to_string(),
+                    applied: true,
+                };
+                trace.push(entry.clone());
+                binding = Some(entry);
             }
 
             // ---- Stage B: modifiers, monotone tighten ----

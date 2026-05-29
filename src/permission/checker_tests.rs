@@ -156,20 +156,19 @@ fn f2_edit_alias_check_path_directly_for_write_and_apply_patch() {
         checker.check_path("edit", "/tmp/x.rs"),
         CheckResult::Denied(_)
     ));
-    // Direct `write` query (no aliasing at checker level): the
-    // CWD-scoped builtin-allow rule only fires for paths inside
-    // working_dir (/tmp here), so probe an OUTSIDE path to
-    // exercise the global Ask default — that's the "write has
-    // no user-configured rules and no in-CWD allow" path the
-    // checker is asserted on.
+    // F2 dissolution: write/edit/apply_patch now share Operation::Edit,
+    // so the `edit: { "**": deny }` rule governs ALL THREE — a write
+    // anywhere (even outside cwd) is denied by the same `**` rule. The
+    // old aliasing special-case is gone; this falls out of the shared
+    // operation.
     assert!(matches!(
         checker.check_path("write", "/opt/elsewhere/x.rs"),
-        CheckResult::Ask
+        CheckResult::Denied(_)
     ));
-    // `tools::enforce` is what ties these together. The
-    // alias test for that path lives in src/agent/tools/mod.rs
-    // (covered indirectly by the bash F1 tests below since
-    // write rules drive the redirect-target gate).
+    assert!(matches!(
+        checker.check_path("apply_patch", "/opt/elsewhere/x.rs"),
+        CheckResult::Denied(_)
+    ));
 }
 
 /// CWD-scoped builtin-allow for mutating tools: writes inside

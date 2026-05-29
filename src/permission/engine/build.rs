@@ -14,9 +14,8 @@
 use std::path::PathBuf;
 
 use super::policies::{
-    AcceptModePolicy, BuiltinAllowPolicy, ConfiguredRulePolicy, DefaultActionPolicy,
-    ExternalDirPolicy, LoopGuardPolicy, OpMatch, PromptDenyPolicy, Rule, SessionAllowlistPolicy,
-    YoloPolicy,
+    BuiltinAllowPolicy, ConfiguredRulePolicy, DefaultActionPolicy, ExternalDirPolicy,
+    LoopGuardPolicy, OpMatch, PromptDenyPolicy, Rule, SessionAllowlistPolicy, YoloPolicy,
 };
 use super::policy::{Decider, Modifier, PolicyCtx};
 use super::types::{Effect, Operation, Resource};
@@ -44,17 +43,20 @@ pub fn tool_operation(tool: &str) -> Operation {
         "read" | "grep" | "find_files" | "glob" | "list_dir" | "repo_overview" | "lsp"
         | "list_symbols" | "get_symbol_body" | "find_definition" | "find_callers"
         | "find_callees" => Operation::Read,
-        "write" => Operation::Write,
+        "write" => Operation::Edit,
         "edit" | "apply_patch" => Operation::Edit,
         "bash" | "shell" => Operation::Execute,
         "webfetch" | "websearch" => Operation::Network,
         "mcp_tool" => Operation::Mcp,
         "memory" => Operation::Memory,
         "skill" => Operation::Skill,
-        "task" | "task_status" | "question" | "write_todo_list" => Operation::Meta,
-        // Unknown (plugin) tools: treat as meta — they fall to the
-        // configured rules / default like anything else.
-        _ => Operation::Meta,
+        // Recursive sub-agent execution: high-risk, not auto-allowed.
+        "task" => Operation::Agent,
+        // Internal no-effect tools: builtin-allowed.
+        "task_status" | "question" | "write_todo_list" => Operation::Meta,
+        // Unknown (plugin/MCP) tools: not auto-allowed; fall to
+        // configured rules or the default (Accept-coercible).
+        _ => Operation::Other,
     }
 }
 
@@ -66,11 +68,26 @@ pub fn tool_operation(tool: &str) -> Operation {
 pub fn classify_path(raw: &str, working_dir: &str) -> Resource {
     let resolved_str = resolve_absolute(raw, working_dir);
     let dev_null = resolved_str == "/dev/null" || raw == "/dev/null";
-    let cwd_canonical = canonicalize_for_cache(working_dir);
-    let trimmed = cwd_canonical.trim_end_matches('/');
-    let in_cwd = !trimmed.is_empty()
-        && trimmed != "/"
-        && (resolved_str == trimmed || resolved_str.starts_with(&format!("{trimmed}/")));
+    // Compare against the cwd in every form it might take so a
+    // symlinked root (macOS `/tmp → /private/tmp`) doesn't misclassify
+    // in-tree paths as external: the path resolved through the
+    // deepest-existing-ancestor canonicalization, the cached
+    // canonical, and the literal working_dir.
+    let under = |base: &str| {
+        let b = base.trim_end_matches('/');
+        !b.is_empty()
+            && b != "/"
+            && (resolved_str == b || resolved_str.starts_with(&format!("{b}/")))
+    };
+    // A working_dir containing glob metacharacters can't anchor a
+    // trustworthy in-cwd classification (the old code refused to
+    // install a CWD-allow for such dirs); treat nothing as in-cwd so
+    // those writes still prompt.
+    let cwd_has_glob = working_dir.contains(['*', '?', '[', '{']);
+    let in_cwd = !cwd_has_glob
+        && (under(&resolve_absolute(working_dir, working_dir))
+            || under(&canonicalize_for_cache(working_dir))
+            || under(working_dir));
     Resource::Path {
         raw: raw.to_string(),
         resolved: PathBuf::from(resolved_str),
@@ -83,10 +100,21 @@ pub fn classify_path(raw: &str, working_dir: &str) -> Resource {
 /// narrowed to `tool`.
 fn rules_from_tool_perm(tool: &str, tp: &ToolPerm) -> Vec<Rule> {
     let op = OpMatch::One(tool_operation(tool));
+    // write/edit/apply_patch are the only tools mapping to
+    // Operation::Edit, so leaving the rule tool-unnarrowed makes a
+    // legacy `edit: deny` cover all three — the old F2 aliasing,
+    // now a natural consequence of the shared operation. Other
+    // shared-op tools (the Read group) stay tool-narrowed so a
+    // `grep` rule doesn't bleed onto `read`.
+    let tool_sel = if matches!(tool, "write" | "edit" | "apply_patch") {
+        None
+    } else {
+        Some(tool.to_string())
+    };
     match tp {
         ToolPerm::Simple(action) => vec![Rule {
             op,
-            tool: Some(tool.to_string()),
+            tool: tool_sel.clone(),
             pattern: pattern_for_tool(tool, "*"),
             effect: (*action).into(),
             original: format!("{tool}:*"),
@@ -95,7 +123,7 @@ fn rules_from_tool_perm(tool: &str, tp: &ToolPerm) -> Vec<Rule> {
             .iter()
             .map(|(pat, action)| Rule {
                 op,
-                tool: Some(tool.to_string()),
+                tool: tool_sel.clone(),
                 pattern: pattern_for_tool(tool, pat),
                 effect: (*action).into(),
                 original: format!("{tool}:{pat}"),
@@ -205,7 +233,6 @@ impl Engine {
             Box::new(ConfiguredRulePolicy { rules }),
             Box::new(BuiltinAllowPolicy),
             Box::new(ExternalDirPolicy { rules: ext_rules }),
-            Box::new(AcceptModePolicy),
             Box::new(DefaultActionPolicy { default }),
         ];
         let modifiers: Vec<Box<dyn Modifier>> = vec![Box::new(LoopGuardPolicy {
@@ -242,7 +269,7 @@ mod tests {
     fn tool_operation_mapping() {
         assert_eq!(tool_operation("read"), Operation::Read);
         assert_eq!(tool_operation("grep"), Operation::Read);
-        assert_eq!(tool_operation("write"), Operation::Write);
+        assert_eq!(tool_operation("write"), Operation::Edit);
         assert_eq!(tool_operation("edit"), Operation::Edit);
         assert_eq!(tool_operation("apply_patch"), Operation::Edit);
         assert_eq!(tool_operation("bash"), Operation::Execute);
@@ -373,7 +400,7 @@ mod tests {
         let e = Engine::from_config(&cfg);
         // external write to /shared is allowed by the ext-dir rule
         let d = e.authorize(&req(
-            Operation::Write,
+            Operation::Edit,
             "write",
             SecurityMode::Standard,
             vec![classify_path("/shared/lib/x", "/proj")],
@@ -381,7 +408,7 @@ mod tests {
         assert_eq!(d.effect, Effect::Allow);
         // external write elsewhere still asks
         let d = e.authorize(&req(
-            Operation::Write,
+            Operation::Edit,
             "write",
             SecurityMode::Standard,
             vec![classify_path("/etc/x", "/proj")],

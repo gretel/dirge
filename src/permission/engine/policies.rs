@@ -10,8 +10,11 @@
 //! 4. [`ConfiguredRulePolicy`]   — user rules, last-match-wins inside.
 //! 5. [`BuiltinAllowPolicy`]     — read-only ops, memory/skill, dev-null, in-cwd writes.
 //! 6. [`ExternalDirPolicy`]      — out-of-cwd paths → external_directory rule or Ask.
-//! 7. [`AcceptModePolicy`]       — `mode == Accept` coerces the otherwise-default to Allow.
-//! 8. [`DefaultActionPolicy`]    — the configured default (always claims; terminal).
+//! 7. [`DefaultActionPolicy`]    — the configured default (always claims; terminal).
+//!
+//! Accept-mode loosening is NOT a decider — it's a post-Stage-A base
+//! coercion in `Engine::authorize` (it relaxes a base `Ask`→`Allow`,
+//! the one place a mode loosens).
 //!
 //! Modes are folded into the deciders (not a separate stage): because
 //! explicit user rules (ConfiguredRule) outrank the builtin/default
@@ -63,10 +66,13 @@ pub struct Rule {
 }
 
 impl Rule {
-    fn matches(&self, req: &AccessRequest, key: &str) -> bool {
+    fn matches(&self, req: &AccessRequest, resource: &Resource) -> bool {
         self.op.matches(req.op)
             && self.tool.as_deref().is_none_or(|t| t == req.tool)
-            && self.pattern.matches(key)
+            && resource
+                .match_candidates()
+                .iter()
+                .any(|k| self.pattern.matches(k))
     }
 }
 
@@ -131,8 +137,10 @@ impl Decider for SessionAllowlistPolicy {
         true
     }
     fn decide(&self, req: &AccessRequest, resource: &Resource, ctx: &PolicyCtx) -> Option<Verdict> {
-        ctx.allowlist
-            .allows(req.op, resource.match_key())
+        resource
+            .match_candidates()
+            .iter()
+            .any(|k| ctx.allowlist.allows(req.op, k))
             .then(|| Verdict::new(Effect::Allow, "allowed for this session"))
     }
 }
@@ -150,15 +158,15 @@ impl Decider for ConfiguredRulePolicy {
         // Coarse: op + pattern (the tool narrowing is applied in
         // `decide`, which has the full request). A false positive here
         // only means `decide` runs and returns None — harmless.
+        let cands = resource.match_candidates();
         self.rules
             .iter()
-            .any(|r| r.op.matches(op) && r.pattern.matches(resource.match_key()))
+            .any(|r| r.op.matches(op) && cands.iter().any(|k| r.pattern.matches(k)))
     }
     fn decide(&self, req: &AccessRequest, resource: &Resource, _: &PolicyCtx) -> Option<Verdict> {
-        let key = resource.match_key();
         self.rules
             .iter()
-            .filter(|r| r.matches(req, key))
+            .filter(|r| r.matches(req, resource))
             .next_back() // last match wins
             .map(|r| Verdict::new(r.effect, format!("rule {:?} → {:?}", r.original, r.effect)))
     }
@@ -192,7 +200,7 @@ impl BuiltinAllowPolicy {
 
             // File mutation: dev-null is a harmless bit-bucket; in-cwd
             // writes are trusted (confirmed under Restrictive).
-            Operation::Write | Operation::Edit => match resource {
+            Operation::Edit => match resource {
                 Resource::Path { dev_null: true, .. } => Some(Effect::Allow),
                 Resource::Path { in_cwd: true, .. } => Some(if restrictive {
                     Effect::Ask
@@ -205,8 +213,14 @@ impl BuiltinAllowPolicy {
             // Internal/meta tools have no external effect.
             Operation::Meta => Some(Effect::Allow),
 
-            // Execute / Network / Mcp are never builtin-allowed.
-            Operation::Execute | Operation::Network | Operation::Mcp => None,
+            // Execute / Network / Mcp / Agent (recursive task) are
+            // never builtin-allowed; Other (unknown/plugin) falls to
+            // configured rules or the default.
+            Operation::Execute
+            | Operation::Network
+            | Operation::Mcp
+            | Operation::Agent
+            | Operation::Other => None,
         }
     }
 }
@@ -223,13 +237,8 @@ impl Decider for BuiltinAllowPolicy {
             Operation::Read | Operation::Memory | Operation::Skill | Operation::Meta
         ) || matches!(
             (op, resource),
-            (
-                Operation::Write | Operation::Edit,
-                Resource::Path { in_cwd: true, .. }
-            ) | (
-                Operation::Write | Operation::Edit,
-                Resource::Path { dev_null: true, .. }
-            )
+            (Operation::Edit, Resource::Path { in_cwd: true, .. })
+                | (Operation::Edit, Resource::Path { dev_null: true, .. })
         )
     }
     fn decide(&self, req: &AccessRequest, resource: &Resource, _: &PolicyCtx) -> Option<Verdict> {
@@ -278,17 +287,16 @@ impl Decider for ExternalDirPolicy {
     fn applies_to(&self, op: Operation, resource: &Resource) -> bool {
         // Only governs mutating access to external paths; external
         // reads are already allowed by BuiltinAllow (higher precedence).
-        matches!(op, Operation::Write | Operation::Edit) && Self::is_external_path(resource)
+        matches!(op, Operation::Edit) && Self::is_external_path(resource)
     }
     fn decide(&self, req: &AccessRequest, resource: &Resource, _: &PolicyCtx) -> Option<Verdict> {
         if !Self::is_external_path(resource) {
             return None;
         }
-        let key = resource.match_key();
         let matched = self
             .rules
             .iter()
-            .filter(|r| r.matches(req, key))
+            .filter(|r| r.matches(req, resource))
             .next_back();
         match matched {
             Some(r) => Some(Verdict::new(
@@ -297,26 +305,6 @@ impl Decider for ExternalDirPolicy {
             )),
             None => Some(Verdict::new(Effect::Ask, "outside the working directory")),
         }
-    }
-}
-
-/// Accept mode: coerce the otherwise-default to Allow, except for
-/// high-risk operations (shell/mcp/network) which still confirm. Sits
-/// just above the default so it only affects calls nothing else
-/// claimed.
-pub struct AcceptModePolicy;
-
-impl Decider for AcceptModePolicy {
-    fn id(&self) -> &'static str {
-        "accept-mode"
-    }
-    fn applies_to(&self, op: Operation, _: &Resource) -> bool {
-        // High-risk ops are NOT coerced — "trust the agent in cwd"
-        // doesn't generalize to shell/mcp/network execution.
-        !matches!(op, Operation::Execute | Operation::Mcp | Operation::Network)
-    }
-    fn decide(&self, req: &AccessRequest, _: &Resource, _: &PolicyCtx) -> Option<Verdict> {
-        (req.mode == SecurityMode::Accept).then(|| Verdict::new(Effect::Allow, "accept mode"))
     }
 }
 
@@ -378,11 +366,15 @@ impl Modifier for LoopGuardPolicy {
         }
         let prior = ctx.repeat.prior(req.op, resource.match_key());
         if prior >= self.threshold {
+            let preview: String = resource.match_key().chars().take(60).collect();
             Refined::tighten(
                 current,
                 Effect::Deny,
                 "loop-guard",
-                format!("repeated identical prompt {prior}× — breaking retry loop"),
+                format!(
+                    "Doom loop: repeated identical {} call ({preview}) prompted {prior}× — breaking retry loop",
+                    req.tool
+                ),
             )
         } else {
             Refined::noop(current)
@@ -405,7 +397,6 @@ mod tests {
                 Box::new(ConfiguredRulePolicy { rules: vec![] }),
                 Box::new(BuiltinAllowPolicy),
                 Box::new(ExternalDirPolicy { rules: vec![] }),
-                Box::new(AcceptModePolicy),
                 Box::new(DefaultActionPolicy { default }),
             ],
             vec![Box::new(LoopGuardPolicy { threshold: 3 })],
@@ -458,13 +449,13 @@ mod tests {
     fn in_cwd_write_allowed_standard_confirms_restrictive() {
         let e = engine(Effect::Ask);
         let d = e.authorize(&req(
-            Operation::Write,
+            Operation::Edit,
             SecurityMode::Standard,
             vec![path("/proj/x", true, false)],
         ));
         assert_eq!(d.effect, Effect::Allow);
         let d = e.authorize(&req(
-            Operation::Write,
+            Operation::Edit,
             SecurityMode::Restrictive,
             vec![path("/proj/x", true, false)],
         ));
@@ -475,7 +466,7 @@ mod tests {
     fn external_write_asks_dev_null_allows() {
         let e = engine(Effect::Ask);
         let d = e.authorize(&req(
-            Operation::Write,
+            Operation::Edit,
             SecurityMode::Standard,
             vec![path("/etc/x", false, false)],
         ));
@@ -483,7 +474,7 @@ mod tests {
         assert_eq!(d.deciding.unwrap().policy, "external-dir");
 
         let d = e.authorize(&req(
-            Operation::Write,
+            Operation::Edit,
             SecurityMode::Standard,
             vec![path("/dev/null", false, true)],
         ));
@@ -609,7 +600,6 @@ mod tests {
                 Box::new(ConfiguredRulePolicy { rules }),
                 Box::new(BuiltinAllowPolicy),
                 Box::new(ExternalDirPolicy { rules: vec![] }),
-                Box::new(AcceptModePolicy),
                 Box::new(DefaultActionPolicy {
                     default: Effect::Ask,
                 }),

@@ -59,7 +59,7 @@ use std::io;
 use serde::Deserialize;
 
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
-use crate::permission::checker::{CheckResult, PermCheck};
+use crate::permission::checker::PermCheck;
 
 pub const MAX_GREP_RESULTS: usize = 200;
 pub const MAX_FIND_RESULTS: usize = 200;
@@ -294,62 +294,35 @@ pub async fn enforce(
         return Ok(raw_scope.to_string());
     };
 
-    // Inner pure-lookup helper. Reads the checker, returns
-    // (CheckResult, resolved-path). Doesn't touch the ask flow —
-    // that's separate so the F2 alias check can MERGE results
-    // before any prompting fires.
-    fn inner_check(
-        guard: &mut crate::permission::checker::PermissionChecker,
-        tool: &str,
-        scope: &Scope<'_>,
-    ) -> (CheckResult, String) {
-        match scope {
-            Scope::Raw(key) => (guard.check(tool, key), (*key).to_string()),
-            Scope::Path(path) => (guard.check_path(tool, path), (*path).to_string()),
-            Scope::PathResolve(path) => {
-                let resolved = guard.resolve_path_for_tool(path);
-                let r = guard.check_path(tool, path);
-                (r, resolved)
-            }
-        }
-    }
-
-    // F2 (dirge-jlj): write / apply_patch alias to the `edit`
-    // permission. Mirrors opencode's `EDIT_TOOLS` aliasing
-    // (`permission/index.ts:291-301`): a user writing
-    // `edit: { "**": "deny" }` blocks all three uniformly.
-    //
-    // Strategy: take the MOST RESTRICTIVE outcome between the
-    // tool's own rules and the edit rules. Deny > Ask > Allow.
-    // If the tool's specific rule allows but `edit` denies, the
-    // edit deny wins — broader deny-list semantics. If both Ask,
-    // we prompt ONCE (avoids double-prompting).
-    let (result, resolved) = {
+    // M-engine (Phase 2b): route the decision through the unified
+    // authorization engine. The old per-tool F2 write↔edit↔apply_patch
+    // aliasing is gone — those tools normalize to `Operation::Edit`,
+    // so one rule governs the trio by construction. Path-vs-raw is a
+    // property of the resource (built in `authorize_scope`), so there
+    // is no Scope-dispatched `check`/`check_path` split here.
+    let is_path = matches!(scope, Scope::Path(_) | Scope::PathResolve(_));
+    let (effect, reason, resolved) = {
         let mut guard = perm.lock().unwrap_or_else(|e| e.into_inner());
-        let primary = inner_check(&mut guard, tool, &scope);
-        if matches!(tool, "write" | "apply_patch") {
-            let alias = inner_check(&mut guard, "edit", &scope);
-            // Combine: most restrictive wins. Use primary's
-            // resolved-path (the tool's own canonicalization
-            // anchored to its rule set, not edit's).
-            let combined = match (&primary.0, &alias.0) {
-                (CheckResult::Denied(reason), _) => CheckResult::Denied(reason.clone()),
-                (_, CheckResult::Denied(reason)) => CheckResult::Denied(reason.clone()),
-                (CheckResult::Ask, _) | (_, CheckResult::Ask) => CheckResult::Ask,
-                _ => CheckResult::Allowed,
-            };
-            (combined, primary.1)
-        } else {
-            primary
-        }
+        let decision = guard.authorize_scope(tool, raw_scope, is_path);
+        // Only PathResolve callers want the canonicalized path back
+        // (to pin the file across the check→open window); Raw/Path
+        // callers echo their input, matching the legacy contract.
+        let resolved = match scope {
+            Scope::PathResolve(_) => decision
+                .resolved_paths
+                .first()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|| raw_scope.to_string()),
+            _ => raw_scope.to_string(),
+        };
+        (decision.effect, decision.reason(), resolved)
     };
 
-    match result {
-        CheckResult::Allowed => Ok(resolved),
-        CheckResult::Denied(reason) => {
-            Err(ToolError::Msg(format!("Permission denied: {}", reason)))
-        }
-        CheckResult::Ask => {
+    use crate::permission::engine::types::Effect;
+    match effect {
+        Effect::Allow => Ok(resolved),
+        Effect::Deny => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
+        Effect::Ask => {
             let Some(tx) = ask_tx else {
                 return Err(ToolError::Msg(
                     "Permission denied (non-interactive mode)".to_string(),
@@ -495,14 +468,15 @@ mod tests {
         .await;
         assert!(matches!(result, Err(_)));
 
-        // `/tmp/x.rs`: write allows (`**`), edit's `/etc/**`
-        // doesn't match → edit lookup = Ask (default), write = Allow.
-        // Combined: Ask (more restrictive). No ask_tx → "non-interactive
-        // mode" deny.
+        // `/tmp/x.rs`: write/edit/apply_patch now share Operation::Edit,
+        // so both rules live in ONE ruleset, last-match-wins. The
+        // `write: { "**": allow }` rule (added before the edit deny)
+        // matches `/tmp/x.rs`; the `/etc/**` deny does not → Allow.
+        // This is the F2 dissolution: "allow all writes except /etc".
         let result = enforce(&Some(perm), &None, "write", Scope::PathResolve("/tmp/x.rs")).await;
         assert!(
-            matches!(result, Err(_)),
-            "/tmp/x.rs: write Allow + edit Ask → combined Ask → non-interactive deny; got {result:?}",
+            result.is_ok(),
+            "/tmp/x.rs: `write **: allow` governs (edit `/etc/**` deny doesn't match) → Allow; got {result:?}",
         );
     }
 

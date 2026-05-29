@@ -209,6 +209,7 @@ fn lexical_normalize(p: &Path) -> std::path::PathBuf {
 ///
 /// Returns `Ok(())` for plausible paths, `Err(reason)` for
 /// paths that should be hard-rejected.
+#[allow(dead_code)] // Phase 4: only reached via the legacy check_path facade
 pub fn validate_path(path: &str) -> Result<(), String> {
     let p = Path::new(path);
     if p.is_absolute() {

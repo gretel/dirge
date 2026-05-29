@@ -119,19 +119,33 @@ fn doom_loop_deny_names_the_call() {
         SecurityMode::Standard,
         Some(std::path::PathBuf::from("/tmp")),
     );
-    // Three identical calls fires the doom-loop deny.
-    checker.check("bash", "echo hi");
-    checker.check("bash", "echo hi");
-    let result = checker.check("bash", "echo hi");
+    // Loop guard: an Ask op (echo hi isn't a default-allowed bash
+    // command) retried past the threshold (3) is hard-denied on the
+    // 4th identical prompted call. (The new guard never gates an
+    // ALLOWED op and always hard-denies a true retry loop, regardless
+    // of the legacy `doom_loop` action.)
+    assert!(matches!(
+        checker.check("bash", "frobnicate xyz"),
+        CheckResult::Ask
+    ));
+    assert!(matches!(
+        checker.check("bash", "frobnicate xyz"),
+        CheckResult::Ask
+    ));
+    assert!(matches!(
+        checker.check("bash", "frobnicate xyz"),
+        CheckResult::Ask
+    ));
+    let result = checker.check("bash", "frobnicate xyz");
     match result {
         CheckResult::Denied(msg) => {
             assert!(msg.contains("Doom loop"), "must say Doom loop: {msg}");
             assert!(
-                msg.contains("bash") && msg.contains("echo hi"),
+                msg.contains("bash") && msg.contains("frobnicate"),
                 "must name tool + call preview: {msg}",
             );
         }
-        other => panic!("expected Denied; got {other:?}"),
+        other => panic!("expected Denied on the 4th identical Ask; got {other:?}"),
     }
 }
 

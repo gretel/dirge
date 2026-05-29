@@ -1,3 +1,11 @@
+// Phase 2b routes runtime decisions through the engine; the legacy
+// `check`/`check_path` facade + their private helpers and rule fields
+// remain only for the `/allow` display surface, the `semantic-bash`
+// dev-null soft-allow, and the test oracle. They are bin-unused in the
+// default build. Phase 4 deletes this legacy decision code wholesale,
+// at which point this allow goes too.
+#![allow(dead_code)]
+
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -15,6 +23,17 @@ pub enum CheckResult {
     Allowed,
     Ask,
     Denied(String),
+}
+
+/// Map an engine [`Decision`](engine::types::Decision) onto the legacy
+/// `CheckResult` returned by the `check`/`check_path` facade.
+fn effect_to_result(decision: engine::types::Decision) -> CheckResult {
+    use engine::types::Effect;
+    match decision.effect {
+        Effect::Allow => CheckResult::Allowed,
+        Effect::Ask => CheckResult::Ask,
+        Effect::Deny => CheckResult::Denied(decision.reason()),
+    }
 }
 
 pub struct PermissionChecker {
@@ -63,6 +82,14 @@ pub struct PermissionChecker {
     /// when no prompt is active or the active prompt has no
     /// frontmatter.
     prompt_deny_tools: Vec<String>,
+    /// The unified authorization engine. Phase 2b routes the live
+    /// `enforce` chokepoint through this (via `authorize_scope`); the
+    /// legacy `rules`/`check`/`check_path` fields above remain only for
+    /// the `/allow` display surface and the old test suite, and are
+    /// deleted in Phase 4. The engine is the source of truth for
+    /// runtime decisions; the session allowlist + prompt-deny are kept
+    /// in sync with it on every write so the two views never diverge.
+    engine: engine::Engine,
 }
 
 /// Tools that execute external code with broad effects. Accept mode
@@ -342,6 +369,10 @@ impl PermissionChecker {
         // by the CWD-scoped builtin allow installer above).
         let working_dir_canonical = canonicalize_for_cache(&working_dir);
 
+        // The unified engine, built from the same config. Runtime
+        // decisions (the `enforce` chokepoint) flow through this.
+        let engine = engine::Engine::from_config(config);
+
         PermissionChecker {
             rules,
             default_action,
@@ -355,6 +386,68 @@ impl PermissionChecker {
             repeat_counts: HashMap::new(),
             mode,
             prompt_deny_tools: Vec::new(),
+            engine,
+        }
+    }
+
+    /// Engine-backed decision for the `enforce` chokepoint. Normalizes
+    /// a single (tool, input) into an [`engine::types::AccessRequest`],
+    /// authorizes it, commits (loop-guard accounting), and returns the
+    /// [`engine::types::Decision`]. `is_path` selects path-resource
+    /// classification (resolved + in_cwd + dev_null) vs a raw resource.
+    pub fn authorize_scope(
+        &mut self,
+        tool: &str,
+        input: &str,
+        is_path: bool,
+    ) -> engine::types::Decision {
+        let req = self.build_request(tool, input, is_path);
+        let decision = self.engine.authorize(&req);
+        self.engine.commit(&req, &decision);
+        decision
+    }
+
+    /// Normalize a (tool, input) pair into a one-resource request. The
+    /// raw-resource variant picks the resource type from the tool:
+    /// shell → Command, mcp_tool → Mcp, webfetch/websearch → Url,
+    /// everything else → Bareword (memory/skill action, grep pattern…).
+    fn build_request(
+        &self,
+        tool: &str,
+        input: &str,
+        is_path: bool,
+    ) -> engine::types::AccessRequest {
+        use engine::types::Resource;
+        let resource = if is_path {
+            engine::classify_path(input, &self.working_dir)
+        } else {
+            match tool {
+                "bash" | "shell" => Resource::Command {
+                    raw: input.to_string(),
+                    head: input.split_whitespace().next().unwrap_or("").to_string(),
+                },
+                "mcp_tool" => {
+                    // input shape: "mcp_tool:<server>:<name>"
+                    let mut parts = input.splitn(3, ':');
+                    let _umbrella = parts.next();
+                    let server = parts.next().unwrap_or("").to_string();
+                    let name = parts.next().unwrap_or("").to_string();
+                    Resource::Mcp {
+                        server,
+                        name,
+                        raw: input.to_string(),
+                    }
+                }
+                "webfetch" | "websearch" => Resource::Url(input.to_string()),
+                _ => Resource::Bareword(input.to_string()),
+            }
+        };
+        engine::types::AccessRequest {
+            op: engine::tool_operation(tool),
+            tool: tool.to_string(),
+            resources: vec![resource],
+            mode: self.mode,
+            display_input: input.to_string(),
         }
     }
 
@@ -362,6 +455,7 @@ impl PermissionChecker {
     /// active prompt changes (startup, session load, `/prompt
     /// <name>`); pass an empty vec to clear.
     pub fn set_prompt_deny_tools(&mut self, denied: Vec<String>) {
+        self.engine.ctx_mut().prompt_deny = denied.clone();
         self.prompt_deny_tools = denied;
     }
 
@@ -409,281 +503,24 @@ impl PermissionChecker {
         }
     }
 
+    /// Decision for a non-path tool input (bash command, mcp id,
+    /// memory/skill action, grep pattern…). Delegates to the unified
+    /// engine. Retained as a convenience wrapper for the `/allow`
+    /// surface, `check_bash_dev_null_softallow`, and the test suite;
+    /// the engine is the single source of truth.
     pub fn check(&mut self, tool: &str, input: &str) -> CheckResult {
-        // Prompt-level deny list runs BEFORE every other gate,
-        // including Yolo mode's blanket allow. This is the
-        // permission-layer enforcement of plan/review/etc. modes:
-        // the prompt's frontmatter declares which tools that mode
-        // CANNOT use (e.g. plan mode denies edit/write/apply_patch/
-        // bash), and the LLM gets a hard refusal instead of relying
-        // on the prompt prose to dissuade it from calling. Yolo is
-        // still "no rule-set, all calls allowed" but a prompt's
-        // deny-list is a stronger contract — the user opted into
-        // this mode, so we honor it even under Yolo.
-        if self.is_prompt_denied(tool) {
-            return CheckResult::Denied(format!(
-                "Tool {tool:?} is denied by the active prompt's `deny_tools` frontmatter. Switch with `/prompt <other>` to use it."
-            ));
-        }
-        // PERM-7: MCP tools route through `check_perm("mcp_tool", input)`
-        // with input shaped `mcp_tool:<server>:<name>`. The umbrella
-        // tool name `"mcp_tool"` won't match a deny-list entry like
-        // `edit` even if the MCP server exports an `edit` tool. Probe
-        // the concrete tool name (the part after the second `:`) so
-        // a prompt's `deny_tools: [edit]` denies an MCP-exported
-        // `edit` too. Centralized here so any caller (not just the
-        // McpTool wrapper) gets the defense; the wrapper's explicit
-        // `any_prompt_denied` probe becomes redundant but harmless.
-        if tool == "mcp_tool"
-            && let Some(rest) = input.strip_prefix("mcp_tool:")
-            && let Some((_server, concrete)) = rest.split_once(':')
-            && self.is_prompt_denied(concrete)
-        {
-            return CheckResult::Denied(format!(
-                "MCP tool {concrete:?} is denied by the active prompt's `deny_tools` frontmatter. Switch with `/prompt <other>` to use it."
-            ));
-        }
-        if self.mode == SecurityMode::Yolo {
-            return CheckResult::Allowed;
-        }
-
-        if self.is_session_allowed(tool, input) {
-            return CheckResult::Allowed;
-        }
-
-        // Track both the action AND the matching pattern so denial
-        // messages can name which rule blocked the call (was just
-        // "Blocked by permission rules", giving the user no way to
-        // identify and edit the offending rule).
-        let mut matched: Vec<(Action, String)> = Vec::new();
-        if let Some(rules) = self.rules.get(tool) {
-            for (pattern, action) in rules {
-                if pattern.matches(input) {
-                    matched.push((*action, pattern.original.clone()));
-                }
-            }
-        }
-
-        let base = matched
-            .last()
-            .map(|(a, _)| *a)
-            .unwrap_or(self.default_action);
-        let last_pat = matched.last().map(|(_, p)| p.clone());
-        let action = match self.mode {
-            SecurityMode::Restrictive => {
-                // Restrictive contract: every WRITE action confirms.
-                // Read-only builtins (read, grep, list_symbols, …)
-                // pass through as Allow — the user opted into
-                // restrictive to gate side effects, not to gate
-                // observation. For `memory`, only the read action
-                // (`view`) follows the same rule; the write actions
-                // (`add`/`replace`/`remove`) demote to Ask. Generic
-                // "no rule matched but default is Allow" also
-                // demotes. Explicit user `deny` still denies.
-                let memory_write = tool == "memory" && input != "view" && base != Action::Deny;
-                // skill read actions arrive as the bare keywords
-                // `load`/`list`; write actions (create/edit/patch)
-                // arrive as `{action}:{name}`. Demote only the writes
-                // — same posture as memory's view-vs-mutate split.
-                let skill_write =
-                    tool == "skill" && input != "load" && input != "list" && base != Action::Deny;
-                let bare_default = matched.is_empty() && self.default_action == Action::Allow;
-                if memory_write || skill_write || bare_default {
-                    Action::Ask
-                } else {
-                    base
-                }
-            }
-            SecurityMode::Accept => match base {
-                Action::Ask => {
-                    if self.is_path_tool(tool) && self.is_external_path(input) {
-                        self.match_ext_dir(input).unwrap_or(Action::Ask)
-                    } else if is_high_risk_non_path_tool(tool) {
-                        // Accept mode coerces Ask → Allow for non-path
-                        // tools on the assumption that "trust the
-                        // agent inside cwd" generalizes. That breaks
-                        // for tools that execute external code with
-                        // arbitrary effects: MCP servers run third-
-                        // party code; `bash` runs shell. Keep the Ask
-                        // for these specifically. Review #1.
-                        Action::Ask
-                    } else {
-                        Action::Allow
-                    }
-                }
-                other => other,
-            },
-            SecurityMode::Standard => base,
-            SecurityMode::Yolo => unreachable!(),
-        };
-
-        if action != Action::Deny {
-            // PERM-2: check doom-loop BEFORE tracking the current
-            // call. The counter reflects previous identical calls
-            // only — the current call doesn't count itself.
-            if self.is_doom_loop(tool, input) {
-                match self.doom_loop_action {
-                    Action::Deny => {
-                        let preview: String = input.chars().take(60).collect();
-                        return CheckResult::Denied(format!(
-                            "Doom loop: repeated identical {} call ({}{})",
-                            tool,
-                            preview,
-                            if input.chars().count() > 60 {
-                                "…"
-                            } else {
-                                ""
-                            },
-                        ));
-                    }
-                    Action::Ask => return CheckResult::Ask,
-                    Action::Allow => {}
-                }
-            }
-            self.track_doom_loop(tool, input);
-        }
-
-        match action {
-            Action::Allow => CheckResult::Allowed,
-            Action::Ask => CheckResult::Ask,
-            Action::Deny => CheckResult::Denied(match last_pat {
-                Some(pat) => format!("Blocked by rule: {tool} {pat:?} → deny"),
-                None => format!("Blocked: {tool} denied by default action"),
-            }),
-        }
+        effect_to_result(self.authorize_scope(tool, input, false))
     }
 
+    /// Decision for a filesystem-path tool input. Path classification
+    /// (resolved / in_cwd / dev_null) happens inside `authorize_scope`.
     pub fn check_path(&mut self, tool: &str, path: &str) -> CheckResult {
-        // Reject paths that are clearly LLM hallucinations
-        // (e.g. "1", "a", "xy") before they trigger permission
-        // dialogs for non-existent files.  Absolute paths and
-        // relative paths with directory components or file
-        // extensions pass through to the normal check.
+        // Reject obvious LLM hallucinations ("1", "a") before the
+        // engine — preserves the old `validate_path` guard.
         if let Err(reason) = path::validate_path(path) {
             return CheckResult::Denied(reason);
         }
-
-        // Prompt deny-list runs first, same reasoning as `check`.
-        if self.is_prompt_denied(tool) {
-            return CheckResult::Denied(format!(
-                "Tool {tool:?} is denied by the active prompt's `deny_tools` frontmatter. Switch with `/prompt <other>` to use it."
-            ));
-        }
-        if self.mode == SecurityMode::Yolo {
-            return CheckResult::Allowed;
-        }
-
-        // Resolve BEFORE the allowlist check so we can test both the
-        // raw path and the absolute form. Without this, a user who
-        // granted AllowAlways for a relative path (e.g. src/main.rs)
-        // gets re-prompted when the LLM sends an absolute path for
-        // the same file.
-        let abs_path = resolve_absolute(path, &self.working_dir);
-
-        if self.is_session_allowed(tool, path) || self.is_session_allowed(tool, &abs_path) {
-            return CheckResult::Allowed;
-        }
-
-        let mut matched: Vec<(Action, String)> = Vec::new();
-        if let Some(rules) = self.rules.get(tool) {
-            for (pattern, action) in rules {
-                if pattern.matches(&abs_path) || pattern.matches(path) {
-                    matched.push((*action, pattern.original.clone()));
-                }
-            }
-        }
-
-        let base = matched
-            .last()
-            .map(|(a, _)| *a)
-            .unwrap_or(self.default_action);
-        let last_pat = matched.last().map(|(_, p)| p.clone());
-
-        // Audit H9: `external_directory` rules used to fire only in
-        // `SecurityMode::Accept`. A user who configured
-        // `external_directory = { "/external/safe/**" = "allow" }`
-        // saw the rule silently ignored under Standard/Restrictive.
-        // Pre-compute the overlay so each mode can opt into it
-        // uniformly.
-        let is_external = self.is_external_path(&abs_path);
-        let ext_dir_action = if is_external {
-            self.match_ext_dir(&abs_path)
-        } else {
-            None
-        };
-
-        let action = match self.mode {
-            SecurityMode::Restrictive => {
-                if let Some(a) = ext_dir_action {
-                    a
-                } else if matched.is_empty() && self.default_action == Action::Allow {
-                    Action::Ask
-                } else {
-                    base
-                }
-            }
-            SecurityMode::Accept => match base {
-                Action::Ask => {
-                    if is_external {
-                        ext_dir_action.unwrap_or(Action::Ask)
-                    } else {
-                        Action::Allow
-                    }
-                }
-                other => other,
-            },
-            SecurityMode::Standard => {
-                // Explicit ext_dir rule overrides the base for external
-                // paths. For non-external paths (or external paths
-                // without a matching ext_dir rule) keep the prior
-                // base-action behavior — the catch-all below will
-                // demote unmatched external Allows to Ask.
-                if let Some(a) = ext_dir_action {
-                    a
-                } else {
-                    base
-                }
-            }
-            SecurityMode::Yolo => unreachable!(),
-        };
-
-        let action = if matched.is_empty()
-            && action == Action::Allow
-            && is_external
-            && ext_dir_action.is_none()
-        {
-            Action::Ask
-        } else {
-            action
-        };
-
-        if action != Action::Deny {
-            self.track_doom_loop(tool, path);
-            if self.is_doom_loop(tool, path) {
-                match self.doom_loop_action {
-                    Action::Deny => {
-                        let preview: String = path.chars().take(80).collect();
-                        return CheckResult::Denied(format!(
-                            "Doom loop: repeated identical {} call ({}{})",
-                            tool,
-                            preview,
-                            if path.chars().count() > 80 { "…" } else { "" },
-                        ));
-                    }
-                    Action::Ask => return CheckResult::Ask,
-                    Action::Allow => {}
-                }
-            }
-        }
-
-        match action {
-            Action::Allow => CheckResult::Allowed,
-            Action::Ask => CheckResult::Ask,
-            Action::Deny => CheckResult::Denied(match last_pat {
-                Some(pat) => format!("Blocked by rule: {tool} {pat:?} → deny"),
-                None => format!("Blocked: {tool} denied by default action"),
-            }),
-        }
+        effect_to_result(self.authorize_scope(tool, path, true))
     }
 
     fn is_session_allowed(&self, tool: &str, input: &str) -> bool {
@@ -706,11 +543,15 @@ impl PermissionChecker {
     /// and the resolve-both-forms logic of the real checks so a
     /// relative allow-always pattern matches an absolute probe.
     pub fn session_allows_now(&self, tool: &str, input: &str) -> bool {
+        // Read the ENGINE allowlist (the runtime source of truth that
+        // `enforce` consults), op-scoped.
+        let op = engine::tool_operation(tool);
+        let al = &self.engine.ctx().allowlist;
         if is_path_tool_name(tool) {
             let abs = resolve_absolute(input, &self.working_dir);
-            self.is_session_allowed(tool, input) || self.is_session_allowed(tool, &abs)
+            al.allows(op, input) || al.allows(op, &abs)
         } else {
-            self.is_session_allowed(tool, input)
+            al.allows(op, input)
         }
     }
 
@@ -760,6 +601,20 @@ impl PermissionChecker {
                 &self.working_dir,
             );
         }
+
+        // Engine (runtime source of truth). Op-scoped: write/edit/
+        // apply_patch all map to Operation::Edit, so a single grant
+        // covers the trio — no mirroring needed. Add a canonical
+        // variant for path tools so a relative "allow always" pattern
+        // matches the absolute probe the engine checks against.
+        let op = engine::tool_operation(&tool);
+        self.engine.allow_always(op, pattern_str);
+        if is_path_tool_name(&tool)
+            && let Some(canon) = canonicalize_path_pattern(pattern_str, &self.working_dir)
+            && canon != pattern_str
+        {
+            self.engine.allow_always(op, &canon);
+        }
     }
 
     pub fn load_session_allowlist(&mut self, entries: &[(String, String)]) {
@@ -786,6 +641,7 @@ impl PermissionChecker {
     /// Remove ALL allowlist entries. Used by `/allow clear`.
     pub fn clear_session_allowlist(&mut self) {
         allowlist::clear(&mut self.session_allowlist);
+        self.engine.ctx_mut().allowlist.clear();
     }
 
     pub fn set_mode(&mut self, mode: SecurityMode) {
@@ -858,6 +714,11 @@ impl PermissionChecker {
         self.recent_calls.clear();
         self.repeat_counts.clear();
         self.session_allowlist.clear();
+        // Mirror the reset into the engine: a cwd change drops the
+        // loop-guard counters and session grants tied to the old
+        // project (privilege carry-over guard).
+        self.engine.ctx_mut().repeat.clear();
+        self.engine.ctx_mut().allowlist.clear();
     }
 
     fn is_path_tool(&self, tool: &str) -> bool {
