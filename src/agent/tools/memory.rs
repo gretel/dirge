@@ -122,11 +122,11 @@ ACTIONS:
             // out as `payload` to avoid the "always a new value"
             // misreading.
             "add" => {
-                let content = args
-                    .content
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| ToolError::Msg("content is required for 'add'".to_string()))?;
+                let content = crate::agent::tools::required_nonblank(
+                    args.content.as_deref(),
+                    "content",
+                    "add",
+                )?;
                 let resp = self.store.add(target, content).map_err(ToolError::Msg)?;
                 crate::agent::review::fire_memory_write(
                     self.store.as_ref(),
@@ -138,20 +138,16 @@ ACTIONS:
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
             "replace" => {
-                let old_text = args
-                    .old_text
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| {
-                        ToolError::Msg("old_text is required for 'replace'".to_string())
-                    })?;
-                let content = args
-                    .content
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| {
-                        ToolError::Msg("content is required for 'replace'".to_string())
-                    })?;
+                let old_text = crate::agent::tools::required_nonblank(
+                    args.old_text.as_deref(),
+                    "old_text",
+                    "replace",
+                )?;
+                let content = crate::agent::tools::required_nonblank(
+                    args.content.as_deref(),
+                    "content",
+                    "replace",
+                )?;
                 let resp = self
                     .store
                     .replace(target, old_text, content)
@@ -166,13 +162,11 @@ ACTIONS:
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
             "remove" => {
-                let old_text = args
-                    .old_text
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| {
-                        ToolError::Msg("old_text is required for 'remove'".to_string())
-                    })?;
+                let old_text = crate::agent::tools::required_nonblank(
+                    args.old_text.as_deref(),
+                    "old_text",
+                    "remove",
+                )?;
                 let resp = self
                     .store
                     .remove(target, old_text)

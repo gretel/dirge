@@ -164,6 +164,29 @@ pub fn head_cap(text: String, max_bytes: usize, what: &str) -> String {
     out
 }
 
+/// Extract a required, non-blank string argument for a multiplexer
+/// tool's action, with a uniform error message. Replaces the per-action
+/// `ok_or_else(|| Msg("X is required for 'Y'"))` checks that memory and
+/// skill each hand-rolled with slightly different wording (dirge-8k3k).
+///
+/// Kept as a call-site helper rather than a schema-driven
+/// `validate_and_repair` rule on purpose: a missing field there returns
+/// `Err` from the repair layer, which arms model escalation — overkill
+/// for a "you forgot a field for this action" error. Same reasoning as
+/// [`require_absolute_path`].
+pub fn required_nonblank<'a>(
+    value: Option<&'a str>,
+    field: &str,
+    action: &str,
+) -> Result<&'a str, ToolError> {
+    match value {
+        Some(s) if !s.trim().is_empty() => Ok(s),
+        _ => Err(ToolError::Msg(format!(
+            "`{field}` is required for action '{action}'"
+        ))),
+    }
+}
+
 /// Enforce that a tool argument is an absolute filesystem path.
 ///
 /// Single source for the check + error message shared by read, write,
@@ -492,6 +515,23 @@ mod tests {
             pattern: pattern.to_string(),
             effect,
             tool: None,
+        }
+    }
+
+    // dirge-8k3k: required_nonblank extracts a present, non-blank value
+    // or errors with a uniform "`field` is required for action 'x'".
+    #[test]
+    fn required_nonblank_extracts_or_errors() {
+        assert_eq!(
+            required_nonblank(Some("hello"), "content", "add").unwrap(),
+            "hello"
+        );
+        for bad in [None, Some(""), Some("   \t")] {
+            let msg = required_nonblank(bad, "content", "add")
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("content"), "names the field: {msg}");
+            assert!(msg.contains("add"), "names the action: {msg}");
         }
     }
 

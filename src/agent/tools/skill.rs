@@ -125,10 +125,8 @@ impl Tool for SkillTool {
 
         match args.action.as_str() {
             "load" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| ToolError::Msg("name is required for 'load'".to_string()))?;
+                let name =
+                    crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "load")?;
                 let Some(skill) = skill::find_skill(name, &self.skills) else {
                     return Err(ToolError::Msg(format!(
                         "Skill '{}' not found. Available: {}",
@@ -171,17 +169,13 @@ impl Tool for SkillTool {
             }
 
             "create" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| ToolError::Msg("name is required for 'create'".to_string()))?;
-                let content = args
-                    .content
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| {
-                        ToolError::Msg("content is required for 'create'".to_string())
-                    })?;
+                let name =
+                    crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "create")?;
+                let content = crate::agent::tools::required_nonblank(
+                    args.content.as_deref(),
+                    "content",
+                    "create",
+                )?;
                 self.manager
                     .create_from_content(name, content)
                     .map_err(ToolError::Msg)?;
@@ -193,15 +187,13 @@ impl Tool for SkillTool {
             }
 
             "edit" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| ToolError::Msg("name is required for 'edit'".to_string()))?;
-                let content = args
-                    .content
-                    .as_deref()
-                    .filter(|c| !c.trim().is_empty())
-                    .ok_or_else(|| ToolError::Msg("content is required for 'edit'".to_string()))?;
+                let name =
+                    crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "edit")?;
+                let content = crate::agent::tools::required_nonblank(
+                    args.content.as_deref(),
+                    "content",
+                    "edit",
+                )?;
                 self.manager
                     .edit_from_content(name, content)
                     .map_err(ToolError::Msg)?;
@@ -213,10 +205,8 @@ impl Tool for SkillTool {
             }
 
             "patch" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| ToolError::Msg("name is required for 'patch'".to_string()))?;
+                let name =
+                    crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "patch")?;
                 let old_string = args
                     .old_string
                     .as_deref()
@@ -236,10 +226,8 @@ impl Tool for SkillTool {
             }
 
             "delete" => {
-                let name = args
-                    .name
-                    .as_deref()
-                    .ok_or_else(|| ToolError::Msg("name is required for 'delete'".to_string()))?;
+                let name =
+                    crate::agent::tools::required_nonblank(args.name.as_deref(), "name", "delete")?;
                 self.manager.delete(name).map_err(ToolError::Msg)?;
                 Ok(format!("Skill '{}' deleted.", name))
             }
