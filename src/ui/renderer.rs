@@ -922,6 +922,14 @@ impl Renderer {
         self.content_width()
     }
 
+    /// The display width the compose buffer is soft-wrapped to in the
+    /// input box (content width minus the 3-col prompt prefix). Mirrors
+    /// the `wrap_w` computed in `draw_bottom`; pushed into the editor so
+    /// Up/Down can move by wrapped display rows (dirge-5w9v).
+    pub fn input_wrap_w(&self) -> usize {
+        self.content_width().saturating_sub(3).max(1)
+    }
+
     /// Raw width of the chat band (terminal width minus 2 cols for
     /// the chat frame's left + right ║). Used for *positioning*
     /// math (`content_indent`, panel widths) — chat text wrapping

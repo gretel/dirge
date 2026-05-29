@@ -142,6 +142,52 @@ fn next_line_start(s: &str, cursor: usize) -> Option<usize> {
     after.find('\n').map(|p| cursor + p + 1)
 }
 
+/// Byte offset to move the cursor to for a vertical (Up/Down) keystroke
+/// across SOFT-wrapped display rows (dirge-5w9v). Reuses the renderer's
+/// `wrap_editor` (the single soft-wrap source — no duplicated logic) to
+/// find the cursor's display `(row, col)`, then locates the byte on the
+/// adjacent row nearest that column. Returns `None` at the top/bottom
+/// display row (caller then falls through to history). Every returned
+/// offset is a real char boundary (the scan steps by `next_char_boundary`),
+/// so a subsequent slice can't panic. O(rows·len) but only on a keypress
+/// over a small compose buffer.
+///
+/// Only valid when the display buffer equals the raw buffer (no paste
+/// placeholders); callers guard on that.
+fn wrap_vertical_target(s: &str, cursor: usize, wrap_w: usize, up: bool) -> Option<usize> {
+    use crate::ui::renderer::wrap_editor;
+    let (rows, cur_row, cur_col) = wrap_editor(s, cursor, wrap_w);
+    let target_row: u16 = if up {
+        cur_row.checked_sub(1)?
+    } else {
+        let next = cur_row + 1;
+        if next as usize >= rows.len() {
+            return None;
+        }
+        next
+    };
+    // Scan char boundaries; on the target row, return the first offset
+    // whose display column reaches `cur_col`, else the row's last offset.
+    let mut best: Option<usize> = None;
+    let mut b = 0usize;
+    loop {
+        let (_, r, c) = wrap_editor(s, b, wrap_w);
+        if r == target_row {
+            if c >= cur_col {
+                return Some(b);
+            }
+            best = Some(b);
+        } else if r > target_row {
+            break;
+        }
+        if b >= s.len() {
+            break;
+        }
+        b = next_char_boundary(s, b);
+    }
+    best
+}
+
 /// Map a CHAR column on the line `[start..end]` of `s` to its
 /// byte offset within `s`. Clamps to `end` when the column exceeds
 /// the line's char count. Used by history Up/Down (H-batch1-2) so
@@ -188,6 +234,11 @@ pub struct InputEditor {
     pastes: Vec<Option<CompactString>>,
     /// Current slash-command completion state, for rendering a preview.
     pub completion: Option<CompletionResult>,
+    /// Display width the buffer is soft-wrapped to in the box, pushed in
+    /// from the renderer before each key dispatch. `0` = unknown (e.g.
+    /// before the first render) → Up/Down fall back to hard-newline
+    /// motion. Used to make vertical motion wrap-aware (dirge-5w9v).
+    wrap_w: usize,
 }
 
 /// Find the marker block `\x01<digits>\x01` containing or starting at
@@ -340,7 +391,14 @@ impl InputEditor {
             yank_state: None,
             pastes: Vec::new(),
             completion: None,
+            wrap_w: 0,
         }
+    }
+
+    /// Push the current display wrap width (from the renderer) so Up/Down
+    /// can move by SOFT-wrapped display rows, not just hard newlines.
+    pub fn set_wrap_width(&mut self, wrap_w: usize) {
+        self.wrap_w = wrap_w;
     }
 
     /// Insert pasted text. If it spans `PASTE_COLLAPSE_LINES` or more lines,
@@ -1081,7 +1139,22 @@ impl InputEditor {
                     self.history_up();
                     return None;
                 }
-                // Try moving up within the multiline buffer first.
+                // Wrap-aware vertical motion: move by displayed (soft-
+                // wrapped) rows when the width is known and the buffer
+                // has no paste placeholders (display == raw). At the top
+                // display row, fall through to history (dirge-5w9v).
+                if self.wrap_w > 0 && marker_blocks(&self.buffer).is_empty() {
+                    if let Some(pos) =
+                        wrap_vertical_target(&self.buffer, self.cursor, self.wrap_w, true)
+                    {
+                        self.cursor = pos;
+                    } else {
+                        self.history_up();
+                    }
+                    return None;
+                }
+                // Fallback (markers present / width unknown): hard-newline
+                // motion, then history.
                 if let Some(pos) = prev_line_start(&self.buffer, self.cursor) {
                     let line_start = cursor_line_start(&self.buffer, self.cursor);
                     // H-batch1-2 (audit fix): map by CHAR column, not
@@ -1110,7 +1183,20 @@ impl InputEditor {
                     self.history_down();
                     return None;
                 }
-                // Try moving down within the multiline buffer first.
+                // Wrap-aware vertical motion (see KeyCode::Up). At the
+                // bottom display row, fall through to history (dirge-5w9v).
+                if self.wrap_w > 0 && marker_blocks(&self.buffer).is_empty() {
+                    if let Some(pos) =
+                        wrap_vertical_target(&self.buffer, self.cursor, self.wrap_w, false)
+                    {
+                        self.cursor = pos;
+                    } else {
+                        self.history_down();
+                    }
+                    return None;
+                }
+                // Fallback (markers present / width unknown): hard-newline
+                // motion, then history.
                 if let Some(pos) = next_line_start(&self.buffer, self.cursor) {
                     let line_start = cursor_line_start(&self.buffer, self.cursor);
                     // H-batch1-2 (audit fix) — see KeyCode::Up.
@@ -1208,6 +1294,24 @@ impl InputEditor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // dirge-5w9v: vertical motion moves by SOFT-wrapped display rows.
+    // "abcdefghij" at wrap_w=4 wraps to ["abcd","efgh","ij"].
+    #[test]
+    fn wrap_vertical_target_moves_by_display_rows() {
+        let s = "abcdefghij";
+        let w = 4;
+        // From end (row 2, col 2), Up lands on row 1 at the same column
+        // ('g' = byte 6).
+        assert_eq!(wrap_vertical_target(s, s.len(), w, true), Some(6));
+        // From there (row 1, col 2), Down returns to row 2, column
+        // clamped to its length (end = byte 10).
+        assert_eq!(wrap_vertical_target(s, 6, w, false), Some(10));
+        // Top display row → None (caller falls through to history).
+        assert_eq!(wrap_vertical_target(s, 1, w, true), None);
+        // Bottom display row → None.
+        assert_eq!(wrap_vertical_target(s, 9, w, false), None);
+    }
 
     #[test]
     fn test_prev_word_boundary_basic() {

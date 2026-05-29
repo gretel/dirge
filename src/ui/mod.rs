@@ -1215,6 +1215,10 @@ pub async fn run_interactive(
                                 continue;
                             }
 
+                        // Keep the editor's wrap width in sync with the
+                        // rendered box so Up/Down move by wrapped display
+                        // rows (dirge-5w9v).
+                        input.set_wrap_width(renderer.input_wrap_w());
                         if let Some(text) = input.handle_key(key) {
                             // Review #4: any submission starts a new
                             // turn — drop the collapsed-result stash
