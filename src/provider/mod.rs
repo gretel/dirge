@@ -1228,11 +1228,44 @@ impl AnyAgent {
         // identity + tool docs) is the base; session-side
         // system messages append.
         let history_preamble = rig_history_system_prompt(&history);
-        let system_prompt = if history_preamble.is_empty() {
+        // `mut` is consumed only by the plugin-gated append below.
+        #[cfg_attr(not(feature = "plugin"), allow(unused_mut))]
+        let mut system_prompt = if history_preamble.is_empty() {
             self.preamble.clone()
         } else {
             format!("{}\n\n{}", self.preamble, history_preamble)
         };
+
+        // dirge-wqxj: fire the `before-agent-start` plugin hook with
+        // the assembled system prompt. A plugin may call
+        // `harness/append-system-prompt` to add project/team context
+        // to the preamble before the agent starts. Append-only — the
+        // model-identity + tool-docs preamble is preserved.
+        #[cfg(feature = "plugin")]
+        if let Some(pm) = crate::plugin::hook::global() {
+            let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+            let ctx = format!(
+                "@{{:system-prompt \"{}\"}}",
+                crate::plugin::escape_janet_string(&system_prompt)
+            );
+            match mgr.dispatch("before-agent-start", &ctx) {
+                Ok(_) => {
+                    if let Some(append) = mgr.take_system_prompt_append() {
+                        let append = append.trim();
+                        if !append.is_empty() {
+                            system_prompt = format!("{system_prompt}\n\n{append}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "dirge::plugin",
+                        error = %e,
+                        "before-agent-start hook error — system prompt left unchanged",
+                    );
+                }
+            }
+        }
 
         // Convert rig history → loop messages (Session-side
         // user/assistant/toolResult shapes).

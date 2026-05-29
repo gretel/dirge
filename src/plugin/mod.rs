@@ -412,6 +412,28 @@ impl PluginManager {
         self.take_string_slot("harness-prompt-replace")
     }
 
+    /// dirge-wqxj: read and clear the `harness-system-prompt-append`
+    /// slot. Set by a `before-agent-start` hook via
+    /// `harness/append-system-prompt`; the host appends it to the
+    /// assembled system prompt before the agent starts.
+    pub fn take_system_prompt_append(&mut self) -> Option<String> {
+        self.take_string_slot("harness-system-prompt-append")
+    }
+
+    /// dirge-lsoq: read and clear the `harness-message-rewrite` slot.
+    /// Set by a `message-end` hook via `harness/rewrite-message`; the
+    /// host replaces the finalized assistant response with it.
+    pub fn take_message_rewrite(&mut self) -> Option<String> {
+        self.take_string_slot("harness-message-rewrite")
+    }
+
+    /// dirge-264x: read and clear the `harness-replace-context` slot.
+    /// Set by a `transform-context` hook via `harness/replace-context`
+    /// (a JSON array string); the host uses it for the next LLM call.
+    pub fn take_replace_context(&mut self) -> Option<String> {
+        self.take_string_slot("harness-replace-context")
+    }
+
     /// Shared body of the three `take_pending_*` functions: probe the type
     /// to disambiguate Janet's nil from a string with the characters "nil",
     /// fetch the value if it's a string, then clear the slot.

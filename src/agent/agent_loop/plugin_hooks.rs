@@ -424,6 +424,64 @@ pub fn get_followup_messages_from_plugin_manager(
     })
 }
 
+/// dirge-264x: build a `TransformContextFn` that dispatches the
+/// `transform-context` plugin hook before each LLM call. The hook
+/// receives the current messages as a JSON array string in
+/// `ctx :messages` and may call `harness/replace-context` with a new
+/// JSON array; the returned array replaces the messages for that one
+/// call (the persisted transcript is untouched — stream.rs clones
+/// before calling this).
+///
+/// Safe passthrough on every failure path: if the hook errors, sets
+/// nothing, or returns malformed JSON, the ORIGINAL messages are
+/// returned unchanged. A plugin can never corrupt the context by
+/// throwing.
+pub fn transform_context_from_plugin_manager(
+    pm: Arc<Mutex<PluginManager>>,
+) -> super::types::TransformContextFn {
+    Arc::new(move |messages: Vec<serde_json::Value>| {
+        let pm = pm.clone();
+        Box::pin(async move {
+            // Serialize the current messages for the hook context.
+            let Ok(messages_json) = serde_json::to_string(&messages) else {
+                return messages; // un-serializable → passthrough
+            };
+            let replaced: Option<String> = {
+                let mut mgr = pm.lock().unwrap_or_else(|e| e.into_inner());
+                let ctx = format!(
+                    "@{{:messages \"{}\"}}",
+                    crate::plugin::escape_janet_string(&messages_json)
+                );
+                match mgr.dispatch("transform-context", &ctx) {
+                    Ok(_) => mgr.take_replace_context(),
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "dirge::plugin",
+                            error = %e,
+                            "transform-context hook error — context unchanged",
+                        );
+                        None
+                    }
+                }
+            };
+            match replaced {
+                Some(json) => match serde_json::from_str::<Vec<serde_json::Value>>(&json) {
+                    Ok(new_messages) => new_messages,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "dirge::plugin",
+                            error = %e,
+                            "transform-context returned malformed JSON — context unchanged",
+                        );
+                        messages
+                    }
+                },
+                None => messages,
+            }
+        })
+    })
+}
+
 /// Parse a Janet-side level string into `ThinkingLevel`. Pi
 /// values: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`,
 /// `"xhigh"`. Unknown values produce None (plugin's typo is

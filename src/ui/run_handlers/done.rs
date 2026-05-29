@@ -63,10 +63,15 @@ pub(crate) struct WorktreeBits<'a> {
 // re-acquired in a new scope at line 263. Clippy can't trace the
 // `drop()` so it flags the outer `let mut mgr` as held across the
 // await even though it isn't.
-#[allow(clippy::too_many_arguments, clippy::await_holding_lock)]
+// `unused_mut` allowed: `response`'s `mut` is consumed only by the
+// plugin-gated `message-end` rewrite, so non-plugin builds see it
+// as unused.
+#[allow(clippy::too_many_arguments, clippy::await_holding_lock, unused_mut)]
 pub(crate) async fn handle_done(
     ctx: &mut RunCtx<'_>,
-    response: CompactString,
+    // dirge-lsoq: `mut` so the `message-end` plugin hook can rewrite
+    // the finalized assistant text before it is stored/persisted.
+    mut response: CompactString,
     tokens: u64,
     cost: f64,
     was_reasoning: &mut bool,
@@ -166,6 +171,28 @@ pub(crate) async fn handle_done(
         // Check for pending prompts queued by on-response
         if let Some(pending) = mgr.take_pending_prompt() {
             plugin_followup = Some(pending);
+        }
+        // dirge-lsoq: fire `message-end` so a plugin can rewrite the
+        // finalized assistant text via `harness/rewrite-message`. The
+        // text already streamed to the screen; this rewrites what is
+        // STORED + persisted (session DB, store_response), enabling
+        // post-hoc redaction/annotation of stored history.
+        match mgr.dispatch(
+            "message-end",
+            &format!(
+                "@{{:message \"{}\"}}",
+                crate::plugin::escape_janet_string(&response)
+            ),
+        ) {
+            Ok(_) => {
+                if let Some(rewritten) = mgr.take_message_rewrite() {
+                    response = compact_str::CompactString::new(&rewritten);
+                }
+            }
+            Err(e) => {
+                ctx.renderer
+                    .write_line(&format!("[plugin] message-end error: {e}"), c_error())?;
+            }
         }
         mgr.store_response(&response);
         // Fire on-complete after on-response so

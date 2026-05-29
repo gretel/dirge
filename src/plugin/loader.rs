@@ -19,6 +19,16 @@ pub const HOOK_NAMES: &[&str] = &[
     "on-error",
     "on-complete",
     "prepare-next-run",
+    // dirge-wqxj: fires once before the agent starts; receives the
+    // assembled system prompt; may call harness/append-system-prompt.
+    "before-agent-start",
+    // dirge-lsoq: fires after the assistant message finalizes; may
+    // call harness/rewrite-message to replace the response text.
+    "message-end",
+    // dirge-264x: fires before each LLM call with the current
+    // messages (JSON) in ctx :messages; may call
+    // harness/replace-context to prune/inject for that call.
+    "transform-context",
 ];
 
 /// Filter an input candidate list to only paths that exist as

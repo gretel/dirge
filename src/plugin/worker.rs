@@ -246,6 +246,40 @@ const HARNESS_INIT: &str = r#"
   (when (string? text)
     (set harness-prompt-replace text)))
 
+# dirge-wqxj: append text to the assembled system prompt before
+# the agent starts. Plugins call this from the `before-agent-start`
+# hook, which receives the current prompt in ctx :system-prompt.
+# Append-only by design — the base preamble (model identity + tool
+# docs) is preserved; the appended text is added after it. Multiple
+# appends from one hook concatenate (newline-joined).
+(var harness-system-prompt-append nil)
+(defn harness/append-system-prompt [text]
+  (when (string? text)
+    (set harness-system-prompt-append
+         (if (string? harness-system-prompt-append)
+           (string harness-system-prompt-append "\n" text)
+           text))))
+
+# dirge-lsoq: rewrite the finalized assistant message. Plugins call
+# this from the `message-end` hook (which receives the message text
+# in ctx :message). Last-write-wins; the host replaces the response
+# text with the slot value before it is rendered/stored.
+(var harness-message-rewrite nil)
+(defn harness/rewrite-message [text]
+  (when (string? text)
+    (set harness-message-rewrite text)))
+
+# dirge-264x: replace the message array for the NEXT LLM call.
+# Plugins call this from the `transform-context` hook, which
+# receives the current messages as a JSON array string in
+# ctx :messages. The value must be a JSON array string; the host
+# parses it and uses it for that single LLM call only (the persisted
+# transcript is unchanged). Last-write-wins.
+(var harness-replace-context nil)
+(defn harness/replace-context [json-array]
+  (when (string? json-array)
+    (set harness-replace-context json-array)))
+
 # Notification queue. Plugins call (harness/notify msg level?)
 # to push a line into the host's chat display. Stored as a
 # `level\tmsg\n` blob; the host's drain_notifications

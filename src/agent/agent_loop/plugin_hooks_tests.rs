@@ -24,6 +24,7 @@ use crate::agent::agent_loop::plugin_hooks::{
     after_hook_from_plugin_manager, before_hook_from_plugin_manager,
     get_followup_messages_from_plugin_manager, get_steering_messages_from_plugin_manager,
     prepare_next_turn_from_plugin_manager, should_stop_after_turn_from_plugin_manager,
+    transform_context_from_plugin_manager,
 };
 use crate::agent::agent_loop::result::LoopToolResult;
 use crate::agent::agent_loop::stream::StreamFn;
@@ -678,4 +679,112 @@ async fn ywj_get_followup_messages_reenters_outer_loop() {
         })
         .collect();
     assert_eq!(user_contents, vec!["hi", "followup question"]);
+}
+
+// ── dirge plugin-gap closure: new hooks ─────────────────────
+
+/// dirge-wqxj: a `before-agent-start` hook calling
+/// harness/append-system-prompt populates the slot the spawn path
+/// drains and appends to the system prompt. Proves the
+/// slot/builtin/HOOK_NAME/drain chain end-to-end.
+#[test]
+fn before_agent_start_appends_system_prompt() {
+    let Some(pm) = try_pm() else {
+        eprintln!("[skipped] PluginManager::try_new failed");
+        return;
+    };
+    let mut mgr = pm.lock().unwrap();
+    mgr.eval(r#"(defn aug [_ctx] (harness/append-system-prompt "TEAM RULES"))"#)
+        .expect("install aug");
+    mgr.register("before-agent-start", "aug");
+    mgr.dispatch("before-agent-start", "@{:system-prompt \"base preamble\"}")
+        .expect("dispatch");
+    assert_eq!(
+        mgr.take_system_prompt_append().as_deref(),
+        Some("TEAM RULES"),
+        "append slot must carry the hook's text",
+    );
+    // Drained once → cleared.
+    assert_eq!(mgr.take_system_prompt_append(), None);
+}
+
+/// dirge-lsoq: a `message-end` hook calling harness/rewrite-message
+/// populates the slot the done-handler drains to replace the stored
+/// response.
+#[test]
+fn message_end_rewrites_response() {
+    let Some(pm) = try_pm() else {
+        eprintln!("[skipped] PluginManager::try_new failed");
+        return;
+    };
+    let mut mgr = pm.lock().unwrap();
+    mgr.eval(r#"(defn redact [_ctx] (harness/rewrite-message "[redacted]"))"#)
+        .expect("install redact");
+    mgr.register("message-end", "redact");
+    mgr.dispatch("message-end", "@{:message \"secret output\"}")
+        .expect("dispatch");
+    assert_eq!(mgr.take_message_rewrite().as_deref(), Some("[redacted]"));
+    assert_eq!(mgr.take_message_rewrite(), None);
+}
+
+/// dirge-264x: the transform_context factory dispatches the
+/// `transform-context` hook and applies harness/replace-context —
+/// the returned messages REPLACE the input for that call.
+#[tokio::test]
+async fn transform_context_replaces_messages() {
+    let Some(pm) = try_pm() else {
+        eprintln!("[skipped] PluginManager::try_new failed");
+        return;
+    };
+    {
+        let mut mgr = pm.lock().unwrap();
+        mgr.eval(
+            r#"(defn xform [_ctx] (harness/replace-context "[{\"role\":\"user\",\"content\":\"pruned\"}]"))"#,
+        )
+        .expect("install xform");
+        mgr.register("transform-context", "xform");
+    }
+    let f = transform_context_from_plugin_manager(pm.clone());
+    let original = vec![
+        serde_json::json!({"role": "user", "content": "a"}),
+        serde_json::json!({"role": "assistant", "content": "b"}),
+    ];
+    let out = f(original).await;
+    assert_eq!(out.len(), 1, "context replaced by the hook's array");
+    assert_eq!(out[0]["content"], "pruned");
+}
+
+/// dirge-264x safety: no hook (or a hook that sets nothing) → the
+/// original messages pass through UNCHANGED. A plugin can never
+/// corrupt the context by being absent.
+#[tokio::test]
+async fn transform_context_passthrough_without_hook() {
+    let Some(pm) = try_pm() else {
+        eprintln!("[skipped] PluginManager::try_new failed");
+        return;
+    };
+    let f = transform_context_from_plugin_manager(pm.clone());
+    let original = vec![serde_json::json!({"role": "user", "content": "keep me"})];
+    let out = f(original.clone()).await;
+    assert_eq!(out, original, "no transform-context hook → unchanged");
+}
+
+/// dirge-264x safety: a hook that sets malformed JSON must NOT
+/// corrupt the context — the original messages pass through.
+#[tokio::test]
+async fn transform_context_passthrough_on_malformed_json() {
+    let Some(pm) = try_pm() else {
+        eprintln!("[skipped] PluginManager::try_new failed");
+        return;
+    };
+    {
+        let mut mgr = pm.lock().unwrap();
+        mgr.eval(r#"(defn bad [_ctx] (harness/replace-context "not json {{{"))"#)
+            .expect("install bad");
+        mgr.register("transform-context", "bad");
+    }
+    let f = transform_context_from_plugin_manager(pm.clone());
+    let original = vec![serde_json::json!({"role": "user", "content": "keep me"})];
+    let out = f(original.clone()).await;
+    assert_eq!(out, original, "malformed JSON → original context preserved");
 }

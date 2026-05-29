@@ -522,6 +522,16 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             loop_config.after_tool_call = Some(
                 super::plugin_hooks::after_hook_from_plugin_manager(pm.clone()),
             );
+            // dirge-264x: plugin-driven context transform, dispatched
+            // before each LLM call (stream_assistant_response reads
+            // config.transform_context). Only install if the host
+            // didn't supply one — it doesn't today, so this is the
+            // sole consumer of the otherwise-always-None field.
+            if loop_config.transform_context.is_none() {
+                loop_config.transform_context = Some(
+                    super::plugin_hooks::transform_context_from_plugin_manager(pm.clone()),
+                );
+            }
             // Phase 5: pi-loop hook surface for plugins.
             // Each polls a dedicated Janet slot the plugin sets
             // via harness/* helpers. Hooks fire at the right
