@@ -332,11 +332,7 @@ mod tests {
     fn narrow_terminal_skips_side_panels() {
         let buf: Vec<LineEntry> = Vec::new();
         let pd = PanelData::default();
-        let info = LeftPanelInfo {
-            agent_id: "abc".into(),
-            model: "m".into(),
-            focus: "code".into(),
-        };
+        let info = LeftPanelInfo::default();
         let subs: Vec<SubagentStatusRow> = Vec::new();
         let mut scene = empty_scene(&buf, &pd, &info, &subs, "narrow");
         scene.show_side_panels = true; // request side panels even though they collapse

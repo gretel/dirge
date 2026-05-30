@@ -9,8 +9,41 @@
 #[cfg(feature = "mcp")]
 use crate::extras::mcp::McpClientManager;
 use crate::session::Session;
+use crate::ui::panel_data::{ContextGauge, GitSnapshot, LeftPanelInfo};
 use crate::ui::renderer::PanelData;
 use crate::ui::sysload::SharedSysLoad;
+
+/// Usage fraction at/above which the context gauge flags an imminent
+/// fold. Tracks the post-usage NORMAL-fold trigger in
+/// `agent_loop::context_manager` (75%); kept as a local constant so the
+/// UI doesn't depend on the agent-loop internals.
+const FOLD_WARN_PCT: u16 = 75;
+
+/// Build the left-panel idle card: a live context gauge, the recent-tool
+/// activity ticker, and the git snapshot. Rebuilt each event-loop tick
+/// (cheap — a few field reads + the pre-polled git snapshot). `activity`
+/// is the UI loop's recent-tool ring (oldest-first) and `git` is the
+/// latest poll from `gitstatus`.
+pub(crate) fn build_left_panel_info(
+    session: &Session,
+    activity: &[String],
+    git: Option<GitSnapshot>,
+) -> LeftPanelInfo {
+    let used = session.total_estimated_tokens;
+    let window = session.context_window;
+    let pct = ((used.saturating_mul(100)).checked_div(window).unwrap_or(0)).min(100) as u16;
+    LeftPanelInfo {
+        context: ContextGauge {
+            used,
+            window,
+            pct,
+            compactions: session.compactions.len(),
+            fold_soon: pct >= FOLD_WARN_PCT,
+        },
+        activity: activity.to_vec(),
+        git,
+    }
+}
 
 /// Cache of the panel's rendered MODIFIED list, keyed by
 /// `(modified::version, cwd)`. Skips the lock + 256-PathBuf clone +

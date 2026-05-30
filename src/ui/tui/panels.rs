@@ -163,55 +163,131 @@ impl<'a> Widget for LeftPanel<'a> {
 /// symmetric padding for visual balance.
 const LEFT_PANEL_TOP_PAD: u16 = 1;
 
+/// Compact token count: `12.3k` / `980`.
+fn kfmt(n: u64) -> String {
+    if n >= 1000 {
+        format!("{:.1}k", n as f64 / 1000.0)
+    } else {
+        n.to_string()
+    }
+}
+
 fn paint_idle_card(buf: &mut Buffer, area: Rect, info: &LeftPanelInfo, style: Style) {
-    let dim = Style::default().fg(RColor::DarkGray);
+    let dim = RColor::DarkGray;
+    let warn = RColor::Yellow;
+    let green = RColor::Green;
     let panel_w = area.width as usize;
+    // Leave one trailing cell so a sub-panel's right border doesn't abut
+    // the chat-frame divider (same caution as the subagent list).
+    let box_w = area.width.saturating_sub(1);
+    let bs = Style::default().fg(RColor::Green);
 
-    // DIRGE banner centered at top. Metadata block (Agent ID /
-    // Model / Focus) below it, LEFT-aligned as a column so the
-    // labels and values line up. The block as a whole is centered
-    // horizontally so it doesn't sit flush against the left edge —
-    // the per-row labels are aligned, not the row centers.
+    let mut dy = LEFT_PANEL_TOP_PAD;
+
+    // DIRGE banner (centered). Identity (model/prompt) lives in the
+    // status line, so it's not repeated here.
     let banner = "D I R G E";
-    let metadata = [
-        format!("Agent ID: {}", info.agent_id),
-        format!("Model:    {}", info.model),
-        format!("Focus:    {}", info.focus),
-    ];
-    let max_meta_w = metadata
-        .iter()
-        .map(|s| s.chars().count())
-        .max()
-        .unwrap_or(0);
-    let meta_indent = panel_w.saturating_sub(max_meta_w) / 2;
-
-    // Row 0 (after top pad): banner centered.
-    let banner_dy = LEFT_PANEL_TOP_PAD;
-    if banner_dy < area.height {
+    if dy < area.height {
         let bw = banner.chars().count();
         let bpad = panel_w.saturating_sub(bw) / 2;
         buf.set_stringn(
             area.x + bpad as u16,
-            area.y + banner_dy,
+            area.y + dy,
             banner,
             panel_w.saturating_sub(bpad),
             style,
         );
     }
-    // Rows 1-2: blank spacer.
-    // Rows 3..: metadata block, left-aligned as a column.
-    for (i, line) in metadata.iter().enumerate() {
-        let dy = banner_dy + 3 + i as u16;
-        if dy >= area.height {
-            break;
+    dy += 2;
+
+    // Helper: render a SubPanel of `lines` at the current `dy` if it
+    // fits, advancing `dy` past it + a 1-row spacer. No-op when out of
+    // vertical room.
+    let place = |buf: &mut Buffer, dy: &mut u16, title: &str, lines: Vec<(String, RColor)>| {
+        let h = 2 + lines.len() as u16;
+        if box_w < 4 || area.y + *dy + h > area.y + area.height {
+            return;
         }
-        buf.set_stringn(
-            area.x + meta_indent as u16,
-            area.y + dy,
-            line,
-            panel_w.saturating_sub(meta_indent),
+        let mut sp = SubPanel::new(title).border_style(bs);
+        for (t, c) in lines {
+            sp = sp.line(t, c);
+        }
+        sp.render(Rect::new(area.x, area.y + *dy, box_w, h), buf);
+        *dy += h + 1;
+    };
+
+    // [CONTEXT] — fill bar + tokens/window + compaction count.
+    let g = &info.context;
+    let mut ctx_lines = vec![
+        (
+            format_bar("ctx", g.pct as f32),
+            if g.fold_soon { warn } else { green },
+        ),
+        (
+            format!("{}/{}  cmp:{}", kfmt(g.used), kfmt(g.window), g.compactions),
             dim,
-        );
+        ),
+    ];
+    if g.fold_soon {
+        ctx_lines.push(("⚠ compaction soon".to_string(), warn));
+    }
+    place(buf, &mut dy, "CONTEXT", ctx_lines);
+
+    // [GIT] — branch + dirty counts + last commit (only when in a repo).
+    // Rendered before activity is sized so activity can take the slack.
+    let git_lines: Option<Vec<(String, RColor)>> = info.git.as_ref().map(|gs| {
+        let mut v = vec![
+            (
+                format!(
+                    "⎇ {}",
+                    if gs.branch.is_empty() {
+                        "?"
+                    } else {
+                        &gs.branch
+                    }
+                ),
+                green,
+            ),
+            (
+                format!("+{} ~{} ?{}", gs.staged, gs.unstaged, gs.untracked),
+                if gs.staged + gs.unstaged + gs.untracked == 0 {
+                    dim
+                } else {
+                    warn
+                },
+            ),
+        ];
+        if !gs.last_commit.is_empty() {
+            v.push((gs.last_commit.clone(), dim));
+        }
+        v
+    });
+    let git_reserve = git_lines
+        .as_ref()
+        .map(|v| 2 + v.len() as u16 + 1)
+        .unwrap_or(0);
+
+    // [ACTIVITY] — recent tool ticker (newest last). Capped to whatever
+    // vertical room is left after CONTEXT and the reserved GIT box.
+    let avail = (area.y + area.height)
+        .saturating_sub(area.y + dy)
+        .saturating_sub(git_reserve);
+    let max_act = avail.saturating_sub(2) as usize; // minus the box borders
+    let act_lines: Vec<(String, RColor)> = if info.activity.is_empty() {
+        vec![("· idle".to_string(), dim)]
+    } else {
+        info.activity
+            .iter()
+            .rev()
+            .take(max_act.max(1))
+            .rev()
+            .map(|a| (a.clone(), dim))
+            .collect()
+    };
+    place(buf, &mut dy, "ACTIVITY", act_lines);
+
+    if let Some(lines) = git_lines {
+        place(buf, &mut dy, "GIT", lines);
     }
 }
 
@@ -591,40 +667,62 @@ mod tests {
         assert_eq!(body_chars[19], '│');
     }
 
-    /// LeftPanel idle state paints DIRGE banner centered.
+    /// LeftPanel idle state paints the DIRGE banner + the vitals
+    /// sections (CONTEXT / ACTIVITY / GIT) with live data.
     #[test]
-    fn left_panel_idle_paints_dirge_card() {
+    fn left_panel_idle_paints_vitals() {
+        use crate::ui::panel_data::{ContextGauge, GitSnapshot};
         let info = LeftPanelInfo {
-            agent_id: "abc123".into(),
-            model: "test".into(),
-            focus: "code".into(),
+            context: ContextGauge {
+                used: 12_300,
+                window: 128_000,
+                pct: 80,
+                compactions: 2,
+                fold_soon: true,
+            },
+            activity: vec!["read run.rs".into(), "bash cargo test".into()],
+            git: Some(GitSnapshot {
+                branch: "main".into(),
+                staged: 1,
+                unstaged: 2,
+                untracked: 0,
+                last_commit: "wip".into(),
+            }),
         };
-        let mut backend = TestBackend::new(30, 12);
-        let mut terminal = Terminal::new(backend.clone()).unwrap();
+        let backend = TestBackend::new(30, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
         terminal
             .draw(|f| {
-                let area = Rect::new(0, 0, 30, 12);
-                f.render_widget(LeftPanel::new(&info, &[]), area);
+                f.render_widget(LeftPanel::new(&info, &[]), Rect::new(0, 0, 30, 30));
             })
             .unwrap();
-        backend = terminal.backend().clone();
-        // Row 1 should contain "D I R G E" centered.
-        let row1: String = (0..30)
-            .map(|x| backend.buffer().cell((x, 1)).unwrap().symbol().to_string())
-            .collect();
-        assert!(row1.contains("D I R G E"), "got {:?}", row1);
-        // Some row should contain "Agent ID: abc123".
-        let mut found_agent_id = false;
-        for y in 0..12 {
-            let r: String = (0..30)
-                .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
-                .collect();
-            if r.contains("Agent ID: abc123") {
-                found_agent_id = true;
-                break;
-            }
-        }
-        assert!(found_agent_id, "expected Agent ID row");
+        let backend = terminal.backend().clone();
+        let dump: String = (0..30)
+            .map(|y| {
+                (0..30)
+                    .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(dump.contains("D I R G E"), "banner missing:\n{dump}");
+        assert!(dump.contains("CONTEXT"), "context section missing:\n{dump}");
+        assert!(dump.contains("80%"), "context pct missing:\n{dump}");
+        assert!(
+            dump.contains("compaction soon"),
+            "fold warning missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("ACTIVITY"),
+            "activity section missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("cargo test"),
+            "activity entry missing:\n{dump}"
+        );
+        assert!(dump.contains("GIT"), "git section missing:\n{dump}");
+        assert!(dump.contains("main"), "git branch missing:\n{dump}");
+        assert!(dump.contains("+1 ~2 ?0"), "git counts missing:\n{dump}");
     }
 
     /// LeftPanel with subagents lists status rows.

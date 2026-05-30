@@ -6,6 +6,7 @@ pub(crate) mod buffer;
 mod chat_state;
 pub(crate) mod colors;
 mod events;
+pub(crate) mod gitstatus;
 mod highlight;
 pub(crate) mod input;
 mod markdown;
@@ -71,7 +72,7 @@ use crate::ui::chat_state::{ChatUiState, load_chat_ui_state, save_chat_ui_state}
 use crate::ui::colors::{c_agent, c_error, c_perm, c_tool, resolve_color};
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::InputEditor;
-use crate::ui::panel_render::build_panel_data;
+use crate::ui::panel_render::{build_left_panel_info, build_panel_data};
 use crate::ui::picker::ListPicker;
 use crate::ui::renderer::{LineEntry, Renderer};
 use crate::ui::search_rewind::{
@@ -171,6 +172,13 @@ pub async fn run_interactive(
     renderer.set_monochrome(cli.no_color);
     let mut input = InputEditor::new();
     input.set_monochrome(cli.no_color);
+    // Left-panel vitals: a background git-status poller (follows `/cd`)
+    // and a ring of the most recent tool actions for the [ACTIVITY]
+    // ticker. Both feed `build_left_panel_info` each loop tick.
+    let gitstat = crate::ui::gitstatus::spawn_poller(std::time::Duration::from_secs(3));
+    const TOOL_ACTIVITY_CAP: usize = 8;
+    let mut tool_activity: std::collections::VecDeque<String> =
+        std::collections::VecDeque::with_capacity(TOOL_ACTIVITY_CAP);
     // Seed the editor's history from the session so Up/Down arrow
     // navigation and Ctrl+F search work across restarts.
     // Skip synthetic prompts (system-reminder wrappers, mid-turn
@@ -421,16 +429,7 @@ pub async fn run_interactive(
     // logo + agent ID / model / focus on first paint. The card
     // shows when no subagents are running; refreshed whenever the
     // user switches model via /model.
-    let initial_left_info = crate::ui::renderer::LeftPanelInfo {
-        agent_id: session.id.as_str().chars().take(8).collect(),
-        model: session.model.to_string(),
-        focus: context
-            .current_prompt_name
-            .as_deref()
-            .unwrap_or("default")
-            .to_string(),
-    };
-    renderer.set_left_panel_info(initial_left_info);
+    renderer.set_left_panel_info(build_left_panel_info(session, &[], gitstat.snapshot()));
 
     // Convenience builder for the bundled `RunCtx` borrowed by the
     // extracted agent-event handlers (`run_handlers::*`). Captures
@@ -606,6 +605,16 @@ pub async fn run_interactive(
             #[cfg(feature = "lsp")]
             lsp_manager.as_ref(),
         ));
+        // Refresh the left-panel vitals (context gauge, activity ticker,
+        // git snapshot) alongside the right panel.
+        {
+            let activity: Vec<String> = tool_activity.iter().cloned().collect();
+            renderer.set_left_panel_info(build_left_panel_info(
+                session,
+                &activity,
+                gitstat.snapshot(),
+            ));
+        }
 
         // H-R1: loop-top PM acquisitions use `try_lock` so a
         // long-running plugin tool (holding the mutex inside
@@ -1851,6 +1860,13 @@ pub async fn run_interactive(
                         agent_line_started = true;
                     }
                     AgentEvent::ToolCall { id, name, args } => {
+                        // Feed the left-panel [ACTIVITY] ticker (newest last,
+                        // bounded ring).
+                        tool_activity
+                            .push_back(crate::ui::panel_data::tool_call_label(&name, &args));
+                        while tool_activity.len() > TOOL_ACTIVITY_CAP {
+                            tool_activity.pop_front();
+                        }
                         // dirge-5h5: log entry state so the parallel-
                         // read race can be reconstructed offline.
                         tracing::trace!(
