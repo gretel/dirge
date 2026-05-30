@@ -389,6 +389,10 @@ pub struct LoopSpawnConfig {
     pub file_touch_tracker:
         Option<std::sync::Arc<crate::agent::agent_loop::context_depth::FileTouchTracker>>,
 
+    /// F6: optional pre-finalization verifier gate. `None` keeps the
+    /// feature off (byte-identical to today).
+    pub verifier: Option<std::sync::Arc<crate::agent::agent_loop::verifier::VerifierGate>>,
+
     /// dirge-nqr: hard cap on assistant turns within a single run.
     /// `None` = unlimited. Forwarded to `LoopConfig.max_turns`.
     pub max_turns: Option<usize>,
@@ -439,6 +443,7 @@ impl LoopSpawnConfig {
             escalation_provider_name: None,
             escalation_max_per_session: None,
             file_touch_tracker: None,
+            verifier: None,
             max_turns: None,
             bg_store: None,
             memory_provider: None,
@@ -510,6 +515,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             cfg.escalation_max_per_session.unwrap_or(3),
         )),
         file_touch_tracker: cfg.file_touch_tracker.clone(),
+        verifier: cfg.verifier.clone(),
         max_turns: cfg.max_turns,
     };
 

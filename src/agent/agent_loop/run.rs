@@ -1280,10 +1280,19 @@ pub async fn run_loop(
         }
 
         // Pi lines 256-262: outer-loop follow-up poll.
-        let follow_up = match &config.get_followup_messages {
+        let mut follow_up = match &config.get_followup_messages {
             Some(get) => get().await,
             None => Vec::new(),
         };
+        // F6: before finalizing, let the verifier gate inject a one-time
+        // "verify before done" nudge when code was edited but nothing was
+        // run to check it. Runs only when no other follow-up is pending,
+        // and is bounded to fire at most once per run.
+        if follow_up.is_empty()
+            && let Some(verifier) = &config.verifier
+        {
+            follow_up = verifier.check_before_finalize();
+        }
         if !follow_up.is_empty() {
             pending_messages = follow_up;
             continue 'outer;

@@ -53,6 +53,7 @@ pub mod tool;
 pub mod tool_input_repair;
 pub mod tools;
 pub mod types;
+pub mod verifier;
 
 pub use bridge::EventBridge;
 pub use hooks::{

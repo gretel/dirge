@@ -387,6 +387,12 @@ pub struct LoopConfig {
     /// reminders. None when the feature isn't configured.
     pub file_touch_tracker: Option<std::sync::Arc<super::context_depth::FileTouchTracker>>,
 
+    /// F6: per-run verifier gate. Watches for code edits vs. shell runs
+    /// and, at the finalization boundary, injects a one-time "verify
+    /// before done" nudge when code was changed but nothing was run to
+    /// check it. None disables it (loop behaves byte-identically).
+    pub verifier: Option<std::sync::Arc<super::verifier::VerifierGate>>,
+
     /// dirge-nqr: hard cap on assistant turns within a single run.
     /// `None` = unlimited (matches the legacy behaviour). When set,
     /// the run loop terminates after `max_turns` assistant turns
@@ -530,6 +536,7 @@ impl std::fmt::Debug for LoopConfig {
                 "file_touch_tracker",
                 &self.file_touch_tracker.as_ref().map(|_| "<tracker>"),
             )
+            .field("verifier", &self.verifier.as_ref().map(|_| "<gate>"))
             .field("max_turns", &self.max_turns)
             .finish()
     }
@@ -570,6 +577,7 @@ impl Clone for LoopConfig {
             escalation_max_per_session: self.escalation_max_per_session,
             escalation_remaining: self.escalation_remaining.clone(),
             file_touch_tracker: self.file_touch_tracker.clone(),
+            verifier: self.verifier.clone(),
             max_turns: self.max_turns,
         }
     }

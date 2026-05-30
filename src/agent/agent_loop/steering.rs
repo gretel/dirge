@@ -387,6 +387,7 @@ mod tests {
             escalation_max_per_session: 3,
             escalation_remaining: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(3)),
             file_touch_tracker: None,
+            verifier: None,
             max_turns: None,
         };
         config.get_steering_messages = Some(steering_from_queue(queue.clone(), QueueMode::All));

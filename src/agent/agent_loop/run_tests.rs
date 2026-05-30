@@ -93,6 +93,7 @@ fn build_config() -> LoopConfig {
         escalation_max_per_session: 3,
         escalation_remaining: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(3)),
         file_touch_tracker: None,
+        verifier: None,
         max_turns: None,
     }
 }

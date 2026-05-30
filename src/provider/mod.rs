@@ -1296,6 +1296,9 @@ impl AnyAgent {
         cfg.file_touch_tracker = self
             .context_depth_reminder_threshold
             .map(|t| crate::agent::agent_loop::context_depth::FileTouchTracker::new(t, prompt));
+        // F6: pre-finalization verifier gate, always on (baked-in). Nudges
+        // to verify before finishing when code was edited but not run.
+        cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
         // dirge-nqr: forward the per-run turn cap. `None` keeps the
         // legacy unlimited behavior.
         cfg.max_turns = self.max_turns;

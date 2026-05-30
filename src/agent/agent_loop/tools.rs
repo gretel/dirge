@@ -444,6 +444,12 @@ async fn prepare_tool_call(
         tracker.record_tool_call(&tool_call.name, &validated_args);
     }
 
+    // F6: feed the verifier gate the same prepared call so it can tell,
+    // at finalization, whether code was edited without anything being run.
+    if let Some(verifier) = &config.verifier {
+        verifier.record_tool_call(&tool_call.name, &validated_args);
+    }
+
     PrepareOutcome::Prepared {
         tool,
         args: validated_args,

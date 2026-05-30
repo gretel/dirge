@@ -83,6 +83,7 @@ fn build_config() -> LoopConfig {
         escalation_max_per_session: 3,
         escalation_remaining: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(3)),
         file_touch_tracker: None,
+        verifier: None,
         max_turns: None,
     }
 }
@@ -702,6 +703,120 @@ async fn reflexion_buffer_surfaces_abandoned_approach_in_guard() {
     assert!(
         saw_reflexion,
         "guard text should carry the reflexion buffer's abandoned-approaches block naming dup(...)",
+    );
+}
+
+/// F6 — pre-finalization verifier gate. The agent edits a code file then
+/// tries to finalize without running anything; the gate must inject the
+/// one-time "verify before done" nudge, which re-enters the loop. Proves
+/// the gate is wired through run_agent_loop end-to-end.
+#[tokio::test]
+async fn verifier_gate_nudges_when_code_edited_without_running() {
+    let tool = std::sync::Arc::new(RecordingTool::new("edit"));
+    let mut ctx = empty_context();
+    ctx.tools.push(tool.clone());
+
+    let mut cfg = build_config();
+    cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+
+    let stream = scripted_stream(vec![
+        // Edit a code file...
+        vec![StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message: tool_use_response("call-1", "edit", serde_json::json!({"path": "src/x.rs"})),
+            usage: None,
+        }],
+        // ...then immediately try to finish.
+        vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: text_response("all done"),
+            usage: None,
+        }],
+        // After the nudge re-enters the loop, finish for real.
+        vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: text_response("verified, done"),
+            usage: None,
+        }],
+    ]);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let messages = run_agent_loop(
+        vec![user("change x")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &stream,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let saw_nudge = messages.iter().any(|m| match m {
+        LoopMessage::User(u) => u.content.contains("[verify-before-done]"),
+        _ => false,
+    });
+    assert!(
+        saw_nudge,
+        "verifier gate should inject the verify-before-done nudge into the loop",
+    );
+}
+
+/// The complement: editing code AND running a shell command suppresses
+/// the nudge — the gate stays silent when the agent did verify.
+#[tokio::test]
+async fn verifier_gate_silent_when_a_command_ran() {
+    let edit_tool = std::sync::Arc::new(RecordingTool::new("edit"));
+    let bash_tool = std::sync::Arc::new(RecordingTool::new("bash"));
+    let mut ctx = empty_context();
+    ctx.tools.push(edit_tool);
+    ctx.tools.push(bash_tool);
+
+    let mut cfg = build_config();
+    cfg.verifier = Some(crate::agent::agent_loop::verifier::VerifierGate::new());
+    cfg.tool_execution = ToolExecutionMode::Sequential;
+
+    let stream = scripted_stream(vec![
+        vec![StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message: tool_use_response("c1", "edit", serde_json::json!({"path": "src/x.rs"})),
+            usage: None,
+        }],
+        vec![StreamEvent::Done {
+            reason: StopReason::ToolUse,
+            message: tool_use_response("c2", "bash", serde_json::json!({"command": "cargo test"})),
+            usage: None,
+        }],
+        vec![StreamEvent::Done {
+            reason: StopReason::Stop,
+            message: text_response("done"),
+            usage: None,
+        }],
+    ]);
+
+    let (tx, _rx) = mpsc::channel::<LoopEvent>(256);
+    let messages = run_agent_loop(
+        vec![user("change x")],
+        ctx,
+        cfg,
+        AbortSignal::new(),
+        &tx,
+        &stream,
+        None,
+        None,
+    )
+    .await;
+    drop(tx);
+
+    let saw_nudge = messages.iter().any(|m| match m {
+        LoopMessage::User(u) => u.content.contains("[verify-before-done]"),
+        _ => false,
+    });
+    assert!(
+        !saw_nudge,
+        "no nudge expected when the agent ran a command after editing",
     );
 }
 
