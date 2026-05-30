@@ -1297,6 +1297,38 @@ mod reminder_tests {
         );
     }
 
+    /// F2 — the base preamble carries the finishing self-check + stop
+    /// condition so every agent (all models) gets it in the system
+    /// prompt, not just in prose scattered elsewhere.
+    #[test]
+    fn base_preamble_includes_finishing_selfcheck() {
+        let p = assemble_base_preamble();
+        assert!(
+            p.contains("# Finishing"),
+            "missing the Finishing section heading"
+        );
+        assert!(
+            p.to_lowercase().contains("self-check"),
+            "missing the single self-check"
+        );
+        // The three checks: did exactly what was asked, verified it,
+        // no unrequested changes.
+        assert!(p.contains("exactly what was asked"), "missing scope check");
+        assert!(
+            p.to_lowercase().contains("verified"),
+            "missing verify check"
+        );
+        assert!(
+            p.to_lowercase().contains("unrequested"),
+            "missing no-scope-creep check"
+        );
+        // Explicit stop condition.
+        assert!(
+            p.to_lowercase().contains("stop"),
+            "missing an explicit stop condition"
+        );
+    }
+
     /// dirge-fmau — the memory-preamble injection path goes through
     /// the `MemoryProvider` trait, so a non-default backend's prompt
     /// block lands in the preamble too. Recording provider verifies
