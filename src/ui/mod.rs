@@ -3965,6 +3965,13 @@ pub async fn run_interactive(
         }
     }
 
+    // Session over (/quit, Ctrl+C/D, EOF). Kill any detached background
+    // shells — they run in their own process group and would otherwise
+    // survive dirge's exit, orphaning servers/watchers and their ports.
+    if let Some(store) = shell_store.as_ref() {
+        store.kill_all();
+    }
+
     Ok(())
 }
 

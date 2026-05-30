@@ -836,6 +836,9 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("warning: failed to save session: {}", e);
             }
         }
+        // Kill any detached background shells the run started so they don't
+        // outlive this headless process (they're in their own process group).
+        crate::agent::tools::bg_shell::global().kill_all();
     } else {
         #[cfg(feature = "loop")]
         if cli.loop_mode {
@@ -919,6 +922,7 @@ async fn main() -> anyhow::Result<()> {
                         // "flush buffered state" signal for plugin
                         // providers.
                         crate::agent::review::maybe_fire_session_end(&current_agent, &session);
+                        crate::agent::tools::bg_shell::global().kill_all();
                         return Ok(());
                     }
                     #[cfg(feature = "plugin")]

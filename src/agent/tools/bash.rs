@@ -244,6 +244,12 @@ async fn run_with_timeout(cmd: Command, secs: u64) -> Result<InterleavedOutput, 
 /// (the Claude-Code model — for dev servers / watchers); `Some(secs)`
 /// auto-kills after that long. The task records a terminal `ShellStatus`
 /// on the store when it ends.
+///
+/// Process-group cleanup is Unix-only (same as `run_with_timeout`): on
+/// Windows there's no `process_group`/`PgKillGuard`, so aborting the task
+/// signals only the immediate child via `kill_on_drop` — a backgrounded
+/// process's grandchildren can be orphaned. Background shells are an
+/// inherently Unix-oriented feature; Windows is best-effort.
 fn spawn_streaming_shell(
     cmd: Command,
     store: crate::agent::tools::bg_shell::BackgroundShellStore,
@@ -270,7 +276,7 @@ fn spawn_streaming_shell(
         };
         let pid = child.id();
         #[cfg(unix)]
-        let _pgguard = pid.map(PgKillGuard::new);
+        let mut pgguard = pid.map(PgKillGuard::new);
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -344,6 +350,16 @@ fn spawn_streaming_shell(
                 Err(e) => ShellStatus::Failed(e.to_string()),
             },
         };
+        // We only reach here when the task was NOT aborted: the process
+        // has already exited (natural) or been SIGKILLed (timeout). Disarm
+        // the guard so its Drop doesn't re-signal a now-reaped (possibly
+        // OS-recycled) process-group id — matching `run_with_timeout`. On
+        // abort (kill_shell / kill_all) we never get here, so the guard
+        // fires on drop and kills the group — which is how kill works.
+        #[cfg(unix)]
+        if let Some(g) = pgguard.as_mut() {
+            g.disarm();
+        }
         store.finish(&id, status);
     })
 }
@@ -419,7 +435,7 @@ impl Tool for BashTool {
                 "properties": {
                     "command": { "type": "string", "description": "Bash command to execute" },
                     "timeout": { "type": "integer", "description": "Timeout in seconds (optional; default 120, or 600 when background)" },
-                    "background": { "type": "boolean", "description": "Run detached: returns immediately with a shell id; the output is delivered automatically when the command finishes (do NOT poll). Use for long-running commands (builds, servers, watchers) so they don't block the turn. Killed at the timeout." }
+                    "background": { "type": "boolean", "description": "Run detached and unbounded: returns immediately with a shell id (does NOT block the turn). Use for long-running commands — dev servers, watch builds, tails. Read its accumulated output with the bash_output tool (pass the id; poll it to follow progress) and stop it with kill_shell (pass the id). Output is NOT auto-delivered. If `timeout` is set, the shell is auto-killed after that many seconds; otherwise it runs until it exits or you kill it." }
                 },
                 "required": ["command"]
             }),
@@ -757,8 +773,8 @@ mod tests {
     use super::*;
 
     /// End-to-end: `background: true` returns immediately with a shell id,
-    /// registers a `TaskKind::Shell` in the store, and delivers the
-    /// command's output via the store's completion path once it finishes.
+    /// registers the shell in the `BackgroundShellStore`, and streams the
+    /// command's output into the store's per-shell buffer as it runs.
     #[tokio::test]
     async fn background_bash_registers_shell_and_streams_output() {
         use crate::agent::tools::BashArgs;

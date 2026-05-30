@@ -135,11 +135,27 @@ impl BackgroundShellStore {
     }
 
     /// Register a freshly-started shell in `Running` state. Evicts the
-    /// oldest entry if at capacity.
+    /// oldest entry if at capacity — preferring the oldest TERMINAL entry,
+    /// and only evicting a still-running one as a last resort (aborting it
+    /// first so we never silently detach a live process group; dropping a
+    /// `JoinHandle` would otherwise leak it).
     pub fn register(&self, id: String, command: String) {
         let mut map = self.lock();
         if !map.contains_key(&id) && map.len() >= STORE_CAPACITY {
-            map.shift_remove_index(0);
+            // Prefer evicting the oldest finished shell.
+            let victim = map
+                .iter()
+                .find(|(_, e)| !e.status.is_running())
+                .map(|(id, _)| id.clone())
+                .or_else(|| map.keys().next().cloned());
+            if let Some(victim) = victim
+                && let Some(mut e) = map.shift_remove(&victim)
+                && let Some(h) = e.handle.take()
+            {
+                // Last-resort eviction of a running shell: abort its drain
+                // task so the process group is SIGKILLed, not orphaned.
+                h.abort();
+            }
         }
         map.insert(
             id,
@@ -442,6 +458,78 @@ mod tests {
         let (out, _) = s.read_new("a").unwrap();
         assert!(out.len() <= MAX_UNREAD_BYTES + 200, "len was {}", out.len());
         assert!(out.contains("exceeded the unread-buffer cap"));
+    }
+
+    #[tokio::test]
+    async fn eviction_aborts_an_evicted_running_shell() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let store = BackgroundShellStore::new();
+        let dropped = Arc::new(AtomicBool::new(false));
+
+        // Fill to capacity with running shells; the oldest (s0) carries a
+        // task whose Drop flips a flag, so we can prove eviction ABORTS it
+        // (drops its future) rather than silently detaching the handle.
+        for n in 0..STORE_CAPACITY {
+            let id = format!("s{n}");
+            store.register(id.clone(), "x".to_string());
+            if n == 0 {
+                let flag = dropped.clone();
+                let h = tokio::spawn(async move {
+                    struct G(Arc<AtomicBool>);
+                    impl Drop for G {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::SeqCst);
+                        }
+                    }
+                    let _g = G(flag);
+                    std::future::pending::<()>().await;
+                });
+                store.attach_handle(&id, h);
+            }
+        }
+
+        // Let s0's task actually start so its drop-guard is constructed
+        // (on a current-thread runtime a freshly-spawned task isn't polled
+        // until we yield).
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // One more → must evict s0 (all entries running, none terminal).
+        store.register("overflow".to_string(), "y".to_string());
+
+        // The evicted task's future should be dropped (aborted) soon.
+        for _ in 0..100 {
+            if dropped.load(Ordering::SeqCst) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "evicted running shell's drain task must be aborted, not detached"
+        );
+        assert!(
+            store.list().iter().all(|s| s.id != "s0"),
+            "evicted shell must be gone from the registry"
+        );
+    }
+
+    #[tokio::test]
+    async fn eviction_prefers_terminal_over_running() {
+        let store = BackgroundShellStore::new();
+        // s0 running (oldest), then a terminal one, then fill the rest.
+        store.register("s0".to_string(), "x".to_string());
+        store.register("term".to_string(), "x".to_string());
+        store.finish("term", ShellStatus::Exited(0));
+        for n in 1..(STORE_CAPACITY - 1) {
+            store.register(format!("s{n}"), "x".to_string());
+        }
+        // At capacity; overflow should evict the terminal entry, not s0.
+        store.register("overflow".to_string(), "x".to_string());
+        let ids: Vec<_> = store.list().into_iter().map(|s| s.id).collect();
+        assert!(ids.contains(&"s0".to_string()), "running s0 must survive");
+        assert!(!ids.contains(&"term".to_string()), "terminal entry evicted");
     }
 
     #[test]
