@@ -161,6 +161,16 @@ pub const SESSION_SEARCH_GUIDANCE: &str = "\n\n## Past-session recall\n\n\
 pub const DYNAMIC_TOOL_SEARCH_PROMPT: &str = "\
 Many tools are not loaded by default. Call `tool_search` with a query to discover and load relevant tools — they'll be available on the next turn. Always-on tools (write_todo_list, task_status) are shipped every turn and need no discovery.";
 
+/// DeepSeek-specific steering, appended to the preamble only for DeepSeek
+/// **chat** models (see `crate::agent::model_family`). Sourced from an
+/// editable markdown file embedded at compile time via `include_str!` so
+/// it ships with the binary regardless of the working directory and never
+/// appears as a selectable `/prompt` mode. Research-backed: structural
+/// (constraint-first) framing, Plan-Execute-Verify, an explicit
+/// success/never contract, and an anti tool-call-repetition rule — the
+/// dominant failure modes for DeepSeek in agentic loops.
+pub const DEEPSEEK_GUIDANCE: &str = include_str!("../../prompts/steering/deepseek.md");
+
 /// Distinctive delimiter wrapping untrusted reference material in the
 /// compaction prompt. Chosen to be visually unambiguous and very
 /// unlikely to appear in natural conversation content. Used both to

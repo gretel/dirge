@@ -2,9 +2,10 @@ use rig::agent::{Agent, AgentBuilder};
 use rig::completion::CompletionModel;
 use std::sync::Arc;
 
+use crate::agent::model_family::{ModelFamily, resolve_family};
 use crate::agent::prompt::{
-    MEMORY_GUIDANCE, PROJECT_SKILLS_PREAMBLE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
-    SYSTEM_PROMPT, TODO_TOOLS_PROMPT,
+    DEEPSEEK_GUIDANCE, MEMORY_GUIDANCE, PROJECT_SKILLS_PREAMBLE, SESSION_SEARCH_GUIDANCE,
+    SKILLS_GUIDANCE, SYSTEM_PROMPT, TODO_TOOLS_PROMPT,
 };
 use crate::agent::tools;
 use crate::agent::tools::ToolCache;
@@ -64,6 +65,22 @@ pub(crate) fn assemble_base_preamble() -> String {
     p.push_str(MEMORY_GUIDANCE);
     p.push_str(SESSION_SEARCH_GUIDANCE);
     p
+}
+
+/// Model-specific steering fragment to append to the preamble, if any.
+///
+/// Returns the DeepSeek guidance for DeepSeek **chat** models and `None`
+/// for everything else (other vendors, and the DeepSeek reasoner, which
+/// ignores the system prompt). Appended last by `build_agent_inner` so it
+/// sits closest to the conversation / action boundary — research shows
+/// rules stated far from the decision point lose influence in long
+/// tool-calling loops ("prompt-distance drift").
+pub(crate) fn model_steering_fragment(family: ModelFamily) -> Option<&'static str> {
+    if family.is_deepseek_chat() {
+        Some(DEEPSEEK_GUIDANCE)
+    } else {
+        None
+    }
 }
 
 /// Factory for the `SessionSearchTool` instance plumbed into both the
@@ -296,6 +313,15 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             .join("PLAN.md")
             .exists();
         append_mode_reminder(&mut preamble, prompt_name, plan_exists);
+    }
+
+    // Model-aware steering. DeepSeek chat models get a research-backed
+    // guidance fragment; appended last so it's nearest the action
+    // boundary, resisting prompt-distance drift. No-op for other models.
+    let family = resolve_family(&cli.resolve_provider(cfg), &cli.resolve_model(cfg));
+    if let Some(fragment) = model_steering_fragment(family) {
+        preamble.push_str("\n\n---\n\n");
+        preamble.push_str(fragment);
     }
 
     let mut builder = AgentBuilder::new(model).preamble(&preamble);
@@ -1094,6 +1120,36 @@ mod reminder_tests {
             assert!(p.contains("REVIEW mode"), "mode={mode}");
             assert!(p.contains("Identify bugs"), "mode={mode}");
         }
+    }
+
+    #[test]
+    fn deepseek_chat_gets_steering_fragment() {
+        let family = resolve_family("deepseek", "deepseek-v4-pro");
+        let frag = model_steering_fragment(family).expect("deepseek chat should get steering");
+        assert!(
+            frag.contains("Plan-Execute-Verify"),
+            "fragment should carry the research-backed guidance"
+        );
+        assert!(
+            frag.contains("re-issue the same call"),
+            "fragment should carry the anti-repetition rule"
+        );
+    }
+
+    #[test]
+    fn other_models_get_no_steering_fragment() {
+        assert!(model_steering_fragment(resolve_family("openai", "gpt-4o")).is_none());
+        assert!(
+            model_steering_fragment(resolve_family("anthropic", "claude-sonnet-4-6")).is_none()
+        );
+    }
+
+    #[test]
+    fn deepseek_reasoner_gets_no_steering_fragment() {
+        // R1 ignores the system prompt, so appending preamble guidance is
+        // pointless — the fragment is chat-only.
+        let family = resolve_family("deepseek", "deepseek-reasoner");
+        assert!(model_steering_fragment(family).is_none());
     }
 
     // Regression: the `code` reminder must only appear when PLAN.md exists.
