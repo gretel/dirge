@@ -216,9 +216,45 @@ tokio = { version = "1", features = ["test-util"] }
 # dep moved back to [dependencies].
 nucleo-matcher = "0.3"
 
+# Profiles tuned with cargo-wizard, then adjusted for dirge's constraints.
+#
+# `release` — the SHIPPED, size-optimized binary (cargo-wizard `min-size`,
+# which dirge already matched). NOTE: we deliberately do NOT set
+# `panic = "abort"` here even though min-size suggests it: the Janet plugin
+# worker relies on `std::panic::catch_unwind` (src/plugin/worker.rs) to
+# contain panics from unsafe FFI, and many background tokio tasks
+# (subagents, background shells) rely on a panicking task NOT aborting the
+# whole process. `panic = "abort"` would break both.
 [profile.release]
 opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
 debug = false
+
+# `dist` — opt for runtime SPEED over size (cargo-wizard `fast-runtime`),
+# for when you want the fastest binary and don't mind it being larger.
+# Build with `cargo build --profile dist`.
+#
+# Adjusted vs the raw template:
+#   - `panic = "unwind"` (template said "abort") — same plugin/​task-isolation
+#     reason as release above.
+#   - `strip = true` (template said "none") — keep the distributed binary lean.
+#   - We intentionally do NOT add `-Ctarget-cpu=native`: it would make the
+#     binary SIGILL on any CPU older than the build host. A user building
+#     for their OWN machine can add `RUSTFLAGS="-Ctarget-cpu=native"`.
+[profile.dist]
+inherits = "release"
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+debug = false
+panic = "unwind"
+
+# `dev` — fast iterate/test loop (cargo-wizard `fast-compile`). `debug = 0`
+# drops debuginfo generation for faster builds; pair with the linker /
+# split-debuginfo settings in `.cargo/config.toml`. If you need line numbers
+# in a dev backtrace, set `debug = "line-tables-only"`.
+[profile.dev]
+debug = 0
