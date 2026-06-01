@@ -67,8 +67,8 @@ use crate::shell;
 #[cfg(feature = "plugin")]
 use crate::ui::agent_io::render_plugin_entry;
 use crate::ui::agent_io::{
-    RENDER_FRAME, apply_subagent_panel_event, capture_partial_on_abort, persist_turn_to_db,
-    render_agent_stream, should_render_token,
+    RENDER_FRAME, apply_subagent_panel_event, capture_partial_on_abort, render_agent_stream,
+    should_render_token,
 };
 use crate::ui::chat_state::{ChatUiState, load_chat_ui_state, save_chat_ui_state};
 use crate::ui::colors::{c_agent, c_error, c_perm, c_tool, resolve_color};
@@ -2194,80 +2194,22 @@ pub async fn run_interactive(
                         ).await?;
                     }
                     AgentEvent::Error(e) => {
-                        was_reasoning = false;
-                        renderer.set_avatar_state(avatar::AvatarState::Error);
-                        #[cfg(feature = "experimental-ui-terminal-tab")]
-                        renderer.set_last_tool_name("");
-                        close_tool_chamber_if_open(&mut renderer, &mut last_tool_name, &mut tool_chamber_open)?;
-                        // dirge-ufe0: flush any trailing token the render
-                        // coalescer skipped (the Error event queued behind
-                        // the final tokens leaves them caught-up-but-
-                        // unpainted) before the error line is written, so
-                        // the streamed text stays on-screen above the error
-                        // (it is also persisted to the DB below).
-                        if !response_buf.is_empty() {
-                            render_agent_stream(
-                                &response_buf,
-                                &mut response_start_line,
-                                c_agent(),
-                                &mut renderer,
-                            )?;
-                            last_token_render = None;
-                        }
-                        let safe = sanitize_output(&e);
-                        renderer.write_line(&format!("error: {}", safe), c_error())?;
-
-                        // Persist partial turn (whatever was streamed before
-                        // the error) so it's searchable and the session has
-                        // a record of what went wrong.
-                        persist_turn_to_db(session, &last_user_prompt, &response_buf, &tool_calls_buf);
-
-                        #[cfg(feature = "plugin")]
-                        if let Some(pm) = plugin_manager {
-                            let mut mgr = pm.lock().unwrap_or_else(|err| err.into_inner());
-                            if let Err(dispatch_err) = mgr.dispatch(
-                                "on-error",
-                                &format!(
-                                    "@{{:error \"{}\"}}",
-                                    crate::plugin::escape_janet_string(&e)
-                                ),
-                            ) {
-                                renderer.write_line(
-                                    &format!("[plugin] on-error error: {dispatch_err}"),
-                                    c_error(),
-                                )?;
-                            }
-                        }
-
-                        is_running = false;
-                        if let Some(tx) = agent_cancel.take() {
-                            let _ = tx.try_send(());
-                        }
-                        if let Some(h) = agent_abort.take() { h.abort(); }
-                        agent_rx = None;
-                        agent_interject = None;
-                        agent_line_started = false;
-                        response_buf.clear();
-                        response_start_line = None;
-                        reasoning_buf.clear();
-                        reasoning_start_line = None;
-
-                        // Drop queued interjections — they were typed expecting
-                        // the running turn to succeed; replaying them blindly
-                        // after an error (e.g. context-length) would just
-                        // re-trigger it.
-                        let dropped = interjection_queue.lock().unwrap().len();
-                        interjection_queue.lock().unwrap().clear();
-                        if dropped > 0 {
-                            renderer.write_line(
-                                &format!(
-                                    "{} queued message{} dropped due to error",
-                                    dropped,
-                                    if dropped == 1 { "" } else { "s" }
-                                ),
-                                c_error(),
-                            )?;
-                        }
+                        let mut ctx = make_run_ctx!();
+                        run_handlers::handle_error(
+                            &mut ctx,
+                            e,
+                            &mut was_reasoning,
+                            &mut is_running,
+                            &mut last_token_render,
+                            &mut agent_rx,
+                            &mut agent_abort,
+                            &mut agent_interject,
+                            &mut agent_cancel,
+                            &interjection_queue,
+                            #[cfg(feature = "plugin")]
+                            plugin_manager,
+                        )
+                        .await?;
                     }
                     AgentEvent::TurnStart { index } => {
                         #[cfg(feature = "plugin")]

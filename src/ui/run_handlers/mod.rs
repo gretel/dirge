@@ -18,6 +18,7 @@ use crate::ui::tool_display::CollapsedToolResult;
 
 pub(super) mod context_overflow;
 pub(super) mod done;
+pub(super) mod error;
 pub(super) mod interjected;
 pub(super) mod notices;
 pub(super) mod tool_result;
@@ -31,6 +32,7 @@ mod dirge_5h5_repro;
 
 pub(super) use context_overflow::handle_context_overflow;
 pub(super) use done::handle_done;
+pub(super) use error::handle_error;
 pub(super) use interjected::handle_interjected;
 pub(super) use tool_result::handle_tool_result;
 
