@@ -86,8 +86,7 @@ use crate::ui::slash::{handle_compress, handle_slash};
 use crate::ui::status::StatusLine;
 use crate::ui::terminal::TerminalGuard;
 use crate::ui::text_output::{
-    sanitize_single_line, strip_leading_system_reminder, with_queue, write_system_lines,
-    write_user_lines,
+    sanitize_single_line, strip_leading_system_reminder, with_queue, write_user_lines,
 };
 use tool_display::*;
 
@@ -2485,91 +2484,41 @@ pub async fn run_interactive(
                         )?;
                     }
                     AgentEvent::UserMessage { content } => {
-                        // The agent loop emits the literal prompt that
-                        // went to the LLM, which may have a
-                        // `<system-reminder>…</system-reminder>` block
-                        // prepended (from `prepend_pending_notifications`
-                        // when background tasks have just completed —
-                        // see src/agent/tools/background.rs:300). The
-                        // user's view should NOT show that wrapper —
-                        // they just see their own text and any visible
-                        // background-task notice the UI rendered
-                        // separately. Strip the leading reminder block
-                        // (and its trailing blank line) before
-                        // rendering. The on-disk session already stores
-                        // the clean `text` via the submit-path's
-                        // `session.add_message(User, &text)` call.
-                        let visible =
-                            strip_leading_system_reminder(&content);
-                        write_user_lines(&mut renderer, visible)?;
-                        renderer.write_line("", Color::White)?;
-                        // session.add_message handled at input time (line ~2119)
+                        run_handlers::notices::handle_user_message(&mut renderer, &content)?;
+                        // session.add_message handled at input time.
                     }
                     AgentEvent::EscalationActivated { provider, reason } => {
-                        // Phase 4 part 1: surface the dual-client
-                        // model swap as a single dim status line so
-                        // the user sees the unexpected provider
-                        // takeover (see docs/AGENTIC_LOOP_PLAN.md
-                        // "Risk + sequencing notes").
-                        let summary = reason.summary();
-                        renderer.write_line(
-                            &format!("  ↑ escalating to {provider} (next turn): {summary}"),
-                            theme::dim(),
+                        run_handlers::notices::handle_escalation_activated(
+                            &mut renderer,
+                            &provider,
+                            &reason,
                         )?;
                     }
                     AgentEvent::SystemNotice { content } => {
-                        // dirge-originated log line (e.g. the max-agent-turns
-                        // cap). Render as `<system>` in the warning color so
-                        // it's visibly distinct from the user's own `<you>`
-                        // messages and from agent output.
-                        write_system_lines(&mut renderer, &content)?;
-                        renderer.write_line("", Color::White)?;
+                        run_handlers::notices::handle_system_notice(&mut renderer, &content)?;
                     }
                     AgentEvent::RetryNotice {
                         attempt,
                         delay_ms,
                         error: _error,
                     } => {
-                        // PROV-2: surface a temporary banner so the
-                        // user isn't staring at silence during backoff.
+                        // `error` is intentionally unrendered today; bind +
+                        // discard so the field still counts as read (keeps
+                        // dead_code quiet under `-D warnings`).
                         let _ = _error;
-                        renderer.write_line(
-                            &format!(
-                                "  ⟳ retry {attempt} ({delay_ms}ms)…",
-                            ),
-                            theme::dim(),
+                        run_handlers::notices::handle_retry_notice(
+                            &mut renderer,
+                            attempt,
+                            delay_ms,
                         )?;
                     }
                     AgentEvent::RepairStats { snapshot } => {
-                        // Phase-1 telemetry. Only emitted when a
-                        // repair fired or an input was invalid,
-                        // so we don't need an `is_empty()` guard
-                        // here — but include it defensively.
+                        // Empty snapshots `continue` to skip the trailing
+                        // status redraw (defensive — they aren't emitted).
                         if snapshot.is_empty() {
                             continue;
                         }
-                        let mut parts: Vec<String> = Vec::new();
-                        if snapshot.md_link_unwrapped > 0 {
-                            parts.push(format!("{} md-link", snapshot.md_link_unwrapped));
-                        }
-                        if snapshot.null_stripped > 0 {
-                            parts.push(format!("{} null-strip", snapshot.null_stripped));
-                        }
-                        if snapshot.json_string_to_array > 0 {
-                            parts.push(format!("{} json-array", snapshot.json_string_to_array));
-                        }
-                        if snapshot.object_to_array > 0 {
-                            parts.push(format!("{} obj-to-array", snapshot.object_to_array));
-                        }
-                        if snapshot.bare_string_to_array > 0 {
-                            parts.push(format!("{} bare-to-array", snapshot.bare_string_to_array));
-                        }
-                        let total = snapshot.total_successful();
-                        let mut line = format!("  ⊕ repaired {total} input(s): {}", parts.join(", "));
-                        if snapshot.invalid > 0 {
-                            line.push_str(&format!("; {} invalid", snapshot.invalid));
-                        }
-                        renderer.write_line(&line, theme::dim())?;
+                        run_handlers::notices::handle_repair_stats(&mut renderer, &snapshot)?;
                     }
                 }
                 renderer.draw_bottom(
