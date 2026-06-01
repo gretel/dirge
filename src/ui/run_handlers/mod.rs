@@ -28,6 +28,7 @@ use crate::extras::mcp::McpClientManager;
 #[cfg(feature = "semantic")]
 use crate::semantic::SemanticManager;
 
+pub(super) mod context_compacted;
 pub(super) mod context_overflow;
 pub(super) mod done;
 pub(super) mod error;
@@ -42,6 +43,7 @@ pub(super) mod tool_result;
 #[cfg(test)]
 mod dirge_5h5_repro;
 
+pub(super) use context_compacted::handle_context_compacted;
 pub(super) use context_overflow::handle_context_overflow;
 pub(super) use done::handle_done;
 pub(super) use error::handle_error;

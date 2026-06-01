@@ -2302,7 +2302,9 @@ pub async fn run_interactive(
                     } => {
                         // IMPROVEMENTS_PLAN #5: surface what the pass did
                         // (prune-only / +summary / +failed-summary) so a
-                        // failing summarizer is visible in the logs.
+                        // failing summarizer is visible in the logs. Kept
+                        // inline because the handler doesn't need the
+                        // compaction_kind / summary_model fields.
                         tracing::debug!(
                             target: "dirge::ui::compaction",
                             kind = ?compaction_kind,
@@ -2311,118 +2313,19 @@ pub async fn run_interactive(
                             tokens_after,
                             "context compacted",
                         );
-                        // Persist session rotation to DB: end the old session
-                        // with reason "compression", insert the new session.
-                        let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-                        let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
-                        if let Ok(db) = crate::extras::session_db::SessionDb::open(
-                            &paths.session_db_path(),
-                        ) {
-                            let old_sid = format!(
-                                "dirge-{}",
-                                session
-                                    .id
-                                    .as_str()
-                                    .chars()
-                                    .take(8)
-                                    .collect::<String>()
-                            );
-                            let _ = db.end_session(&old_sid, "compression");
-                            let now = chrono::Utc::now().to_rfc3339();
-                            let _ = db.insert_session(
-                                new_session_id,
-                                "cli",
-                                &session.model,
-                                &session.provider,
-                                &now,
-                            );
-                            let _ = db.set_parent_session(new_session_id, &old_sid);
-                        }
-                        // SESS-2 follow-up #1: mutate the in-memory
-                        // Session to match the rotation and push a
-                        // Compaction entry, then persist to disk.
-                        // Without this the on-disk session file kept
-                        // the OLD id and the compaction was lost on
-                        // next resume. Mirrors Hermes
-                        // conversation_compression.py lines 380-397.
-                        let token_savings =
-                            tokens_before.saturating_sub(tokens_after);
-                        if !summary.is_empty() {
-                            session.compress_reporting(
-                                summary.to_string(),
-                                first_kept_index,
-                                token_savings,
-                            );
-                        }
-                        // dirge-hs61: capture the outgoing id, do
-                        // ALL the mutations (id rotation + disk
-                        // save), THEN fire the on_session_switch
-                        // hook. Pre-fix the hook fired in the
-                        // middle: DB rotated, messages drained, but
-                        // on-disk JSON still had the old id —
-                        // providers querying either store saw
-                        // inconsistent triple state.
-                        let parent_id = session.id.to_string();
-                        session.id = compact_str::CompactString::new(
-                            new_session_id.as_str(),
-                        );
-                        if let Err(e) =
-                            crate::session::storage::save_session(session)
-                        {
-                            tracing::warn!(
-                                target: "dirge::ui",
-                                error = %e,
-                                "could not persist rotated session after compaction",
-                            );
-                        }
-                        // dirge-g72y: rebuild the agent so
-                        // SessionSearchTool picks up the new id.
-                        // Pre-fix the tool was constructed with the
-                        // pre-rotation id and silently excluded the
-                        // wrong session — same bug class as the
-                        // dirge-502b regression that cmd_session.rs
-                        // already handles by rebuilding on swap.
-                        let model = client.completion_model(session.model.to_string());
-                        agent = crate::provider::build_agent(
-                            model,
-                            cli,
-                            cfg,
+                        let mut ctx = make_run_ctx!();
+                        run_handlers::handle_context_compacted(
+                            &mut ctx,
+                            &make_agent_build_deps!(),
+                            &mut agent,
                             context,
-                            permission.clone(),
-                            ask_tx.clone(),
-                            question_tx.clone(),
-                            plan_tx.clone(),
-                            bg_store.clone(),
-                            #[cfg(feature = "lsp")]
-                            lsp_manager.clone(),
-                            sandbox.clone(),
-                            #[cfg(feature = "mcp")]
-                            mcp_manager.as_ref(),
-                            #[cfg(feature = "semantic")]
-                            semantic_manager,
-                            Some(session.id.to_string()),
-                        )
-                        .await;
-                        // dirge-5gn6: fire on_session_switch only AFTER
-                        // everything is consistent: id rotated in
-                        // memory, JSON saved to disk under new id,
-                        // agent rebuilt. Providers can now query DB
-                        // or disk and see a coherent snapshot.
-                        // `reset=false` — compaction continues the
-                        // logical conversation.
-                        crate::agent::review::maybe_fire_session_switch(
-                            &agent,
                             new_session_id,
-                            &parent_id,
-                            /* reset = */ false,
-                        );
-                        renderer.write_line(
-                            &format!(
-                                "  context compacted: {} → {} tokens (session {})",
-                                tokens_before, tokens_after, new_session_id
-                            ),
-                            Color::DarkGrey,
-                        )?;
+                            tokens_before,
+                            tokens_after,
+                            summary,
+                            first_kept_index,
+                        )
+                        .await?;
                     }
                     AgentEvent::UserMessage { content } => {
                         run_handlers::notices::handle_user_message(&mut renderer, &content)?;
