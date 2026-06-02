@@ -99,8 +99,8 @@ impl Theme {
     ///     the loud warm signals (error/perm) and the agent's answer are
     ///     brightest; supporting detail (tool output, system/thinking
     ///     notes) is muted; chrome (dim/divider) barely registers.
-    /// Saturation stays low everywhere EXCEPT the warm urgency signals,
-    /// which keep their vividness so they pop off the green/cyan field.
+    ///     Saturation stays low everywhere EXCEPT the warm urgency signals,
+    ///     which keep their vividness so they pop off the green/cyan field.
     pub const fn phosphor() -> Self {
         Theme {
             // GREEN — the agent's prose. Focal point; brightest content color.

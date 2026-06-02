@@ -16,6 +16,7 @@ use crate::context::ContextFiles;
 use crate::provider::AnyAgent;
 use crate::ui::run_handlers::{AgentBuildDeps, RunCtx};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_context_compacted(
     ctx: &mut RunCtx<'_>,
     deps: &AgentBuildDeps<'_>,

@@ -999,6 +999,11 @@ fn worker_loop(
             env.add_c_fn(CFunOptions::new(c"__lsp", janet_lsp_cfn).namespace(c"harness"));
             env.add_c_fn(CFunOptions::new(c"__lsp-live", janet_lsp_live_cfn).namespace(c"harness"));
         }
+        // Register DAP C functions when both features are enabled.
+        #[cfg(feature = "dap")]
+        {
+            crate::dap::janet_bindings::register_dap_cfns(&mut client);
+        }
     }
 
     if let Err(e) = client.run(HARNESS_INIT) {
@@ -1019,6 +1024,35 @@ fn worker_loop(
     if let Err(e) = client.run(HARNESS_SANDBOX) {
         let _ = init_tx.send(Err(format!("harness sandbox init failed: {e}")));
         return;
+    }
+
+    // Run the DAP Janet bindings prelude when the dap feature is enabled.
+    // This defines (dap/launch ...), (dap/step), etc. as wrappers over
+    // the C functions registered above. Plugins can call these directly.
+    // DAP bridge: stores channel before init completes; the Janet
+    // thread consumes it in set_ce_fn. Must precede dap init so plugins
+    // that invoke dap/ functions during their own setup don't hit NPE.
+    #[cfg(feature = "dap")]
+    {
+        // Note: the DAP bridge is already spawned by spawn_dap_responder()
+        // in main.rs (from a tokio runtime). In test context there is no
+        // main.rs, so the bridge was never spawned and take_dap_tx_for_worker
+        // returns None. In that case we skip the Janet prelude and bridge
+        // install — plugins will see (dap/available?) == false.
+        // Run Janet init that binds dap/ C fns.
+        // Must run AFTER harness-sandbox so overridden fns that touch
+        // DAP internals can't be shadowed.
+        if let Err(e) = client.run(crate::dap::janet_bindings::HARNESS_DAP_INIT) {
+            let _ = init_tx.send(Err(format!("dap init failed: {e}")));
+            return;
+        }
+        // Install the bridge sender on the Janet thread so C-fns can
+        // reach the tokio worker. Must happen here, inside the worker,
+        // because `store_dap_tx` already primed the channel from the
+        // plugin-manager side.
+        if let Some(dap_tx) = crate::dap::janet_bindings::take_dap_tx_for_worker() {
+            crate::dap::janet_bindings::install_dap_tx(dap_tx);
+        }
     }
 
     let _ = init_tx.send(Ok(()));

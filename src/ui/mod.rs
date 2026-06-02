@@ -125,7 +125,7 @@ use tool_display::*;
 // config, session, context, hooks, plugin manager, …) is threaded in
 // explicitly so the TUI loop owns no globals. Refactoring into a
 // context struct is tracked separately; silence the lint.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn run_interactive(
     client: AnyClient,
     mut agent: AnyAgent,
@@ -463,6 +463,14 @@ pub async fn run_interactive(
         #[cfg(feature = "lsp")]
         lsp_manager.as_ref(),
     ));
+    #[cfg(feature = "dap")]
+    {
+        let debug_data = crate::dap::session::DAP_MANAGER
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|m| m.debug_snapshot()));
+        renderer.set_debug_panel_data(debug_data);
+    }
 
     // ui-redesign: seed the left-panel [AGENT STATUS] card with the
     // current session's metadata so the idle state has a real
@@ -570,6 +578,14 @@ pub async fn run_interactive(
             #[cfg(feature = "lsp")]
             lsp_manager.as_ref(),
         ));
+        #[cfg(feature = "dap")]
+        {
+            let debug_data = crate::dap::session::DAP_MANAGER
+                .lock()
+                .ok()
+                .and_then(|g| g.as_ref().and_then(|m| m.debug_snapshot()));
+            renderer.set_debug_panel_data(debug_data);
+        }
         // Refresh the left-panel vitals (context gauge, activity ticker,
         // git snapshot) alongside the right panel.
         {

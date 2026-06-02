@@ -76,6 +76,17 @@ pub fn spawn_lsp_responder(
     })
 }
 
+/// Spawn the DAP Janet-bridge task and store its sender so the Janet
+/// worker thread can pick it up. The bridge receives [`DapCommand`]s
+/// from Janet C functions and runs the corresponding async
+/// `DapSessionManager` methods on the tokio runtime.
+#[cfg(all(feature = "plugin", feature = "dap"))]
+pub fn spawn_dap_responder() -> tokio::task::JoinHandle<()> {
+    let (handle, tx) = crate::dap::janet_bindings::spawn_dap_bridge();
+    crate::dap::janet_bindings::store_dap_tx(tx);
+    handle
+}
+
 /// Escape a Rust string so it can be safely embedded inside a Janet
 /// double-quoted string literal. Janet's parser accepts the standard
 /// `\"`, `\\`, `\n`, `\r`, `\t` escapes, so we normalise all of those

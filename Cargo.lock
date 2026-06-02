@@ -722,6 +722,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "dap"
+version = "0.4.1-alpha1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "35c7fc89d334ab745ba679f94c7314c9b17ecdcd923c111df6206e9fd7729fa9"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "darling"
 version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -857,6 +868,7 @@ dependencies = [
  "clap",
  "compact_str",
  "crossterm",
+ "dap",
  "dirs",
  "futures",
  "html2text",
@@ -900,6 +912,7 @@ dependencies = [
  "tree-sitter-typescript",
  "unicode-width",
  "uuid",
+ "which",
  "yaml-rust2",
 ]
 
@@ -4528,6 +4541,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "which"
+version = "8.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81995fafaaaf6ae47a7d0cc83c67caf92aeb7e5331650ae6ff856f7c0c60c459"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

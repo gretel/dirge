@@ -3,6 +3,8 @@ pub(crate) mod background;
 mod bash;
 pub(crate) mod bg_shell;
 pub(crate) mod cache;
+#[cfg(feature = "dap")]
+pub(crate) mod debug;
 pub(crate) mod edit;
 mod find_files;
 mod glob;
@@ -33,6 +35,8 @@ pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
 pub use bg_shell::{BashOutputTool, KillShellTool};
 pub use cache::ToolCache;
+#[cfg(feature = "dap")]
+pub use debug::DebugTool;
 pub use edit::EditTool;
 pub use find_files::FindFilesTool;
 pub use glob::GlobTool;
@@ -97,6 +101,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "webfetch",
     "websearch",
     "lsp",
+    "debug",
     "repo_overview",
     "session_search",
     "list_symbols",

@@ -18,7 +18,9 @@ use super::chat::{ChatPane, crossterm_to_ratatui};
 use super::frame::{ChatBotFrame, TopFrame};
 use super::layout::Layout;
 use super::panels::{LeftPanel, RightPanel};
-use crate::ui::renderer::{LeftPanelInfo, LineEntry, PanelData, SelectionRange, SubagentStatusRow};
+use crate::ui::renderer::{
+    LeftPanelInfo, LineEntry, PanelData, PanelMode, SelectionRange, SubagentStatusRow,
+};
 
 #[allow(unused_imports)] // RColor stays in scope for the doctest example.
 use ratatui::style::Color as _RColor;
@@ -39,6 +41,13 @@ pub struct Scene<'a> {
     pub chat_selection: Option<SelectionRange>,
     /// Right panel data (MCP, LSP, TODOS, MODIFIED, sysload).
     pub panel_data: &'a PanelData,
+    /// Debug panel data. When `right_panel_mode` is `Debug` and this is
+    /// `Some`, the right panel shows debug info instead of system info.
+    #[cfg(feature = "dap")]
+    pub debug_panel_data: Option<&'a crate::dap::types::DebugPanelData>,
+    /// Current right-panel mode — determines whether to show the debug panel
+    /// or the normal system-info panel on the right side.
+    pub right_panel_mode: PanelMode,
     /// dirge-b11: how many entries to skip from the *top* of the
     /// MODIFIED list (most-recent-first). Carried in Scene so the
     /// renderer can paint the scrolled view; persisted across
@@ -99,6 +108,25 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
 
     // Right panel — stacked sub-panels. Skip on narrow terminals.
     if scene.show_right_panel && layout.right_panel.width >= 16 {
+        #[allow(unused_variables)]
+        let is_debug = scene.right_panel_mode == PanelMode::Debug;
+        #[cfg(feature = "dap")]
+        if is_debug {
+            if let Some(dbg_data) = scene.debug_panel_data {
+                use super::panels::debug::DebugRightPanel;
+                f.render_widget(DebugRightPanel::new(dbg_data), layout.right_panel);
+            }
+        }
+        // Render normal right panel only when NOT in debug mode (or when
+        // dap feature is off).
+        #[cfg(feature = "dap")]
+        if !is_debug || scene.debug_panel_data.is_none() {
+            f.render_widget(
+                RightPanel::new(scene.panel_data).modified_offset(scene.modified_offset),
+                layout.right_panel,
+            );
+        }
+        #[cfg(not(feature = "dap"))]
         f.render_widget(
             RightPanel::new(scene.panel_data)
                 .border_style(frame_style)
@@ -184,6 +212,9 @@ pub fn empty_scene<'a>(
         input_rows: 1,
         chat_selection: None,
         panel_data,
+        #[cfg(feature = "dap")]
+        debug_panel_data: None,
+        right_panel_mode: PanelMode::Auto,
         modified_offset: 0,
         left_info,
         subagents,
@@ -289,6 +320,9 @@ mod tests {
             input_rows: 4,
             chat_selection: None,
             panel_data: &pd,
+            #[cfg(feature = "dap")]
+            debug_panel_data: None,
+            right_panel_mode: PanelMode::Auto,
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,
@@ -470,6 +504,9 @@ mod tests {
             input_rows: 1,
             chat_selection: None,
             panel_data: &pd,
+            #[cfg(feature = "dap")]
+            debug_panel_data: None,
+            right_panel_mode: PanelMode::Auto,
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,
@@ -497,6 +534,9 @@ mod tests {
             input_rows: 1,
             chat_selection: None,
             panel_data: &pd,
+            #[cfg(feature = "dap")]
+            debug_panel_data: None,
+            right_panel_mode: PanelMode::Auto,
             modified_offset: 0,
             left_info: &info,
             subagents: &subs,

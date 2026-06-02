@@ -168,6 +168,9 @@ pub enum PanelMode {
     On,
     /// Force panel off regardless of width.
     Off,
+    /// Show debug panel instead of system info (gated on ≥100 cols).
+    /// Only meaningful when a DAP session is active.
+    Debug,
 }
 
 /// Which side panels a `/display` spec (or the `display` config value)
@@ -325,6 +328,10 @@ pub struct Renderer {
     /// ui-redesign: idle-state info for the left panel. Painted when
     /// `subagent_status` is empty so the gutter never looks dead.
     left_panel_info: LeftPanelInfo,
+    /// DAP debug panel snapshot — updated each UI tick when a
+    /// DAP session is active and panel mode is Debug.
+    #[cfg(feature = "dap")]
+    debug_panel_data: Option<crate::dap::types::DebugPanelData>,
     /// ui-redesign Phase 6: when set, `draw_bottom` paints these
     /// lines inside the bottom frame INSTEAD of the input editor.
     /// Used by permission prompts and questionnaire prompts so the
@@ -438,6 +445,8 @@ impl Renderer {
             panel_data: PanelData::default(),
             subagent_status: Vec::new(),
             left_panel_info: LeftPanelInfo::default(),
+            #[cfg(feature = "dap")]
+            debug_panel_data: None,
             alert_overlay: None,
             alert_title: String::new(),
             avatar_state: crate::ui::avatar::AvatarState::Idle,
@@ -523,6 +532,7 @@ impl Renderer {
             selection_active,
             selection_start,
             selection_end,
+            right_panel_mode,
             ..
         } = self;
 
@@ -667,6 +677,9 @@ impl Renderer {
             show_left_panel,
             show_right_panel,
             frame_color,
+            right_panel_mode: *right_panel_mode,
+            #[cfg(feature = "dap")]
+            debug_panel_data: self.debug_panel_data.as_ref(),
         };
 
         // Wrap the draw in Begin/EndSynchronizedUpdate. Modern
@@ -900,6 +913,11 @@ impl Renderer {
         self.right_panel_mode = mode;
     }
 
+    /// Set only the right panel mode (used by `/panel debug`).
+    pub fn set_right_panel_mode(&mut self, mode: PanelMode) {
+        self.right_panel_mode = mode;
+    }
+
     /// Apply a parsed `/display` selection (or the `display` config
     /// value): each listed side panel is forced on, each omitted one
     /// forced off — an explicit user choice, so `On`/`Off` rather than
@@ -921,6 +939,10 @@ impl Renderer {
         self.left_panel_mode
     }
 
+    pub fn right_panel_mode(&self) -> PanelMode {
+        self.right_panel_mode
+    }
+
     /// dirge-gek: replace the subagent panel data. UI loop calls this
     /// on each subagent lifecycle event (Spawn / Complete / Failed)
     /// and on Ctrl-N/P chat switch so the panel reflects current
@@ -936,6 +958,20 @@ impl Renderer {
     /// gutter stays current.
     pub fn set_left_panel_info(&mut self, info: LeftPanelInfo) {
         self.left_panel_info = info;
+    }
+
+    /// Update the DAP debug panel snapshot. Called each UI tick
+    /// when the DAP feature is enabled. When a debug session becomes
+    /// active (data transitions from None to Some), auto-switches
+    /// the right panel to Debug mode so the user sees the session
+    /// state without needing /panel debug or /debug panel.
+    #[cfg(feature = "dap")]
+    pub fn set_debug_panel_data(&mut self, data: Option<crate::dap::types::DebugPanelData>) {
+        let was_active = self.debug_panel_data.is_some();
+        self.debug_panel_data = data;
+        if !was_active && self.debug_panel_data.is_some() {
+            self.right_panel_mode = PanelMode::Debug;
+        }
     }
 
     /// ui-redesign Phase 6: set the alert overlay. While `Some`, the
@@ -1013,6 +1049,7 @@ impl Renderer {
             PanelMode::Off => false,
             PanelMode::On => self.content_indent() >= 15,
             PanelMode::Auto => cols >= PANEL_AUTO_MIN_COLS && self.content_indent() >= 15,
+            PanelMode::Debug => cols >= PANEL_AUTO_MIN_COLS && self.content_indent() >= 15,
         }
     }
 
@@ -1651,7 +1688,7 @@ pub(crate) fn wrap_input(
 
         if li == cursor_line_idx {
             let col = cursor_display_col;
-            let (vr, vc) = if col > 0 && col == display_width && col.is_multiple_of(wrap_width) {
+            let (vr, vc) = if col > 0 && col == display_width && col % wrap_width == 0 {
                 // End of a line that exactly fills the last row — stay on
                 // the filled row, position cursor past its last char.
                 (col / wrap_width - 1, wrap_width)

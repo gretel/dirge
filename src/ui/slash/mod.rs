@@ -18,6 +18,8 @@ use crate::ui::input::InputEditor;
 use crate::ui::renderer::Renderer;
 use crate::ui::theme;
 
+#[cfg(feature = "dap")]
+mod cmd_debug;
 mod cmd_misc;
 mod cmd_model;
 mod cmd_session;
@@ -487,6 +489,8 @@ pub async fn handle_slash(
         "/why" => cmd_misc::cmd_why(&mut ctx, &parts).await?,
         "/help" => cmd_misc::cmd_help(&mut ctx).await?,
         "/kill" => cmd_misc::cmd_kill(&mut ctx, &parts).await?,
+        #[cfg(feature = "dap")]
+        "/debug" => cmd_debug::cmd_debug(&mut ctx, &parts).await?,
         _ => {
             // If `slash_command_names()` advertised this command
             // but no match arm above caught it, the lists drifted
@@ -705,6 +709,8 @@ pub fn slash_command_names() -> Vec<&'static str> {
     cmds.push("/mcp");
     #[cfg(feature = "loop")]
     cmds.push("/loop");
+    #[cfg(feature = "dap")]
+    cmds.push("/debug");
     cmds.sort_unstable();
     cmds
 }

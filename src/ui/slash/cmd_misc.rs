@@ -199,28 +199,35 @@ pub(super) async fn cmd_panel(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         "on" => Some(PanelMode::On),
         "off" => Some(PanelMode::Off),
         "auto" => Some(PanelMode::Auto),
+        "debug" => Some(PanelMode::Debug),
         other => {
             ctx.renderer.write_line(
-                &format!("unknown /panel mode '{}' (use on|off|auto)", other),
+                &format!("unknown /panel mode '{}' (use on|off|auto|debug)", other),
                 c_error(),
             )?;
             return Ok(());
         }
     };
     if let Some(mode) = new_mode {
-        ctx.renderer.set_panel_mode(mode);
+        if mode == PanelMode::Debug {
+            ctx.renderer.set_right_panel_mode(mode);
+        } else {
+            ctx.renderer.set_panel_mode(mode);
+        }
         ctx.renderer.render_viewport()?;
     }
-    // Both sides share a mode after /panel; report the left as the
-    // representative. For per-side control, see /display.
-    let current = ctx.renderer.left_panel_mode();
+    // Report both sides independently since they're independently
+    // controlled (e.g. /panel debug only affects the right).
+    let left_mode = ctx.renderer.left_panel_mode();
+    let right_mode = ctx.renderer.right_panel_mode();
     let left = ctx.renderer.left_panel_visible();
     let right = ctx.renderer.right_panel_visible();
     ctx.renderer.write_line(
         &format!(
-            "panel mode: {:?} (left {}, right {}). Use /display for per-pane control.",
-            current,
+            "left panel: {:?} ({})  right panel: {:?} ({}). Use /display for per-pane control.",
+            left_mode,
             if left { "shown" } else { "hidden" },
+            right_mode,
             if right { "shown" } else { "hidden" },
         ),
         c_agent(),
@@ -618,7 +625,7 @@ pub(super) async fn cmd_help(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
         c_result(),
     )?;
     renderer.write_line(
-        "  /panel [on|off|auto]   toggle both side panels together",
+        "  /panel [on|off|auto|debug]   toggle right-hand info panel",
         c_result(),
     )?;
     renderer.write_line(
@@ -716,6 +723,34 @@ pub(super) async fn cmd_help(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
     renderer.write_line("  /quit                  exit dirge", c_result())?;
     renderer.write_line("  /help                  show this message", c_result())?;
     renderer.write_line("", c_agent())?;
+    #[cfg(feature = "dap")]
+    {
+        let _ = renderer.write_line("debug commands:", c_agent());
+        let _ = renderer.write_line(
+            "  /debug launch <file>   start debugging a program",
+            c_result(),
+        );
+        let _ = renderer.write_line(
+            "  /debug attach <pid>    attach to a running process",
+            c_result(),
+        );
+        let _ = renderer.write_line("  /debug bp <file> <ln>  set a breakpoint", c_result());
+        let _ = renderer.write_line("  /debug step | step_in | step_out | continue", c_result());
+        let _ = renderer.write_line(
+            "  /debug evaluate <expr> evaluate an expression",
+            c_result(),
+        );
+        let _ = renderer.write_line(
+            "  /debug sessions        show active debug session",
+            c_result(),
+        );
+        let _ = renderer.write_line("  /debug terminate       end debug session", c_result());
+        let _ = renderer.write_line(
+            "  /debug panel           show debug panel on right",
+            c_result(),
+        );
+        let _ = renderer.write_line("", c_agent());
+    }
     renderer.write_line("keys:", c_agent())?;
     renderer.write_line("  PgUp/PgDn / wheel      scroll chat history", c_result())?;
     renderer.write_line("  Home/End               jump to top/bottom", c_result())?;

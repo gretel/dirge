@@ -47,6 +47,7 @@ impl<'a> SubPanel<'a> {
         self
     }
 
+    #[allow(dead_code)]
     pub fn border_style(mut self, style: Style) -> Self {
         self.border_style = style;
         self
@@ -444,6 +445,7 @@ impl<'a> RightPanel<'a> {
     /// main chat frame's color (the theme header tone). Default is
     /// green to match the phosphor preset. Body text keeps its own
     /// semantic colors (amber SYSTEM data, dim placeholders).
+    #[allow(dead_code)]
     pub fn border_style(mut self, style: Style) -> Self {
         self.style = style;
         self
@@ -645,6 +647,191 @@ impl<'a> Widget for RightPanel<'a> {
                 p = p.line(footer, dim);
             }
             p.render(rect, buf);
+        }
+    }
+}
+
+#[cfg(feature = "dap")]
+pub mod debug {
+    //! Debug panel widget — renders DAP session state.
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color as RColor, Style};
+    use ratatui::widgets::Widget;
+
+    use crate::dap::types::*;
+
+    use super::SubPanel;
+
+    const AMBER: RColor = RColor::Rgb(255, 191, 0);
+    const RIGHT_PANEL_TOP_PAD: u16 = 1;
+    const RIGHT_PANEL_TRAILING_PAD: u16 = 1;
+
+    /// Right panel widget that shows DAP debug session state.
+    pub struct DebugRightPanel<'a> {
+        data: &'a DebugPanelData,
+        style: Style,
+    }
+
+    impl<'a> DebugRightPanel<'a> {
+        pub fn new(data: &'a DebugPanelData) -> Self {
+            Self {
+                data,
+                style: Style::default().fg(RColor::Green),
+            }
+        }
+    }
+
+    impl<'a> Widget for DebugRightPanel<'a> {
+        fn render(self, area: Rect, buf: &mut Buffer) {
+            if area.width == 0 || area.height == 0 {
+                return;
+            }
+
+            let dim = RColor::DarkGray;
+            let body_color = AMBER;
+
+            let mut y = area.y + RIGHT_PANEL_TOP_PAD;
+            let inner_w = area.width.saturating_sub(RIGHT_PANEL_TRAILING_PAD);
+
+            let summary = self.data.session_summary.as_ref();
+
+            // [DEBUG] — session status
+            let debug_panel = {
+                let mut p = SubPanel::new("DEBUG").border_style(self.style);
+                if let Some(s) = summary {
+                    p = p.line(format!("status: {:?}", s.status), body_color);
+                    p = p.line(format!("adapter: {}", s.adapter_name), body_color);
+                    if let Some(ref reason) = s.stop_reason {
+                        p = p.line(format!("reason: {}", reason), body_color);
+                    }
+                    if let Some(tid) = s.thread_id {
+                        p = p.line(format!("thread: {}", tid), body_color);
+                    }
+                } else {
+                    p = p.line("· (no session)", dim);
+                }
+                p
+            };
+            let h = debug_panel.height();
+            if y + h <= area.y + area.height {
+                debug_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                y += h + 1;
+            }
+
+            // [THREADS]
+            let threads_panel = {
+                let mut p = SubPanel::new("THREADS").border_style(self.style);
+                if self.data.threads.is_empty() {
+                    p = p.line("· (pending)", dim);
+                } else {
+                    for t in &self.data.threads {
+                        p = p.line(format!("{} {}", t.id, t.name), body_color);
+                    }
+                }
+                p
+            };
+            let h = threads_panel.height();
+            if y + h <= area.y + area.height {
+                threads_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                y += h + 1;
+            }
+
+            // [FRAMES]
+            let frames_panel = {
+                let mut p = SubPanel::new("FRAMES").border_style(self.style);
+                if self.data.frames.is_empty() {
+                    p = p.line("· (pending)", dim);
+                } else {
+                    for f in &self.data.frames {
+                        let src = f
+                            .source
+                            .as_ref()
+                            .and_then(|s| s.name.as_deref())
+                            .unwrap_or("??");
+                        p = p.line(
+                            format!("{} {}:{} {}", f.id, src, f.line, f.name),
+                            body_color,
+                        );
+                    }
+                }
+                p
+            };
+            let h = frames_panel.height();
+            if y + h <= area.y + area.height {
+                frames_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                y += h + 1;
+            }
+
+            // [VARIABLES]
+            let variables_panel = {
+                let mut p = SubPanel::new("VARIABLES").border_style(self.style);
+                if self.data.variables.is_empty() {
+                    p = p.line("· (pending)", dim);
+                } else {
+                    for v in &self.data.variables {
+                        let val = &v.value;
+                        let type_hint = v
+                            .type_field
+                            .as_deref()
+                            .map(|t| format!(": {t}"))
+                            .unwrap_or_default();
+                        p = p.line(format!("{} = {}{}", v.name, val, type_hint), body_color);
+                    }
+                }
+                p
+            };
+            let h = variables_panel.height();
+            if y + h <= area.y + area.height {
+                variables_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                y += h + 1;
+            }
+
+            // [BREAKPOINTS]
+            let bp_count = summary.map(|s| s.breakpoint_count).unwrap_or(0);
+            let fbp_count = summary.map(|s| s.function_breakpoint_count).unwrap_or(0);
+            let bp_panel = SubPanel::new("BREAKPOINTS")
+                .line(
+                    format!("source: {}  func: {}", bp_count, fbp_count),
+                    body_color,
+                )
+                .border_style(self.style);
+            let h = bp_panel.height();
+            if y + h <= area.y + area.height {
+                bp_panel.render(Rect::new(area.x, y, inner_w, h), buf);
+                y += h + 1;
+            }
+
+            // [OUTPUT] — grow to fill remaining vertical space.
+            let remaining = (area.y + area.height).saturating_sub(y);
+            if remaining >= 3 {
+                let rect = Rect::new(area.x, y, inner_w, remaining);
+                let inner_rows = (remaining as usize).saturating_sub(2);
+                let mut p = SubPanel::new("OUTPUT").border_style(self.style);
+                let output = &self.data.output;
+                if output.is_empty() {
+                    p = p.line("· (none)", dim);
+                } else {
+                    let lines: Vec<&str> = output.lines().collect();
+                    let total = lines.len();
+                    if total <= inner_rows {
+                        for line in &lines {
+                            p = p.line(*line, body_color);
+                        }
+                    } else {
+                        for line in lines.iter().take(inner_rows.saturating_sub(1)) {
+                            p = p.line(*line, body_color);
+                        }
+                        let footer = if self.data.output_truncated {
+                            format!("+{} more (truncated)", total.saturating_sub(inner_rows - 1))
+                        } else {
+                            format!("+{} more", total.saturating_sub(inner_rows - 1))
+                        };
+                        p = p.line(footer, dim);
+                    }
+                }
+                p.render(rect, buf);
+            }
         }
     }
 }
@@ -1137,5 +1324,93 @@ mod tests {
         assert_eq!(format_bar("CPU", 0.0), "CPU: [..........]   0%");
         assert_eq!(format_bar("MEM", 50.0), "MEM: [#####.....]  50%");
         assert_eq!(format_bar("CPU", 100.0), "CPU: [##########] 100%");
+    }
+
+    /// DebugRightPanel renders VARIABLES and all sub-panel titles
+    /// when DebugPanelData is populated with session state.
+    #[cfg(feature = "dap")]
+    #[test]
+    fn debug_panel_renders_variables() {
+        use crate::dap::types::{DebugPanelData, SessionStatus, Variable};
+
+        let data = DebugPanelData {
+            adapter: "test".into(),
+            status: SessionStatus::Stopped,
+            session_summary: Some(crate::dap::types::SessionSummary {
+                id: "s1".into(),
+                adapter_name: "test".into(),
+                program: None,
+                status: SessionStatus::Stopped,
+                breakpoint_count: 1,
+                function_breakpoint_count: 2,
+                stop_reason: Some("breakpoint".into()),
+                thread_id: Some(1),
+                output: String::new(),
+                output_truncated: false,
+                exit_code: None,
+                capabilities: None,
+                languages: vec![],
+            }),
+            threads: vec![],
+            frames: vec![],
+            scopes: vec![],
+            breakpoints: vec![],
+            variables: vec![
+                Variable {
+                    name: "x".into(),
+                    value: "42".into(),
+                    type_field: Some("i32".into()),
+                    presentation_hint: None,
+                    evaluate_name: None,
+                    variables_reference: 0,
+                    named_variables: None,
+                    indexed_variables: None,
+                    memory_reference: None,
+                },
+                Variable {
+                    name: "msg".into(),
+                    value: "\"hello\"".into(),
+                    type_field: Some("String".into()),
+                    presentation_hint: None,
+                    evaluate_name: None,
+                    variables_reference: 0,
+                    named_variables: None,
+                    indexed_variables: None,
+                    memory_reference: None,
+                },
+            ],
+            output: "hello\nworld\n".into(),
+            output_truncated: false,
+            exit_code: None,
+        };
+
+        let backend = TestBackend::new(30, 30);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 0, 30, 30);
+                f.render_widget(debug::DebugRightPanel::new(&data), area);
+            })
+            .unwrap();
+        let backend = terminal.backend().clone();
+
+        let dump: String = (0..30)
+            .map(|y| {
+                (0..30)
+                    .map(|x| backend.buffer().cell((x, y)).unwrap().symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(dump.contains("[VARIABLES]"), "VARIABLES title:\n{dump}");
+        assert!(dump.contains("msg = \"hello\""), "variable value:\n{dump}");
+        assert!(dump.contains(": String"), "variable type:\n{dump}");
+        assert!(dump.contains("x = 42"), "simple variable:\n{dump}");
+        assert!(dump.contains("source: 1  func: 2"), "bp counts:\n{dump}");
+        assert!(dump.contains("[DEBUG]"), "DEBUG title:\n{dump}");
+        assert!(dump.contains("[BREAKPOINTS]"), "BREAKPOINTS title:\n{dump}");
+        assert!(dump.contains("[OUTPUT]"), "OUTPUT title:\n{dump}");
+        assert!(dump.contains("hello"), "output:\n{dump}");
     }
 }
