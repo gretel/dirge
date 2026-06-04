@@ -351,6 +351,23 @@ fn text_of_block(block: &Value) -> Option<&str> {
     obj.get("text").and_then(|t| t.as_str())
 }
 
+/// Concatenate the text the model would actually see from a tool
+/// result's `content` field, handling BOTH shapes: the scalar-string
+/// (heal-on-load) shape and the production block-array shape
+/// (`[{type:"text", text:"..."}, ...]`). dirge-u5ka: production tool
+/// results are arrays, so a naive `.as_str()` saw nothing.
+fn content_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(text_of_block)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
 /// Build a `head + marker + tail` payload sized so the
 /// total length is `<= max_chars`. Tail gets 10% of the
 /// remaining content budget (capped at 1024 chars to keep
@@ -416,8 +433,13 @@ pub fn prune_tool_outputs(messages: &[Value], protect_tail: usize) -> Vec<Value>
             if role != "tool" && role != "toolResult" {
                 return msg.clone();
             }
-            let content = msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
-            if content.len() <= 500 {
+            // dirge-u5ka: read text from BOTH the scalar-string and the
+            // production block-array shapes — previously only `.as_str()`
+            // was checked, so live tool results (always arrays) were never
+            // pruned and this pass was a silent no-op.
+            let content = msg.get("content");
+            let text = content_text(content);
+            if text.len() <= 500 {
                 return msg.clone();
             }
             // Summarize: 1-line tool result.
@@ -427,9 +449,17 @@ pub fn prune_tool_outputs(messages: &[Value], protect_tail: usize) -> Vec<Value>
                 .and_then(|v| v.as_str())
                 .unwrap_or("tool");
             pruned += 1;
-            let summary = summarize_tool_result(tool_name, content);
+            let summary = summarize_tool_result(tool_name, &text);
             let mut new_msg = msg.clone();
-            new_msg["content"] = Value::String(summary);
+            // Preserve the original content SHAPE: an array stays a single
+            // text block (so the LLM-API contract is unchanged), a string
+            // stays a string.
+            new_msg["content"] = match content {
+                Some(Value::Array(_)) => {
+                    Value::Array(vec![serde_json::json!({"type": "text", "text": summary})])
+                }
+                _ => Value::String(summary),
+            };
             new_msg
         })
         .collect()
@@ -733,12 +763,58 @@ pub fn compute_compress_window(
     if n < protect_head + protect_tail + 1 {
         return (0, 0);
     }
-    let start = protect_head;
-    let end = n.saturating_sub(protect_tail);
+    let raw_start = protect_head;
+    let raw_end = n.saturating_sub(protect_tail);
+    if raw_start >= raw_end {
+        return (0, 0);
+    }
+    // dirge-89fm: snap both cuts to USER-message boundaries. A user
+    // message never carries a dangling tool_use (its results follow as
+    // separate messages) and is never itself an orphaned tool_result, so
+    // cutting there guarantees the dropped middle removes whole turns —
+    // neither the protected head (ends just before a user turn) nor the
+    // protected tail (starts on a user turn) is left holding half of a
+    // tool_use↔tool_result pair, which would 400 the next API request.
+    // Same discipline as the `/compress` path's `align_cut_to_user_boundary`.
+    // Head snaps FORWARD (protects ≥ protect_head), tail snaps BACKWARD
+    // (protects ≥ protect_tail); both only ever protect more, never less.
+    let start = snap_forward_to_user(messages, raw_start);
+    let end = snap_backward_to_user(messages, raw_end);
     if start >= end {
         return (0, 0);
     }
     (start, end)
+}
+
+/// True when `msg` is a user-role turn.
+fn is_user_msg(msg: &Value) -> bool {
+    msg.get("role").and_then(|r| r.as_str()) == Some("user")
+}
+
+/// Smallest index `>= idx` whose message is a user turn, clamped to
+/// `messages.len()` when none is found at or after `idx`.
+fn snap_forward_to_user(messages: &[Value], idx: usize) -> usize {
+    let n = messages.len();
+    let mut i = idx.min(n);
+    while i < n && !is_user_msg(&messages[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Largest index `<= idx` whose message is a user turn, or `0` when none
+/// is found at or before `idx`.
+fn snap_backward_to_user(messages: &[Value], idx: usize) -> usize {
+    let mut i = idx.min(messages.len().saturating_sub(1));
+    loop {
+        if is_user_msg(&messages[i]) {
+            return i;
+        }
+        if i == 0 {
+            return 0;
+        }
+        i -= 1;
+    }
 }
 
 /// Generate a new session id with a `compacted-` prefix to
@@ -972,6 +1048,50 @@ mod tests {
         );
         // Small result in tail should be untouched.
         assert_eq!(pruned[2]["content"].as_str().unwrap(), "small");
+    }
+
+    /// dirge-u5ka: production tool results carry block-ARRAY content
+    /// (`[{type:"text", text:"..."}]`), not a scalar string. Pruning must
+    /// see through the array — previously `.as_str()` returned None so
+    /// these were never pruned and the pass was a silent no-op.
+    #[test]
+    fn prune_handles_block_array_content() {
+        let big = "y".repeat(1000);
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({
+                "role": "toolResult",
+                "toolName": "read",
+                "content": [{"type": "text", "text": big}],
+            }),
+            serde_json::json!({"role": "user", "content": "tail"}),
+        ];
+        let pruned = prune_tool_outputs(&msgs, 1);
+        let content = &pruned[1]["content"];
+        // Shape preserved: still an array of one text block...
+        let blocks = content.as_array().expect("content stays a block array");
+        assert_eq!(blocks.len(), 1);
+        let text = blocks[0]["text"].as_str().unwrap();
+        // ...but summarized (carries the [read] marker, drops the 1000 y's).
+        assert!(text.contains("[read]"), "summarized: {text}");
+        assert!(!text.contains("yyyyy"), "raw content dropped: {text}");
+        assert!(text.len() < 500);
+    }
+
+    /// A small block-array tool result is left untouched.
+    #[test]
+    fn prune_leaves_small_block_array_untouched() {
+        let msgs = vec![
+            serde_json::json!({"role": "user", "content": "hello"}),
+            serde_json::json!({
+                "role": "toolResult",
+                "toolName": "grep",
+                "content": [{"type": "text", "text": "two matches"}],
+            }),
+            serde_json::json!({"role": "user", "content": "tail"}),
+        ];
+        let pruned = prune_tool_outputs(&msgs, 1);
+        assert_eq!(pruned[1], msgs[1], "small block-array result is unchanged");
     }
 
     // ── cap_oversized_tool_results (dirge-k6be) ─────────
@@ -1378,6 +1498,58 @@ mod tests {
         assert_eq!(end, 7);
     }
 
+    /// dirge-89fm: with tool_use/tool_result pairs straddling the raw
+    /// count-based cut, the window must snap to user boundaries so neither
+    /// the head nor the tail is left holding half a pair.
+    #[test]
+    fn compute_window_snaps_off_tool_pairs() {
+        // 0 system, 1 user, 2 assistant(tool_call), 3 toolResult,
+        // 4 assistant(final), 5 user, 6 assistant(tool_call), 7 toolResult,
+        // 8 assistant(final), 9 user, 10 assistant, 11 user(latest)
+        let msgs = vec![
+            serde_json::json!({"role": "system", "content": "s"}),
+            serde_json::json!({"role": "user", "content": "u0"}),
+            serde_json::json!({"role": "assistant", "content": "a0", "tool_calls": [{"id": "c0"}]}),
+            serde_json::json!({"role": "toolResult", "toolCallId": "c0", "content": "t0"}),
+            serde_json::json!({"role": "assistant", "content": "a0-final"}),
+            serde_json::json!({"role": "user", "content": "u1"}),
+            serde_json::json!({"role": "assistant", "content": "a1", "tool_calls": [{"id": "c1"}]}),
+            serde_json::json!({"role": "toolResult", "toolCallId": "c1", "content": "t1"}),
+            serde_json::json!({"role": "assistant", "content": "a1-final"}),
+            serde_json::json!({"role": "user", "content": "u2"}),
+            serde_json::json!({"role": "assistant", "content": "a2"}),
+            serde_json::json!({"role": "user", "content": "u3 latest"}),
+        ];
+        let (start, end) = compute_compress_window(&msgs, 2, 2);
+        // Both cuts land on user messages → no split pair.
+        assert!(start < end);
+        assert_eq!(msgs[start]["role"].as_str().unwrap(), "user");
+        assert_eq!(msgs[end]["role"].as_str().unwrap(), "user");
+        // Apply and verify the result has NO orphaned toolResult: every
+        // toolResult is immediately preceded by an assistant message.
+        let out = apply_summary(&msgs, "S", start, end);
+        for (i, m) in out.iter().enumerate() {
+            if m["role"].as_str() == Some("toolResult") {
+                assert_eq!(
+                    out[i - 1]["role"].as_str(),
+                    Some("assistant"),
+                    "toolResult at {i} must follow an assistant: {out:?}"
+                );
+            }
+        }
+        // And the message right before the summary is never a dangling
+        // assistant tool_call (it precedes a user turn in the source).
+        let summary_idx = out
+            .iter()
+            .position(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(SUMMARY_PREFIX))
+            })
+            .unwrap();
+        assert!(out[summary_idx - 1]["tool_calls"].is_null());
+    }
+
     #[test]
     fn compute_window_short_list_returns_zero() {
         let msgs: Vec<Value> = (0..3)
@@ -1440,7 +1612,13 @@ mod tests {
             None,
         );
         assert!(prompt.contains("TURNS TO SUMMARIZE"));
-        assert!(prompt.contains("turn 0"));
+        // The window snaps to user boundaries (dirge-89fm), so it begins a
+        // little after the raw head cut; assert it carries the mid
+        // conversation rather than a fixed "turn 0".
+        assert!(
+            prompt.contains("turn "),
+            "prompt should include the middle turns: {prompt}"
+        );
 
         // 4. mock summarizer — implements SummarizeFn shape.
         let summarizer: SummarizeFn = Arc::new(|_prompt| {
@@ -1459,20 +1637,29 @@ mod tests {
         // 6. apply.
         let compressed = apply_summary(&msgs, &summary, start, end);
 
-        // Assertions: head + 1 summary + tail.
-        assert_eq!(
-            compressed.len(),
-            PROTECT_HEAD_DEFAULT + 1 + PROTECT_TAIL_DEFAULT,
-            "compressed should be head(2) + summary(1) + tail(5) = 8",
-        );
+        // dirge-89fm: the window now snaps to user-message boundaries, so
+        // the protected head/tail can be a little larger than the raw
+        // PROTECT_* counts. Assert the structure (head + 1 summary + tail =
+        // start + 1 + (n - end)) rather than the exact pre-snap size.
+        assert_eq!(compressed.len(), start + 1 + (n_before - end));
         // Original was much longer.
         assert!(compressed.len() < n_before);
-        // The summary message has SUMMARY_PREFIX.
-        let summary_msg = &compressed[PROTECT_HEAD_DEFAULT];
+        // The single summary message sits at `start`, carrying SUMMARY_PREFIX.
+        let summary_msg = &compressed[start];
         assert_eq!(summary_msg["role"].as_str().unwrap(), "system");
         let body = summary_msg["content"].as_str().unwrap();
         assert!(body.starts_with(SUMMARY_PREFIX));
         assert!(body.contains("## Active Task"));
+        // Exactly one summary marker (no duplication).
+        assert_eq!(
+            compressed
+                .iter()
+                .filter(|m| m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.starts_with(SUMMARY_PREFIX)))
+                .count(),
+            1
+        );
         // The latest user message is preserved in the tail.
         let last = compressed.last().unwrap();
         assert_eq!(last["content"].as_str().unwrap(), "latest user request");
