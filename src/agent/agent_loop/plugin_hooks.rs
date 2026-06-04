@@ -448,22 +448,50 @@ pub fn transform_context_from_plugin_manager(
             let Ok(messages_json) = serde_json::to_string(&messages) else {
                 return messages; // un-serializable → passthrough
             };
-            let replaced: Option<String> = {
-                let mut mgr = pm.lock_ignore_poison();
-                let ctx = format!(
-                    "@{{:messages \"{}\"}}",
-                    crate::plugin::escape_janet_string(&messages_json)
-                );
+            let ctx = format!(
+                "@{{:messages \"{}\"}}",
+                crate::plugin::escape_janet_string(&messages_json)
+            );
+            // dirge-tte0: run the Janet dispatch on a blocking thread with a
+            // timeout (same hardening as the tool hooks, LOOP-8) — `dispatch`
+            // blocks the OS thread inside the worker, and this hook fires on
+            // EVERY LLM call. Without spawn_blocking a slow/wedged
+            // transform-context hook would stall a tokio worker (and hold the
+            // PM mutex) for up to the eval timeout each turn.
+            const HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+            let pm_for_dispatch = pm.clone();
+            let fut = tokio::task::spawn_blocking(move || {
+                let mut mgr = pm_for_dispatch.lock_ignore_poison();
                 match mgr.dispatch("transform-context", &ctx) {
-                    Ok(_) => mgr.take_replace_context(),
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "dirge::plugin",
-                            error = %e,
-                            "transform-context hook error — context unchanged",
-                        );
-                        None
-                    }
+                    Ok(_) => Ok(mgr.take_replace_context()),
+                    Err(e) => Err(e.to_string()),
+                }
+            });
+            let replaced: Option<String> = match tokio::time::timeout(HOOK_TIMEOUT, fut).await {
+                Ok(Ok(Ok(v))) => v,
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(
+                        target: "dirge::plugin",
+                        error = %e,
+                        "transform-context hook error — context unchanged",
+                    );
+                    None
+                }
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        target: "dirge::plugin",
+                        error = %join_err,
+                        "transform-context hook panicked — context unchanged",
+                    );
+                    None
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        target: "dirge::plugin",
+                        timeout_ms = HOOK_TIMEOUT.as_millis() as u64,
+                        "transform-context hook timed out — context unchanged",
+                    );
+                    None
                 }
             };
             match replaced {
@@ -495,17 +523,35 @@ pub fn compaction_hooks_from_plugin_manager(
     pm: Arc<Mutex<PluginManager>>,
 ) -> super::types::CompactionHooks {
     let pm_before = pm.clone();
+    // dirge-tte0: both compaction hooks dispatch into the Janet worker
+    // (blocking). Run them on a blocking thread with a timeout so a slow
+    // plugin can't stall a tokio worker / hold the PM mutex through a fold.
+    const COMPACT_HOOK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
     let on_before: super::types::OnBeforeCompactFn = Arc::new(move |count: usize, tokens: u64| {
         let pm = pm_before.clone();
         Box::pin(async move {
-            let mut mgr = pm.lock_ignore_poison();
             let ctx = format!("@{{:message-count {count} :tokens {tokens}}}");
-            if let Err(e) = mgr.dispatch("on-before-compact", &ctx) {
-                tracing::warn!(
+            let fut = tokio::task::spawn_blocking(move || {
+                pm.lock_ignore_poison()
+                    .dispatch("on-before-compact", &ctx)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            });
+            match tokio::time::timeout(COMPACT_HOOK_TIMEOUT, fut).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => tracing::warn!(
                     target: "dirge::plugin",
                     error = %e,
                     "on-before-compact hook error (observe-only; fold proceeds)",
-                );
+                ),
+                Ok(Err(join_err)) => tracing::warn!(
+                    target: "dirge::plugin", error = %join_err,
+                    "on-before-compact hook panicked (observe-only; fold proceeds)",
+                ),
+                Err(_) => tracing::warn!(
+                    target: "dirge::plugin",
+                    "on-before-compact hook timed out (observe-only; fold proceeds)",
+                ),
             }
         })
     });
@@ -516,18 +562,37 @@ pub fn compaction_hooks_from_plugin_manager(
             let Ok(middle_json) = serde_json::to_string(&middle) else {
                 return None;
             };
-            let mut mgr = pm.lock_ignore_poison();
             let ctx = format!(
                 "@{{:messages \"{}\"}}",
                 crate::plugin::escape_janet_string(&middle_json)
             );
-            match mgr.dispatch("on-compact", &ctx) {
-                Ok(_) => mgr.take_compact_summary(),
-                Err(e) => {
+            let fut = tokio::task::spawn_blocking(move || {
+                let mut mgr = pm.lock_ignore_poison();
+                match mgr.dispatch("on-compact", &ctx) {
+                    Ok(_) => Ok(mgr.take_compact_summary()),
+                    Err(e) => Err(e.to_string()),
+                }
+            });
+            match tokio::time::timeout(COMPACT_HOOK_TIMEOUT, fut).await {
+                Ok(Ok(Ok(v))) => v,
+                Ok(Ok(Err(e))) => {
+                    tracing::warn!(
+                        target: "dirge::plugin", error = %e,
+                        "on-compact hook error — falling back to LLM summarizer",
+                    );
+                    None
+                }
+                Ok(Err(join_err)) => {
+                    tracing::warn!(
+                        target: "dirge::plugin", error = %join_err,
+                        "on-compact hook panicked — falling back to LLM summarizer",
+                    );
+                    None
+                }
+                Err(_) => {
                     tracing::warn!(
                         target: "dirge::plugin",
-                        error = %e,
-                        "on-compact hook error — falling back to LLM summarizer",
+                        "on-compact hook timed out — falling back to LLM summarizer",
                     );
                     None
                 }

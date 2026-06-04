@@ -301,7 +301,27 @@ pub(crate) fn apply_response_hooks(
     if let Err(e) = mgr.dispatch("on-response", &janet_ctx) {
         eprintln!("[plugin] on-response error: {e}");
     }
-    mgr.store_response(response);
+    // dirge-tte0: fire `message-end` on the headless path too. Previously
+    // only the interactive (TUI) finalization dispatched it, so a
+    // `harness/rewrite-message` plugin silently no-op'd under
+    // `--print` / `--loop` / ACP. Mirror done.rs: dispatch, then apply any
+    // rewrite to the text that gets stored.
+    let mut stored = response.to_string();
+    match mgr.dispatch(
+        "message-end",
+        &format!(
+            "@{{:message \"{}\"}}",
+            crate::plugin::escape_janet_string(response)
+        ),
+    ) {
+        Ok(_) => {
+            if let Some(rewritten) = mgr.take_message_rewrite() {
+                stored = rewritten;
+            }
+        }
+        Err(e) => eprintln!("[plugin] message-end error: {e}"),
+    }
+    mgr.store_response(&stored);
     let replacement = mgr.take_pending_replace_result();
     if let Err(e) = mgr.dispatch("on-complete", "@{}") {
         eprintln!("[plugin] on-complete error: {e}");
@@ -460,6 +480,31 @@ mod plugin_hook_tests {
             mgr.take_pending_next_model().as_deref(),
             Some("claude-opus-4-7")
         );
+    }
+
+    /// dirge-tte0: `message-end` (`harness/rewrite-message`) now fires on
+    /// the HEADLESS path too — previously only the TUI dispatched it, so a
+    /// rewrite plugin silently no-op'd under `--print`/`--loop`/ACP. The
+    /// stored response must reflect the rewrite.
+    #[test]
+    fn apply_response_hooks_fires_message_end_rewrite() {
+        let mut mgr = PluginManager::try_new().unwrap();
+        mgr.eval(
+            r#"(defn rw [ctx]
+                 (harness/rewrite-message "REWRITTEN-BY-MESSAGE-END")
+                 nil)"#,
+        )
+        .unwrap();
+        mgr.register("message-end", "rw");
+        apply_response_hooks("original text", &mut mgr);
+        // store_response wrote the rewritten text into `harness-response`.
+        let stored = mgr.eval("harness-response").unwrap();
+        assert!(
+            stored.contains("REWRITTEN-BY-MESSAGE-END"),
+            "headless message-end rewrite must be stored; got {stored:?}"
+        );
+        // The rewrite slot was consumed by apply_response_hooks.
+        assert_eq!(mgr.take_message_rewrite(), None);
     }
 
     /// No plugins / no hooks fired: response passes through with
