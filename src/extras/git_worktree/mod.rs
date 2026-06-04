@@ -139,12 +139,25 @@ pub fn create(name: &str) -> Result<(PathBuf, WorktreeInfo), String> {
         return Err(format!("git worktree add failed: {}", stderr.trim()));
     }
 
-    let wt_path = PathBuf::from(&target)
-        .canonicalize()
-        .map_err(|e| format!("failed to resolve worktree path: {}", e))?;
+    // dirge-ivel: `git worktree add` has already created the worktree on
+    // disk. If a later step (canonicalize / cwd lookup) fails we must NOT
+    // leave it stranded — remove it before returning the error.
+    let cleanup = |reason: String| -> String {
+        let _ = Command::new("git")
+            .args(["worktree", "remove", "--force", "--", &target])
+            .output();
+        reason
+    };
 
-    let main_repo =
-        std::env::current_dir().map_err(|e| format!("failed to get current dir: {}", e))?;
+    let wt_path = match PathBuf::from(&target).canonicalize() {
+        Ok(p) => p,
+        Err(e) => return Err(cleanup(format!("failed to resolve worktree path: {}", e))),
+    };
+
+    let main_repo = match std::env::current_dir() {
+        Ok(p) => p,
+        Err(e) => return Err(cleanup(format!("failed to get current dir: {}", e))),
+    };
 
     Ok((
         wt_path.clone(),
@@ -160,6 +173,13 @@ pub fn create(name: &str) -> Result<(PathBuf, WorktreeInfo), String> {
 /// or a trimmed-stderr error on failure. Always inserts `-C <repo>`.
 fn git_in(repo: &Path, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
+        // Set the child's cwd to `repo` (not just `-C repo`): git calls
+        // getcwd() at startup, so if the PARENT process cwd has been removed
+        // the child would fail with "cannot access current directory" even
+        // though `-C` points elsewhere. Pinning the child cwd to the repo
+        // makes the call robust (and fixes a parallel-test flake where a
+        // sibling test deletes the shared process cwd).
+        .current_dir(repo)
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -274,6 +294,10 @@ mod merge_tests {
         ];
         full.extend_from_slice(args);
         let out = Command::new("git")
+            // Pin the child cwd to `dir` so a concurrent test deleting the
+            // shared process cwd can't make git fail getcwd() (parallel-test
+            // isolation; mirrors git_in).
+            .current_dir(dir)
             .arg("-C")
             .arg(dir)
             .args(&full)
@@ -296,14 +320,14 @@ mod merge_tests {
     /// branch `feature`. Returns (info, tmp_root) — tmp_root is removed by
     /// the caller.
     fn setup() -> (WorktreeInfo, PathBuf) {
-        let root = std::env::temp_dir().join(format!(
-            "dirge-wt-merge-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // Unique per invocation: a process-wide atomic counter, NOT just a
+        // timestamp — tests run in parallel and `as_nanos()` collided on
+        // coarse clocks / same-instant samples, so two tests shared a temp
+        // dir and the second `git init` failed with "File exists".
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("dirge-wt-merge-test-{}-{}", std::process::id(), n));
         let _ = std::fs::remove_dir_all(&root);
         let main = root.join("repo");
         std::fs::create_dir_all(&main).unwrap();
