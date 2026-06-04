@@ -336,7 +336,20 @@ static PLUGIN_PROVIDERS: OnceLock<HashMap<String, ProviderEntry>> = OnceLock::ne
 #[cfg_attr(not(feature = "plugin"), allow(dead_code))]
 pub fn install_plugin_providers(map: HashMap<String, ProviderEntry>) -> usize {
     let size = map.len();
-    let _ = PLUGIN_PROVIDERS.set(map);
+    // dirge-gsbf: don't silently swallow a second install. OnceLock::set
+    // fails (returning the map) once already set — e.g. a plugin hot-reload
+    // re-registering providers. Surface it instead of `let _ =`, and report
+    // the size actually in effect (the first install's).
+    if let Err(rejected) = PLUGIN_PROVIDERS.set(map) {
+        let in_effect = PLUGIN_PROVIDERS.get().map(|m| m.len()).unwrap_or(0);
+        tracing::warn!(
+            target: "dirge::provider",
+            attempted = rejected.len(),
+            in_effect,
+            "plugin providers already installed — ignoring re-registration (runtime hot-reload of providers is not supported)",
+        );
+        return in_effect;
+    }
     size
 }
 
