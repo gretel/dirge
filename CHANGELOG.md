@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-06-08
+
+### Added
+- **Hardware-isolated microVM sandbox** (`--sandbox microvm`, opt-in behind
+  the `sandbox-microvm` build feature). A per-session Linux microVM boots
+  once via libkrun and runs every `bash` tool call inside it over SSH, with
+  the workspace mounted via virtio-fs. Includes a pure-Rust OCI image puller
+  (every layer SHA-256-verified against the manifest, no skopeo/buildah
+  needed for remote images), ephemeral SSH keys with guest host-key pinning,
+  rootfs snapshot/restore, the `/sandbox` slash commands (`attach`/`ssh`,
+  `reboot`/`start`, `snapshot save|list|restore|delete`), the
+  `dirge sandbox check` / `dirge sandbox setup` subcommands, and a
+  `--microvm-image` flag. Requires `/dev/kvm` and `libkrun.so`. See
+  [docs/microvm/](docs/microvm/INDEX.md).
+
+  Experimental, and narrower than full isolation: only `bash` runs in the
+  VM. The file tools (`read`/`write`/`edit`/`apply_patch`/`list_dir`/
+  `find_files`) still operate directly on the host workspace, so the VM is a
+  boundary for command execution, not for file access. See
+  [docs/microvm/SECURITY.md](docs/microvm/SECURITY.md).
+- **Memory entries now carry a UMP kind, identity, and lifecycle metadata.**
+  Saved memories are classified by kind (working / semantic / procedural /
+  identity / …) at capture time instead of all defaulting to one bucket, and
+  record provenance and lifecycle fields used by eviction and recall.
+
+### Changed
+- **Memory compaction evicts by salience, not age.** When the store is full
+  the least-salient entry is dropped first (ties broken oldest-first, so the
+  prior behavior holds under uniform salience). Salience now derives from the
+  entry's kind (transient working notes rank well below durable identity /
+  semantic facts), so the useful memories survive longer.
+
+### Security
+- **Load-time threat scan on memory.** Entries that reach `MEMORY.md` /
+  `PITFALLS.md` out-of-band (hand-edit, `git pull`) and so bypassed the
+  capture-time check are now scanned on read, closing the rehydration gap for
+  prompt-injection content smuggled into the memory files.
+
 ## [0.3.1] - 2026-06-05
 
 ### Changed
@@ -213,6 +251,7 @@ agent in Rust with:
   LSP integration, and a Janet plugin system.
 - Session save/load/resume with LLM-summarization compaction.
 
-[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/dirge-code/dirge/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/dirge-code/dirge/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/dirge-code/dirge/compare/v0.3.0...v0.3.1
 [1.0.0]: https://github.com/dirge-code/dirge/releases/tag/v1.0.0
