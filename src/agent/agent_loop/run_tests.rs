@@ -1272,10 +1272,16 @@ impl MemoryProvider for PreCompressRecorder {
     fn view(&self, _: &str) -> serde_json::Value {
         serde_json::Value::Null
     }
-    fn add(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+    fn add(&self, _: &str, _: &str, _kind: Option<&str>) -> Result<serde_json::Value, String> {
         Ok(serde_json::Value::Null)
     }
-    fn replace(&self, _: &str, _: &str, _: &str) -> Result<serde_json::Value, String> {
+    fn replace(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+        _kind: Option<&str>,
+    ) -> Result<serde_json::Value, String> {
         Ok(serde_json::Value::Null)
     }
     fn remove(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {

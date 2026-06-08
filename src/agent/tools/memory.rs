@@ -38,10 +38,18 @@ pub struct Args {
     target: String,
     content: Option<String>,
     old_text: Option<String>,
+    /// UMP memory kind (types.ts:8-13). One of: semantic, episodic,
+    /// procedural, working, identity. Defaults to "procedural".
+    #[serde(default = "default_kind")]
+    kind: Option<String>,
 }
 
 fn default_target() -> String {
     "memory".to_string()
+}
+
+fn default_kind() -> Option<String> {
+    None
 }
 
 impl Tool for MemoryTool {
@@ -57,20 +65,27 @@ impl Tool for MemoryTool {
             description: r#"Persistent long-term memory. Actions: view [target] (read all entries), add (new entry), replace (update by substring match), remove (delete by substring match).
 
 WHEN TO SAVE:
-- User corrects you or says "remember this" / "don't do that again"
-- You discover build commands, test runners, or project conventions
-- You learn architecture patterns, library quirks, or naming conventions
-- You identify a pitfall — something tried and failed, with the reason
+- User corrects you or says "remember this" / "don't do that"
+- You discover build commands, test runners, or conventions
+- You learn architecture patterns, library quirks, naming conventions
+- You identify a pitfall — something tried and failed
 
 TARGETS:
-- "memory": project facts, conventions, build commands, architecture patterns
-- "pitfalls": anti-patterns, things tried and failed, environment-specific issues
+- "memory": project facts, conventions, build, architecture
+- "pitfalls": anti-patterns, things tried and failed
+
+KINDS (optional, defaults to "procedural"):
+- "semantic": durable facts/preferences
+- "episodic": a specific past event
+- "procedural": how-to / behavioral rule
+- "working": short-lived task context
+- "identity": who the user/agent is
 
 ACTIONS:
-- view: read all entries in a target (no other args needed)
+- view: read all entries in a target (no other args)
 - add: create a new entry (needs content)
-- replace: update existing entry found by old_text substring (needs old_text + content)
-- remove: delete entry found by old_text substring (needs old_text)"#
+- replace: update by old_text substring (needs old_text + content)
+- remove: delete by old_text substring (needs old_text)"#
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
@@ -92,6 +107,11 @@ ACTIONS:
                     "old_text": {
                         "type": "string",
                         "description": "Short unique substring identifying the entry to replace or remove."
+                    },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["semantic", "episodic", "procedural", "working", "identity"],
+                        "description": "The UMP memory kind. Defaults to 'procedural'. See KINDS above."
                     }
                 },
                 "required": ["action"]
@@ -127,7 +147,10 @@ ACTIONS:
                     "content",
                     "add",
                 )?;
-                let resp = self.store.add(target, content).map_err(ToolError::Msg)?;
+                let resp = self
+                    .store
+                    .add(target, content, args.kind.as_deref())
+                    .map_err(ToolError::Msg)?;
                 crate::agent::review::fire_memory_write(
                     self.store.as_ref(),
                     "add",
@@ -150,7 +173,7 @@ ACTIONS:
                 )?;
                 let resp = self
                     .store
-                    .replace(target, old_text, content)
+                    .replace(target, old_text, content, args.kind.as_deref())
                     .map_err(ToolError::Msg)?;
                 crate::agent::review::fire_memory_write(
                     self.store.as_ref(),
@@ -237,6 +260,7 @@ mod tests {
             target: "memory".into(),
             content: Some("build command: cargo build --release".into()),
             old_text: None,
+            kind: None,
         }));
         assert!(result.is_ok(), "add failed: {:?}", result);
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
@@ -249,6 +273,7 @@ mod tests {
             target: "memory".into(),
             content: None,
             old_text: None,
+            kind: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         let entries = resp["entries"].as_array().unwrap();
@@ -267,6 +292,7 @@ mod tests {
             target: "pitfalls".into(),
             content: Some("Don't use async in the render loop".into()),
             old_text: None,
+            kind: None,
         }));
         assert!(result.is_ok());
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
@@ -284,6 +310,7 @@ mod tests {
             target: "memory".into(),
             content: Some("same entry".into()),
             old_text: None,
+            kind: None,
         }))
         .unwrap();
 
@@ -292,6 +319,7 @@ mod tests {
             target: "memory".into(),
             content: Some("same entry".into()),
             old_text: None,
+            kind: None,
         }));
         assert!(result.is_err());
     }
@@ -307,6 +335,7 @@ mod tests {
             target: "memory".into(),
             content: Some("build command: cargo build".into()),
             old_text: None,
+            kind: None,
         }))
         .unwrap();
 
@@ -315,6 +344,7 @@ mod tests {
             target: "memory".into(),
             content: Some("build command: cargo build --release".into()),
             old_text: Some("cargo build".into()),
+            kind: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["success"], true);
@@ -325,6 +355,7 @@ mod tests {
             target: "memory".into(),
             content: None,
             old_text: None,
+            kind: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         let entries = resp["entries"].as_array().unwrap();
@@ -342,6 +373,7 @@ mod tests {
             target: "memory".into(),
             content: Some("temp entry to remove".into()),
             old_text: None,
+            kind: None,
         }))
         .unwrap();
 
@@ -350,6 +382,7 @@ mod tests {
             target: "memory".into(),
             content: None,
             old_text: Some("temp entry".into()),
+            kind: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["success"], true);
@@ -360,6 +393,7 @@ mod tests {
             target: "memory".into(),
             content: None,
             old_text: None,
+            kind: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["entry_count"], 0);
@@ -376,6 +410,7 @@ mod tests {
             target: "user".into(),
             content: None,
             old_text: None,
+            kind: None,
         }));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid target"));
@@ -392,6 +427,7 @@ mod tests {
             target: "memory".into(),
             content: None,
             old_text: None,
+            kind: None,
         }));
         assert!(result.is_err());
     }
@@ -428,7 +464,12 @@ mod tests {
                 self.calls.lock().unwrap().push(format!("view:{}", target));
                 json!({ "entries": [], "count": 0 })
             }
-            fn add(&self, target: &str, content: &str) -> Result<serde_json::Value, String> {
+            fn add(
+                &self,
+                target: &str,
+                content: &str,
+                _kind: Option<&str>,
+            ) -> Result<serde_json::Value, String> {
                 self.calls
                     .lock()
                     .unwrap()
@@ -440,6 +481,7 @@ mod tests {
                 target: &str,
                 old: &str,
                 content: &str,
+                _kind: Option<&str>,
             ) -> Result<serde_json::Value, String> {
                 self.calls
                     .lock()
@@ -465,6 +507,7 @@ mod tests {
             target: "memory".into(),
             content: Some("from-tool".into()),
             old_text: None,
+            kind: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -472,6 +515,7 @@ mod tests {
             target: "memory".into(),
             content: None,
             old_text: None,
+            kind: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -479,6 +523,7 @@ mod tests {
             target: "memory".into(),
             content: Some("new".into()),
             old_text: Some("from-tool".into()),
+            kind: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -486,6 +531,7 @@ mod tests {
             target: "memory".into(),
             content: None,
             old_text: Some("new".into()),
+            kind: None,
         }))
         .unwrap();
 
@@ -525,10 +571,21 @@ mod tests {
             fn view(&self, _: &str) -> serde_json::Value {
                 json!({ "entries": [] })
             }
-            fn add(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
+            fn add(
+                &self,
+                _: &str,
+                _: &str,
+                _kind: Option<&str>,
+            ) -> Result<serde_json::Value, String> {
                 Ok(json!({ "success": true }))
             }
-            fn replace(&self, _: &str, _: &str, _: &str) -> Result<serde_json::Value, String> {
+            fn replace(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _kind: Option<&str>,
+            ) -> Result<serde_json::Value, String> {
                 Ok(json!({ "success": true }))
             }
             fn remove(&self, _: &str, _: &str) -> Result<serde_json::Value, String> {
@@ -552,6 +609,7 @@ mod tests {
             target: "memory".into(),
             content: None,
             old_text: None,
+            kind: None,
         }))
         .unwrap();
         assert!(
@@ -565,6 +623,7 @@ mod tests {
             target: "memory".into(),
             content: Some("alpha".into()),
             old_text: None,
+            kind: None,
         }))
         .unwrap();
         // replace → one fire with the new content.
@@ -573,6 +632,7 @@ mod tests {
             target: "memory".into(),
             content: Some("beta".into()),
             old_text: Some("alpha".into()),
+            kind: None,
         }))
         .unwrap();
         // remove → one fire with the old_text (no new content).
@@ -581,6 +641,7 @@ mod tests {
             target: "pitfalls".into(),
             content: None,
             old_text: Some("beta".into()),
+            kind: None,
         }))
         .unwrap();
 
@@ -636,6 +697,7 @@ mod tests {
             target: "memory".into(),
             content: Some("seed: build command cargo test".into()),
             old_text: None,
+            kind: None,
         }))
         .expect("seed add should succeed");
 
@@ -646,24 +708,28 @@ mod tests {
                     target: "memory".into(),
                     content: None,
                     old_text: None,
+                    kind: None,
                 },
                 "add" => Args {
                     action: "add".into(),
                     target: "memory".into(),
                     content: Some(format!("entry-for-{}", action)),
                     old_text: None,
+                    kind: None,
                 },
                 "replace" => Args {
                     action: "replace".into(),
                     target: "memory".into(),
                     content: Some("seed: build command cargo test --release".into()),
                     old_text: Some("seed:".into()),
+                    kind: None,
                 },
                 "remove" => Args {
                     action: "remove".into(),
                     target: "memory".into(),
                     content: None,
                     old_text: Some("entry-for-add".into()),
+                    kind: None,
                 },
                 _ => unreachable!(),
             };

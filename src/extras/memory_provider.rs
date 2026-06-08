@@ -48,12 +48,21 @@ pub trait MemoryProvider: Send + Sync {
     /// schema — a JSON object with `entries`, `count`, `usage_pct`.
     fn view(&self, target: &str) -> Value;
 
-    /// Append a new entry.
-    fn add(&self, target: &str, content: &str) -> Result<Value, String>;
+    /// Append a new entry. `kind` is the UMP memory kind
+    /// (types.ts:8-13); `None` defaults to `"procedural"`.
+    fn add(&self, target: &str, content: &str, kind: Option<&str>) -> Result<Value, String>;
 
     /// Replace an entry matched by substring. `old_text` must
     /// uniquely identify an entry; ambiguous matches error.
-    fn replace(&self, target: &str, old_text: &str, content: &str) -> Result<Value, String>;
+    /// `kind` is the UMP memory kind for the replacement entry;
+    /// `None` defaults to `"procedural"`.
+    fn replace(
+        &self,
+        target: &str,
+        old_text: &str,
+        content: &str,
+        kind: Option<&str>,
+    ) -> Result<Value, String>;
 
     /// Drop an entry matched by substring. Same uniqueness rule as
     /// `replace`.
@@ -146,12 +155,20 @@ impl MemoryProvider for super::memory_store::MemoryToolStore {
         super::memory_store::MemoryToolStore::view(self, target)
     }
 
-    fn add(&self, target: &str, content: &str) -> Result<Value, String> {
-        super::memory_store::MemoryToolStore::add(self, target, content)
+    fn add(&self, target: &str, content: &str, kind: Option<&str>) -> Result<Value, String> {
+        let mkind = kind.and_then(super::memory_store::parse_kind);
+        super::memory_store::MemoryToolStore::add(self, target, content, mkind)
     }
 
-    fn replace(&self, target: &str, old_text: &str, content: &str) -> Result<Value, String> {
-        super::memory_store::MemoryToolStore::replace(self, target, old_text, content)
+    fn replace(
+        &self,
+        target: &str,
+        old_text: &str,
+        content: &str,
+        kind: Option<&str>,
+    ) -> Result<Value, String> {
+        let mkind = kind.and_then(super::memory_store::parse_kind);
+        super::memory_store::MemoryToolStore::replace(self, target, old_text, content, mkind)
     }
 
     fn remove(&self, target: &str, old_text: &str) -> Result<Value, String> {
@@ -180,10 +197,10 @@ mod tests {
         fn view(&self, _target: &str) -> Value {
             Value::Null
         }
-        fn add(&self, _: &str, _: &str) -> Result<Value, String> {
+        fn add(&self, _: &str, _: &str, _kind: Option<&str>) -> Result<Value, String> {
             Ok(Value::Null)
         }
-        fn replace(&self, _: &str, _: &str, _: &str) -> Result<Value, String> {
+        fn replace(&self, _: &str, _: &str, _: &str, _kind: Option<&str>) -> Result<Value, String> {
             Ok(Value::Null)
         }
         fn remove(&self, _: &str, _: &str) -> Result<Value, String> {
@@ -205,8 +222,8 @@ mod tests {
         // methods directly (bypassing the tool) — the writes vec
         // must stay empty.
         let p = RecordingProvider::default();
-        let _ = p.add("memory", "hello");
-        let _ = p.replace("memory", "old", "hello");
+        let _ = p.add("memory", "hello", None);
+        let _ = p.replace("memory", "old", "hello", None);
         let _ = p.remove("pitfalls", "old");
 
         let writes = p.writes.lock().unwrap();
@@ -290,10 +307,16 @@ mod tests {
             fn view(&self, _: &str) -> Value {
                 Value::Null
             }
-            fn add(&self, _: &str, _: &str) -> Result<Value, String> {
+            fn add(&self, _: &str, _: &str, _kind: Option<&str>) -> Result<Value, String> {
                 Ok(Value::Null)
             }
-            fn replace(&self, _: &str, _: &str, _: &str) -> Result<Value, String> {
+            fn replace(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _kind: Option<&str>,
+            ) -> Result<Value, String> {
                 Ok(Value::Null)
             }
             fn remove(&self, _: &str, _: &str) -> Result<Value, String> {
@@ -331,10 +354,16 @@ mod tests {
             fn view(&self, _: &str) -> Value {
                 Value::Null
             }
-            fn add(&self, _: &str, _: &str) -> Result<Value, String> {
+            fn add(&self, _: &str, _: &str, _kind: Option<&str>) -> Result<Value, String> {
                 Ok(Value::Null)
             }
-            fn replace(&self, _: &str, _: &str, _: &str) -> Result<Value, String> {
+            fn replace(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _kind: Option<&str>,
+            ) -> Result<Value, String> {
                 Ok(Value::Null)
             }
             fn remove(&self, _: &str, _: &str) -> Result<Value, String> {
@@ -367,10 +396,16 @@ mod tests {
             fn view(&self, _: &str) -> Value {
                 Value::Null
             }
-            fn add(&self, _: &str, _: &str) -> Result<Value, String> {
+            fn add(&self, _: &str, _: &str, _kind: Option<&str>) -> Result<Value, String> {
                 Ok(Value::Null)
             }
-            fn replace(&self, _: &str, _: &str, _: &str) -> Result<Value, String> {
+            fn replace(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _kind: Option<&str>,
+            ) -> Result<Value, String> {
                 Ok(Value::Null)
             }
             fn remove(&self, _: &str, _: &str) -> Result<Value, String> {
@@ -402,7 +437,7 @@ mod tests {
         // Call through the trait — proves the impl forwards.
         let provider: &dyn MemoryProvider = &store;
         assert_eq!(provider.name(), "builtin");
-        let resp = provider.add("memory", "trait-routed entry").unwrap();
+        let resp = provider.add("memory", "trait-routed entry", None).unwrap();
         assert_eq!(resp["success"], true);
 
         let view = provider.view("memory");
