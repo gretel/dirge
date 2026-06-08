@@ -77,6 +77,14 @@ const COMBINED_REVIEW_PROMPT: &str = r#"Review the conversation above and update
 - Were there any user corrections about how things should be done?
 - Was something tried and failed? Capture what was attempted and WHY it failed.
 
+Classify every entry you save with the `kind` parameter — it drives how memory ranks and what gets evicted first when the budget is full:
+  • `semantic` — a durable fact or preference ("this project pins the MSRV in rust-toolchain.toml").
+  • `procedural` — a how-to rule or convention ("run `cargo fmt --all` before committing"). Default for AGENTS.md-style guidance.
+  • `episodic` — a specific past event worth recalling ("the 0.3 cut broke because the lockfile wasn't regenerated").
+  • `identity` — who the user/agent is ("operator prefers terse, no-preamble handoffs").
+  • `working` — short-lived task context. Rarely worth saving and the FIRST to be evicted under budget pressure — prefer not to persist it.
+When unsure, use `semantic` for facts and `procedural` for rules.
+
 **2. Update SKILLS (procedural improvements):**
 Be ACTIVE — most sessions produce at least one skill update. A pass that does nothing is a missed learning opportunity.
 
