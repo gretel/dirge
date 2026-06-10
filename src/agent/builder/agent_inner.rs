@@ -129,18 +129,18 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
         .unwrap_or_else(|_| {
             crate::extras::dirge_paths::ProjectPaths::new(std::path::Path::new("."))
         });
-    // dirge-dktb: `MemoryToolStore::load` performs synchronous file
-    // I/O for both memory + pitfalls. On slow filesystems (NFS,
-    // network mounts) this blocks the async runtime worker thread
-    // during agent construction. Move the synchronous load onto
-    // the blocking pool, mirroring the `skill::discover_skills`
-    // shape above. `unwrap_or_default()` collapses both a
-    // `spawn_blocking` JoinError and a load error into `None`,
-    // which matches the previous `Err(_) => None` branch.
+    // dirge-dktb: `SqliteMemoryStore::load` performs synchronous DB
+    // I/O (open, migrate, possible legacy-markdown import). On slow
+    // filesystems (NFS, network mounts) this blocks the async runtime
+    // worker thread during agent construction. Move the synchronous
+    // load onto the blocking pool, mirroring the
+    // `skill::discover_skills` shape above. `unwrap_or_default()`
+    // collapses both a `spawn_blocking` JoinError and a load error
+    // into `None`, which matches the previous `Err(_) => None` branch.
     let paths_for_mem = paths.clone();
-    let memory_load_result: Result<crate::extras::memory_store::MemoryToolStore, String> =
+    let memory_load_result: Result<crate::extras::memory_db::SqliteMemoryStore, String> =
         tokio::task::spawn_blocking(move || {
-            crate::extras::memory_store::MemoryToolStore::load(&paths_for_mem)
+            crate::extras::memory_db::SqliteMemoryStore::load(&paths_for_mem)
         })
         .await
         .unwrap_or_else(|_| Err("spawn_blocking join failed".to_string()));

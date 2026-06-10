@@ -99,7 +99,7 @@ Available tools:
 - question: Ask the user structured questions when you need clarification, decisions, or preferences. Blocks until user answers.
 - plan_enter / plan_exit: Suggest switching to/from plan mode for complex tasks. User must confirm.
 - task: Spawn a subagent for research/analysis subtasks. Set background=true for async — completion arrives as <system-reminder> on your next turn. Do NOT poll task_status.
-- memory: Persistent per-project knowledge for project facts and pitfalls. Actions: view (read entries in a target), add (append a new entry; needs content), replace (rewrite an entry matched by old_text substring; needs old_text and content), remove (drop an entry matched by old_text substring; needs old_text). Targets: 'memory' for facts/conventions/build commands, 'pitfalls' for anti-patterns and things tried and failed.
+- memory: Persistent per-project knowledge for project facts and pitfalls. Actions: view (read entries in a target), add (append a new entry; needs content), replace (rewrite an entry matched by old_text substring; needs old_text and content), remove (archive an entry matched by old_text substring; needs old_text), restore (un-archive a removed entry; needs old_text), expand (fetch one entry's full text by id or substring; needs old_text), search (full-text search across all memory; needs query). Targets: 'memory' for facts/conventions/build commands, 'pitfalls' for anti-patterns and things tried and failed.
 - skill: Load a skill by name to get detailed instructions for a specific task or domain.";
 
 pub const TODO_TOOLS_PROMPT: &str = "\
@@ -133,7 +133,7 @@ pub const SKILLS_GUIDANCE: &str = "\n\n## Skill creation and maintenance\n\n\
 /// hermes-agent (`agent/prompt_builder.py:150-171`, `MEMORY_GUIDANCE`).
 /// Hermes uses a single global memory; dirge memory is per-project
 /// (see `~/.claude/projects/<slug>/memory/MEMORY.md` analogue at
-/// `extras::memory_store::MemoryToolStore`). The advice on what to
+/// `extras::memory_db::SqliteMemoryStore`). The advice on what to
 /// save / not save and the declarative-fact phrasing applies equally
 /// to both. See dirge-a6bv.
 pub const MEMORY_GUIDANCE: &str = "\n\n## Memory usage\n\n\
@@ -159,7 +159,13 @@ pub const MEMORY_GUIDANCE: &str = "\n\n## Memory usage\n\n\
      'Project uses pytest with xdist' ✓ — 'Run tests with pytest -n 4' ✗. \
      Imperative phrasing gets re-read as a directive in later sessions \
      and can cause repeated work or override the user's current request. \
-     Procedures and workflows belong in skills, not memory.";
+     Procedures and workflows belong in skills, not memory.\n\
+     When the inline budget fills, older entries are demoted to a \
+     breadcrumb index (the <project_memory_index> block): one line of \
+     id + preview each. They are still memory — fetch the full text \
+     with memory(action='expand', old_text='<id>') when an index line \
+     looks relevant, and use memory(action='search', query='...') to \
+     find facts that may not be inlined.";
 
 /// In-session guidance for `session_search`. Ported verbatim from
 /// hermes-agent (`agent/prompt_builder.py:173-177`,
@@ -349,7 +355,9 @@ mod tests {
         // Authoritative list — must stay in sync with
         // `src/agent/tools/memory.rs` schema enum and the match arms in
         // `MemoryTool::call`.
-        let real_actions = ["view", "add", "replace", "remove"];
+        let real_actions = [
+            "view", "add", "replace", "remove", "restore", "expand", "search",
+        ];
         let forbidden_actions = ["write", "delete", "create", "update"];
 
         // Locate the `- memory:` bullet in SYSTEM_PROMPT.

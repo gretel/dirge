@@ -376,11 +376,14 @@ impl CrossSessionExtractor {
         }))
     }
 
+    /// dirge-18ks: memory lives in the session DB now. A load failure
+    /// degrades to "nothing covered" — the LLM prompt is the real
+    /// dedup, this is only the coarse pre-filter.
     fn existing_memory_lowercased(&self) -> String {
-        let mem = std::fs::read_to_string(self.paths.memory_file("MEMORY.md")).unwrap_or_default();
-        let pit =
-            std::fs::read_to_string(self.paths.memory_file("PITFALLS.md")).unwrap_or_default();
-        format!("{mem}\n{pit}").to_lowercase()
+        match crate::extras::memory_db::SqliteMemoryStore::load(&self.paths) {
+            Ok(store) => store.all_content_lowercased(),
+            Err(_) => String::new(),
+        }
     }
 
     fn write_report(

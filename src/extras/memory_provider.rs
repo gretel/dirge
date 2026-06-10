@@ -65,8 +65,30 @@ pub trait MemoryProvider: Send + Sync {
     ) -> Result<Value, String>;
 
     /// Drop an entry matched by substring. Same uniqueness rule as
-    /// `replace`.
+    /// `replace`. The builtin backend tombstones rather than deletes
+    /// (dirge-8h22); other backends may hard-delete.
     fn remove(&self, target: &str, old_text: &str) -> Result<Value, String>;
+
+    /// Bring a previously removed (tombstoned/archived) entry back.
+    /// `old_text` matches over archived entries with the same
+    /// substring/id rules as `replace`/`remove`. Default errors so
+    /// backends without an archive don't silently no-op (dirge-8h22).
+    fn restore(&self, _target: &str, _old_text: &str) -> Result<Value, String> {
+        Err("This memory backend does not support restoring removed entries".to_string())
+    }
+
+    /// Fetch one entry's full text by id or unique substring, across
+    /// targets — the dereference half of the breadcrumb index
+    /// (dirge-q8wt). Default errors for backends without tiering.
+    fn expand(&self, _old_text: &str) -> Result<Value, String> {
+        Err("This memory backend does not support expanding entries".to_string())
+    }
+
+    /// Full-text search across all active entries (dirge-q8wt).
+    /// Default errors for backends without a search index.
+    fn search(&self, _query: &str) -> Result<Value, String> {
+        Err("This memory backend does not support searching entries".to_string())
+    }
 
     // ── Optional lifecycle hooks — default no-ops ──────────────
 
@@ -75,7 +97,9 @@ pub trait MemoryProvider: Send + Sync {
     /// backend (e.g. a vector store), audit log, or analytics
     /// sink.
     ///
-    /// `action` is one of `"add"`, `"replace"`, `"remove"`.
+    /// `action` is one of `"add"`, `"replace"`, `"remove"`,
+    /// `"restore"`. Consumers should ignore actions they don't know —
+    /// the set can grow.
     ///
     /// `payload` carries action-specific data — the semantics
     /// differ by action, NOT a generic "new content" field:
@@ -133,7 +157,7 @@ pub trait MemoryProvider: Send + Sync {
 }
 
 /// Implementing `MemoryProvider` on the dirge built-in
-/// `MemoryToolStore` makes it the canonical backend without changing
+/// `SqliteMemoryStore` makes it the canonical backend without changing
 /// any of its existing public methods.
 ///
 /// dirge-5feg: this impl deliberately does NOT call `on_memory_write`
@@ -142,22 +166,22 @@ pub trait MemoryProvider: Send + Sync {
 /// custom providers (and providers that wrap this one) get the hook
 /// fired exactly once at the tool layer, without each impl having to
 /// remember to do so.
-impl MemoryProvider for super::memory_store::MemoryToolStore {
+impl MemoryProvider for super::memory_db::SqliteMemoryStore {
     fn name(&self) -> &str {
         "builtin"
     }
 
     fn format_for_system_prompt(&self) -> String {
-        super::memory_store::MemoryToolStore::format_for_system_prompt(self)
+        super::memory_db::SqliteMemoryStore::format_for_system_prompt(self)
     }
 
     fn view(&self, target: &str) -> Value {
-        super::memory_store::MemoryToolStore::view(self, target)
+        super::memory_db::SqliteMemoryStore::view(self, target)
     }
 
     fn add(&self, target: &str, content: &str, kind: Option<&str>) -> Result<Value, String> {
-        let mkind = kind.and_then(super::memory_store::parse_kind);
-        super::memory_store::MemoryToolStore::add(self, target, content, mkind)
+        let mkind = kind.and_then(super::memory_db::parse_kind);
+        super::memory_db::SqliteMemoryStore::add(self, target, content, mkind)
     }
 
     fn replace(
@@ -167,12 +191,24 @@ impl MemoryProvider for super::memory_store::MemoryToolStore {
         content: &str,
         kind: Option<&str>,
     ) -> Result<Value, String> {
-        let mkind = kind.and_then(super::memory_store::parse_kind);
-        super::memory_store::MemoryToolStore::replace(self, target, old_text, content, mkind)
+        let mkind = kind.and_then(super::memory_db::parse_kind);
+        super::memory_db::SqliteMemoryStore::replace(self, target, old_text, content, mkind)
     }
 
     fn remove(&self, target: &str, old_text: &str) -> Result<Value, String> {
-        super::memory_store::MemoryToolStore::remove(self, target, old_text)
+        super::memory_db::SqliteMemoryStore::remove(self, target, old_text)
+    }
+
+    fn restore(&self, target: &str, old_text: &str) -> Result<Value, String> {
+        super::memory_db::SqliteMemoryStore::restore(self, target, old_text)
+    }
+
+    fn expand(&self, old_text: &str) -> Result<Value, String> {
+        super::memory_db::SqliteMemoryStore::expand(self, old_text)
+    }
+
+    fn search(&self, query: &str) -> Result<Value, String> {
+        super::memory_db::SqliteMemoryStore::search(self, query)
     }
 }
 
@@ -432,7 +468,7 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let paths = ProjectPaths::new(&dir);
-        let store = super::super::memory_store::MemoryToolStore::load(&paths).unwrap();
+        let store = super::super::memory_db::SqliteMemoryStore::load(&paths).unwrap();
 
         // Call through the trait — proves the impl forwards.
         let provider: &dyn MemoryProvider = &store;

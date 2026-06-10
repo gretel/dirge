@@ -156,7 +156,7 @@ pub async fn build_loop_tools(
         if let Ok(c) = std::env::current_dir() {
             let paths = crate::extras::dirge_paths::ProjectPaths::new(&c);
             tokio::task::spawn_blocking(move || {
-                crate::extras::memory_store::MemoryToolStore::load(&paths)
+                crate::extras::memory_db::SqliteMemoryStore::load(&paths)
                     .ok()
                     .map(|s| {
                         let arc: Arc<dyn crate::extras::memory_provider::MemoryProvider> =

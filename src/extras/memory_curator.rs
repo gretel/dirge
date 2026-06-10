@@ -27,12 +27,10 @@
 //! - LLM pass uses a memory-only allow-list — model literally
 //!   cannot reach skill-write tools even if its prompt slips.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::extras::dirge_paths::ProjectPaths;
-use crate::extras::memory_usage::{MemoryUsageStore, ReconcileReport, entry_id};
 
 /// dirge-mo0w PR-2: prompt for the memory curator's LLM
 /// consolidation pass. Analog of `skills/curator::CURATOR_PROMPT`
@@ -67,7 +65,9 @@ the redundant copies.\n\
 the other. This is rare — only do it when the entry is genuinely two facts wearing one coat.\n\
   4. REMOVE. Only if the entry is clearly obsolete (refers to a deleted file, a renamed binary, \
 a long-superseded approach the project no longer uses). Show your reasoning in your thinking before \
-removing.\n\
+removing. Removal ARCHIVES the entry (it can be restored with `memory(action='restore', ...)`), \
+so a justified removal is recoverable. The `old_text` argument also accepts the entry's exact \
+`urn:ump:...` id from the stale-candidate table below when a substring would be ambiguous.\n\
 \n\
 Do NOT:\n\
   • Add new facts. The curator is for consolidation, not capture. Background review handles capture.\n\
@@ -85,6 +85,16 @@ Operate on these only.";
 /// Days since `first_seen_at` before an entry counts as stale.
 const STALE_AFTER_DAYS: u64 = 30;
 
+/// dirge-jyks: a young project should get its first curation pass
+/// once it has accumulated this many sessions, instead of waiting a
+/// full calendar interval — memory churn is highest at the start.
+const MIN_SESSIONS_FOR_FIRST_RUN: i64 = 10;
+
+/// dirge-jyks: hot-tier utilization (%) at or above which the LLM
+/// pass is told consolidation of YOUNGER overlapping entries is also
+/// in scope for that target.
+const BUDGET_PRESSURE_PCT: u32 = 90;
+
 /// Days of staleness before an entry becomes an archive candidate
 /// for the LLM pass (PR-2). PR-1 just identifies them.
 #[allow(dead_code)]
@@ -92,8 +102,6 @@ const ARCHIVE_AFTER_STALE_DAYS: u64 = 90;
 
 /// Minimum hours between curator runs.
 const INTERVAL_HOURS: u64 = 168; // 7 days
-
-const ENTRY_DELIMITER: &str = "\n§\n";
 
 // ── State ─────────────────────────────────────────────
 
@@ -159,29 +167,18 @@ impl MemoryCurator {
         })
     }
 
-    /// Should the curator run now? On the first-ever check, SEED
-    /// the clock (persist `last_run = now`) and return false, so the
-    /// pass first runs one interval after install; afterwards, run
-    /// when the last run was >= 7 days ago.
+    /// Should the curator run now? dirge-jyks: before the first run,
+    /// the gate is SESSION COUNT, not the calendar — once the project
+    /// has accumulated [`MIN_SESSIONS_FOR_FIRST_RUN`] sessions the
+    /// first pass fires on the next check, however young the project
+    /// is. Afterwards, run when the last run was >= 7 days ago.
     ///
-    /// dirge-6js7 fix: previously returned false on first check
-    /// WITHOUT seeding, so `last_run` stayed `None` forever and the
-    /// curator DEADLOCKED (the only seeder, `run_mechanical_pass`,
-    /// is gated behind this check). Takes `&mut self` because
-    /// seeding is a persisted side effect.
+    /// No deadlock (dirge-6js7's failure mode): the `None` branch
+    /// returns `true` as soon as sessions accumulate, and
+    /// `run_mechanical_pass` is the seeder that sets `last_run`.
     pub fn should_run_now(&mut self) -> bool {
         match self.state.last_run {
-            None => {
-                self.state.last_run = Some(now_secs());
-                if let Err(e) = self.state.save(&self.state_path) {
-                    tracing::debug!(
-                        target: "dirge::memory_curator",
-                        error = %e,
-                        "failed to seed memory curator state on first check",
-                    );
-                }
-                false
-            }
+            None => self.session_count() >= MIN_SESSIONS_FOR_FIRST_RUN,
             Some(last) => {
                 let elapsed = Duration::from_secs(now_secs().saturating_sub(last));
                 elapsed >= Duration::from_secs(INTERVAL_HOURS * 3600)
@@ -189,72 +186,103 @@ impl MemoryCurator {
         }
     }
 
-    /// Run the mechanical pass: reconcile telemetry sidecar
-    /// against current entries, identify stale candidates, write
-    /// audit report. No LLM call, no archival. Returns the
-    /// per-run report so callers (tests, follow-on LLM pass) can
-    /// inspect what happened.
+    /// Best-effort session count from the project DB. 0 when the DB
+    /// can't be opened (no sessions yet → first run stays deferred).
+    fn session_count(&self) -> i64 {
+        let Ok(db) = crate::extras::session_db::SessionDb::open(&self.paths.session_db_path())
+        else {
+            return 0;
+        };
+        db.conn
+            .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+            .unwrap_or(0)
+    }
+
+    /// Run the mechanical pass: scan the memories table, identify
+    /// stale candidates by row age, write audit report. No LLM call,
+    /// no archival. Returns the per-run report so callers (tests,
+    /// follow-on LLM pass) can inspect what happened.
+    ///
+    /// dirge-18ks: entry age comes straight from `created_at` on the
+    /// memories row — the `.usage.json` sidecar reconciliation this
+    /// pass used to perform is obsolete (and `created_at` survives
+    /// `replace`, which the content-hash-keyed sidecar did not).
     pub fn run_mechanical_pass(&mut self) -> Result<MechanicalReport, String> {
         let started_at = chrono::Utc::now();
         let started_at_iso = started_at.to_rfc3339();
         let started_at_filename = started_at.format("%Y%m%d-%H%M%S").to_string();
         let now = now_secs();
 
-        // 1. Scan MEMORY.md and PITFALLS.md into (target, entry)
-        //    pairs.
-        let entries = self.scan_entries()?;
+        // 1. Apply disuse decay BEFORE scanning, so this run's report
+        //    reflects post-decay salience (dirge-jyks).
+        let store = crate::extras::memory_db::SqliteMemoryStore::load(&self.paths)?;
+        let decayed = store
+            .apply_disuse_decay(STALE_AFTER_DAYS as i64)
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    target: "dirge::memory_curator",
+                    error = %e,
+                    "disuse decay failed — continuing pass",
+                );
+                0
+            });
+
+        // 2. Scan active entries from the store.
+        let entries = store.entries_for_curation()?;
         let total_entries = entries.len();
 
-        // 2. Reconcile usage sidecar.
-        let mut usage = MemoryUsageStore::load(&self.paths);
-        let entries_slice: Vec<(&str, &str)> = entries
-            .iter()
-            .map(|(t, c)| (t.as_str(), c.as_str()))
-            .collect();
-        let reconcile = usage.reconcile(&entries_slice, &started_at_iso);
-        if let Err(e) = usage.save() {
-            // Don't abort the pass — the report still has value.
-            tracing::warn!(
-                target: "dirge::memory_curator",
-                error = %e,
-                "Failed to save memory usage sidecar",
-            );
-        }
-
-        // 3. Identify stale candidates.
+        // 3. Identify stale candidates: old AND not recently used.
+        //    dirge-jyks: an entry the agent expanded within the stale
+        //    window is demonstrably load-bearing — age alone no longer
+        //    flags it.
+        let recent_use_cutoff =
+            (started_at - chrono::Duration::days(STALE_AFTER_DAYS as i64)).to_rfc3339();
         let mut stale_candidates: Vec<StaleCandidate> = Vec::new();
-        for (target, content) in &entries {
-            let Some(rec) = usage.get(content) else {
-                continue;
-            };
-            let Ok(first_seen) = chrono::DateTime::parse_from_rfc3339(&rec.first_seen_at) else {
+        for entry in &entries {
+            let Ok(first_seen) = chrono::DateTime::parse_from_rfc3339(&entry.created_at) else {
                 continue;
             };
             let age_secs = started_at.timestamp() - first_seen.timestamp();
             let age_days = (age_secs.max(0) as u64) / 86400;
-            if age_days >= STALE_AFTER_DAYS {
+            let recently_used = entry
+                .last_used_at
+                .as_deref()
+                .map(|t| t > recent_use_cutoff.as_str())
+                .unwrap_or(false);
+            if age_days >= STALE_AFTER_DAYS && !recently_used {
                 stale_candidates.push(StaleCandidate {
-                    target: target.clone(),
-                    entry_id: entry_id(content),
-                    preview: preview(content),
+                    target: entry.target.clone(),
+                    entry_id: entry.uid.clone(),
+                    preview: preview(&entry.content),
                     age_days,
+                    use_count: entry.use_count,
                 });
             }
         }
-        stale_candidates.sort_by(|a, b| b.age_days.cmp(&a.age_days));
+        stale_candidates.sort_by_key(|c| std::cmp::Reverse(c.age_days));
 
-        // 4. Update state.
+        // 4. Budget pressure: targets at/over the threshold are
+        //    flagged so the LLM pass may consolidate YOUNGER
+        //    overlapping entries there too (dirge-jyks).
+        let pressure_targets: Vec<String> = ["memory", "pitfalls"]
+            .iter()
+            .filter(|t| store.hot_usage_pct(t) >= BUDGET_PRESSURE_PCT)
+            .map(|t| t.to_string())
+            .collect();
+
+        // 5. Update state.
         self.state.last_run = Some(now);
         self.state.save(&self.state_path)?;
 
         let report = MechanicalReport {
             started_at_iso: started_at_iso.clone(),
             total_entries,
-            reconcile,
+            decayed,
+            pressure_targets,
             stale_candidates,
         };
 
-        // 5. Write audit report.
+        // 4. Write audit report.
         let reports_dir = self
             .paths
             .memory_dir()
@@ -266,36 +294,6 @@ impl MemoryCurator {
             .map_err(|e| format!("write report: {e}"))?;
 
         Ok(report)
-    }
-
-    /// Read MEMORY.md and PITFALLS.md from `.dirge/memory/`,
-    /// split on `\n§\n`, return `(target, entry_content)` pairs.
-    /// Empty / missing files contribute nothing — caller treats
-    /// an empty Vec as "no entries to curate".
-    fn scan_entries(&self) -> Result<Vec<(String, String)>, String> {
-        let mut entries: Vec<(String, String)> = Vec::new();
-        for target in ["memory", "pitfalls"] {
-            let file_name = match target {
-                "memory" => "MEMORY.md",
-                "pitfalls" => "PITFALLS.md",
-                _ => continue,
-            };
-            let path = self.paths.memory_dir().join(file_name);
-            if !path.is_file() {
-                continue;
-            }
-            let _ = File::open(&path); // sanity check accessibility
-            let content =
-                std::fs::read_to_string(&path).map_err(|e| format!("read {file_name}: {e}"))?;
-            for raw in content.split(ENTRY_DELIMITER) {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                entries.push((target.to_string(), trimmed.to_string()));
-            }
-        }
-        Ok(entries)
     }
 }
 
@@ -309,7 +307,11 @@ impl MemoryCurator {
 pub struct MechanicalReport {
     pub started_at_iso: String,
     pub total_entries: usize,
-    pub reconcile: ReconcileReport,
+    /// Entries whose salience decayed for disuse this run (dirge-jyks).
+    pub decayed: usize,
+    /// Targets at/over the hot-budget pressure threshold — the LLM
+    /// pass may consolidate younger overlapping entries there.
+    pub pressure_targets: Vec<String>,
     pub stale_candidates: Vec<StaleCandidate>,
 }
 
@@ -321,6 +323,9 @@ pub struct StaleCandidate {
     pub entry_id: String,
     pub preview: String,
     pub age_days: u64,
+    /// Times the agent expanded this entry — 0 means nothing ever
+    /// looked it up (dirge-jyks).
+    pub use_count: i64,
 }
 
 impl MechanicalReport {
@@ -333,23 +338,30 @@ impl MechanicalReport {
         let _ = writeln!(out, "# Memory curator — mechanical pass\n");
         let _ = writeln!(out, "- Started: {}", self.started_at_iso);
         let _ = writeln!(out, "- Total entries: {}", self.total_entries);
-        let _ = writeln!(
-            out,
-            "- Reconcile: +{} new / {} retained / -{} dropped",
-            self.reconcile.added, self.reconcile.retained, self.reconcile.dropped,
-        );
+        let _ = writeln!(out, "- Salience decayed (disuse): {}", self.decayed);
+        if !self.pressure_targets.is_empty() {
+            let _ = writeln!(
+                out,
+                "- Budget pressure (≥ {BUDGET_PRESSURE_PCT}%): {}",
+                self.pressure_targets.join(", "),
+            );
+        }
         let _ = writeln!(out, "- Stale candidates: {}", self.stale_candidates.len());
 
         if !self.stale_candidates.is_empty() {
-            let _ = writeln!(out, "\n## Stale candidates (≥ {STALE_AFTER_DAYS} days)\n",);
-            let _ = writeln!(out, "| Target | Age (days) | Entry ID | Preview |");
-            let _ = writeln!(out, "|---|---|---|---|");
+            let _ = writeln!(
+                out,
+                "\n## Stale candidates (≥ {STALE_AFTER_DAYS} days, no recent use)\n",
+            );
+            let _ = writeln!(out, "| Target | Age (days) | Uses | Entry ID | Preview |");
+            let _ = writeln!(out, "|---|---|---|---|---|");
             for c in &self.stale_candidates {
                 let _ = writeln!(
                     out,
-                    "| `{}` | {} | `{}` | {} |",
+                    "| `{}` | {} | {} | `{}` | {} |",
                     c.target,
                     c.age_days,
+                    c.use_count,
                     c.entry_id,
                     c.preview.replace('|', "\\|"),
                 );
@@ -422,14 +434,15 @@ impl LlmCuratorReport {
 
         if !self.stale_candidates.is_empty() {
             let _ = writeln!(out, "\n## Stale candidates given to the LLM\n");
-            let _ = writeln!(out, "| Target | Age (days) | Entry ID | Preview |");
-            let _ = writeln!(out, "|---|---|---|---|");
+            let _ = writeln!(out, "| Target | Age (days) | Uses | Entry ID | Preview |");
+            let _ = writeln!(out, "|---|---|---|---|---|");
             for c in &self.stale_candidates {
                 let _ = writeln!(
                     out,
-                    "| `{}` | {} | `{}` | {} |",
+                    "| `{}` | {} | {} | `{}` | {} |",
                     c.target,
                     c.age_days,
+                    c.use_count,
                     c.entry_id,
                     c.preview.replace('|', "\\|"),
                 );
@@ -463,6 +476,17 @@ pub fn render_curator_input(
     } else {
         let _ = writeln!(out, "{}", pitfalls_md.trim_end());
     }
+    // dirge-jyks: budget pressure widens the LLM's consolidation
+    // scope to younger overlapping entries for the named targets.
+    if !report.pressure_targets.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n## Budget pressure\n\nThe following target(s) are at ≥ {BUDGET_PRESSURE_PCT}% of \
+             their inline budget: {}. For these, consolidating YOUNGER overlapping or \
+             contradictory entries is also in scope — the <30-day rule is relaxed under pressure.",
+            report.pressure_targets.join(", "),
+        );
+    }
     let _ = writeln!(
         out,
         "\n## Stale candidates flagged by mechanical pass ({})\n",
@@ -471,17 +495,22 @@ pub fn render_curator_input(
     if report.stale_candidates.is_empty() {
         let _ = writeln!(
             out,
-            "_None. The mechanical pass found no entries ≥ {STALE_AFTER_DAYS} days old._"
+            "_None. The mechanical pass found no entries ≥ {STALE_AFTER_DAYS} days old without recent use._"
         );
     } else {
-        let _ = writeln!(out, "| Target | Age (days) | Entry ID | Preview |");
-        let _ = writeln!(out, "|---|---|---|---|");
+        let _ = writeln!(
+            out,
+            "Uses = how many times the agent looked the entry up; 0 means nothing has needed it.\n"
+        );
+        let _ = writeln!(out, "| Target | Age (days) | Uses | Entry ID | Preview |");
+        let _ = writeln!(out, "|---|---|---|---|---|");
         for c in &report.stale_candidates {
             let _ = writeln!(
                 out,
-                "| `{}` | {} | `{}` | {} |",
+                "| `{}` | {} | {} | `{}` | {} |",
                 c.target,
                 c.age_days,
+                c.use_count,
                 c.entry_id,
                 c.preview.replace('|', "\\|"),
             );
@@ -530,31 +559,69 @@ mod tests {
         (paths, dir)
     }
 
-    fn write_memory(paths: &ProjectPaths, name: &str, entries: &[&str]) {
-        let path = paths.memory_dir().join(name);
-        let content = entries.join(ENTRY_DELIMITER);
-        std::fs::write(path, content).unwrap();
+    /// Seed entries through the store API (the only write path now).
+    fn seed_memory(paths: &ProjectPaths, target: &str, entries: &[&str]) {
+        let store = crate::extras::memory_db::SqliteMemoryStore::load(paths).unwrap();
+        for entry in entries {
+            store.add_entry(target, entry, None).unwrap();
+        }
     }
 
-    /// First-ever check SEEDS state (persists last_run) and does
-    /// NOT run. dirge-6js7 deadlock fix: previously the first check
-    /// returned false without persisting, so last_run stayed None
-    /// forever and the curator never ran.
+    /// Backdate an entry's created_at directly in the DB — the test
+    /// stand-in for "this entry has been around for N days".
+    fn backdate_entry(paths: &ProjectPaths, content: &str, days: i64) {
+        let conn = crate::extras::memory_db::raw_conn(paths);
+        let then = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let changed = conn
+            .execute(
+                "UPDATE memories SET created_at = ?1 WHERE content = ?2",
+                rusqlite::params![then, content],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "backdate must hit exactly one row");
+    }
+
+    /// Seed N sessions into the project DB so the first-run session
+    /// gate (dirge-jyks) has material to count.
+    fn seed_sessions(paths: &ProjectPaths, n: usize) {
+        let db = crate::extras::session_db::SessionDb::open(&paths.session_db_path()).unwrap();
+        for i in 0..n {
+            db.insert_session(
+                &format!("sess-{i}"),
+                "cli",
+                "gpt-5",
+                "openai",
+                "2026-05-01T10:00:00Z",
+            )
+            .unwrap();
+        }
+    }
+
+    /// dirge-jyks: before the first run, the gate is session count.
+    /// A young project with few sessions defers; once enough sessions
+    /// accumulate, the first pass fires without waiting 7 days.
     #[test]
-    fn should_run_now_seeds_and_defers_on_first_check() {
+    fn first_run_gated_on_session_count_not_calendar() {
         let (paths, _tmp) = temp_project();
-        let state_path = paths.memory_dir().join(".curator_state");
+        std::fs::create_dir_all(paths.sessions_dir()).unwrap();
+        seed_sessions(&paths, 2);
         let mut curator = MemoryCurator::new(&paths).unwrap();
-        assert!(!curator.should_run_now(), "first check defers");
         assert!(
-            state_path.exists(),
-            "first check must persist seeded state (deadlock fix)",
+            !curator.should_run_now(),
+            "2 sessions — first run still deferred"
         );
-        let seeded = MemoryCuratorState::load(&state_path).unwrap();
+
+        seed_sessions(&paths, 10); // brings the total to 12
+        let mut curator = MemoryCurator::new(&paths).unwrap();
         assert!(
-            seeded.last_run.is_some(),
-            "first check must seed last_run so the interval clock starts",
+            curator.should_run_now(),
+            "enough sessions — first run fires without a 7-day wait"
         );
+        // The pass itself seeds last_run, closing the dirge-6js7
+        // deadlock the old defer-and-seed dance worked around.
+        curator.run_mechanical_pass().unwrap();
+        assert!(curator.state.last_run.is_some());
+        assert!(!curator.should_run_now(), "interval gate applies after");
     }
 
     /// After a run, the 7-day interval gate keeps subsequent
@@ -592,33 +659,29 @@ mod tests {
         assert!(curator.should_run_now(), "after 8 days the gate must open");
     }
 
-    /// Empty memory directory: pass runs cleanly, report shows
+    /// Empty memory store: pass runs cleanly, report shows
     /// zero entries, state advances.
     #[test]
-    fn run_mechanical_pass_handles_empty_memory_dir() {
+    fn run_mechanical_pass_handles_empty_memory_store() {
         let (paths, _tmp) = temp_project();
         let mut curator = MemoryCurator::new(&paths).unwrap();
         let report = curator.run_mechanical_pass().unwrap();
         assert_eq!(report.total_entries, 0);
-        assert_eq!(report.reconcile.added, 0);
         assert_eq!(report.stale_candidates.len(), 0);
         // State advanced.
         assert!(curator.state.last_run.is_some());
     }
 
-    /// Fresh entries get recorded in the usage sidecar and
-    /// surface as "added" in the report, but DON'T appear as
+    /// Fresh entries appear in the report total but DON'T appear as
     /// stale candidates (they're new).
     #[test]
     fn run_mechanical_pass_records_fresh_entries_without_marking_stale() {
         let (paths, _tmp) = temp_project();
-        write_memory(&paths, "MEMORY.md", &["fact 1", "fact 2"]);
-        write_memory(&paths, "PITFALLS.md", &["pitfall 1"]);
+        seed_memory(&paths, "memory", &["fact 1", "fact 2"]);
+        seed_memory(&paths, "pitfalls", &["pitfall 1"]);
         let mut curator = MemoryCurator::new(&paths).unwrap();
         let report = curator.run_mechanical_pass().unwrap();
         assert_eq!(report.total_entries, 3);
-        assert_eq!(report.reconcile.added, 3);
-        assert_eq!(report.reconcile.dropped, 0);
         assert_eq!(
             report.stale_candidates.len(),
             0,
@@ -626,20 +689,13 @@ mod tests {
         );
     }
 
-    /// Entries first observed > 30 days ago surface as stale
-    /// candidates. Simulated by pre-seeding the usage sidecar
-    /// with a backdated `first_seen_at`.
+    /// Entries created > 30 days ago surface as stale candidates.
+    /// Age now comes straight from the row's `created_at`.
     #[test]
-    fn run_mechanical_pass_identifies_entries_first_seen_long_ago_as_stale() {
+    fn run_mechanical_pass_identifies_old_entries_as_stale() {
         let (paths, _tmp) = temp_project();
-        write_memory(&paths, "MEMORY.md", &["old fact", "new fact"]);
-        // Pre-seed the sidecar with backdated "old fact".
-        let mut usage = MemoryUsageStore::load(&paths);
-        let thirty_one_days_ago = chrono::Utc::now() - chrono::Duration::days(31);
-        let now = chrono::Utc::now().to_rfc3339();
-        usage.reconcile(&[("memory", "old fact")], &thirty_one_days_ago.to_rfc3339());
-        usage.reconcile(&[("memory", "old fact"), ("memory", "new fact")], &now);
-        usage.save().unwrap();
+        seed_memory(&paths, "memory", &["old fact", "new fact"]);
+        backdate_entry(&paths, "old fact", 31);
 
         let mut curator = MemoryCurator::new(&paths).unwrap();
         let report = curator.run_mechanical_pass().unwrap();
@@ -657,13 +713,102 @@ mod tests {
             !stale_targets.contains(&"new fact"),
             "fresh entry must NOT be stale: {stale_targets:?}",
         );
+        // Stale candidates are identified by their stable uid now.
+        assert!(
+            report.stale_candidates[0].entry_id.starts_with("urn:ump:"),
+            "candidate id must be the row uid: {:?}",
+            report.stale_candidates[0].entry_id,
+        );
+    }
+
+    /// dirge-jyks: an old entry the agent recently expanded is
+    /// load-bearing — it must NOT surface as a stale candidate.
+    #[test]
+    fn recently_used_old_entries_are_not_stale() {
+        let (paths, _tmp) = temp_project();
+        seed_memory(&paths, "memory", &["consulted fact", "ignored fact"]);
+        backdate_entry(&paths, "consulted fact", 60);
+        backdate_entry(&paths, "ignored fact", 60);
+        // Expanding records last_used_at = now.
+        let store = crate::extras::memory_db::SqliteMemoryStore::load(&paths).unwrap();
+        store.expand_entry("consulted fact").unwrap();
+
+        let mut curator = MemoryCurator::new(&paths).unwrap();
+        let report = curator.run_mechanical_pass().unwrap();
+        let stale: Vec<&str> = report
+            .stale_candidates
+            .iter()
+            .map(|c| c.preview.as_str())
+            .collect();
+        assert!(
+            !stale.contains(&"consulted fact"),
+            "recently-used entry must not be stale: {stale:?}"
+        );
+        assert!(
+            stale.contains(&"ignored fact"),
+            "unused old entry still flags: {stale:?}"
+        );
+        // The unused candidate carries its zero use_count for the LLM.
+        assert_eq!(report.stale_candidates[0].use_count, 0);
+    }
+
+    /// dirge-jyks: the mechanical pass decays salience of old unused
+    /// entries (floored), leaving young or used entries alone.
+    #[test]
+    fn mechanical_pass_applies_disuse_decay() {
+        let (paths, _tmp) = temp_project();
+        seed_memory(&paths, "memory", &["old unused", "young entry"]);
+        backdate_entry(&paths, "old unused", 45);
+
+        let mut curator = MemoryCurator::new(&paths).unwrap();
+        let report = curator.run_mechanical_pass().unwrap();
+        assert_eq!(report.decayed, 1, "exactly the old unused entry decays");
+
+        let conn = crate::extras::memory_db::raw_conn(&paths);
+        let (old_sal, young_sal): (f64, f64) = (
+            conn.query_row(
+                "SELECT salience FROM memories WHERE content = 'old unused'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+            conn.query_row(
+                "SELECT salience FROM memories WHERE content = 'young entry'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap(),
+        );
+        assert!(old_sal < 0.5, "default 0.5 must have decayed: {old_sal}");
+        assert!(
+            (young_sal - 0.5).abs() < 1e-9,
+            "young entry untouched: {young_sal}"
+        );
+    }
+
+    /// dirge-jyks: a target at >= 90% hot-budget utilization is
+    /// flagged as a pressure target.
+    #[test]
+    fn mechanical_pass_flags_budget_pressure() {
+        let (paths, _tmp) = temp_project();
+        // ~2060 of 2200 chars ≈ 93%.
+        let big_one = format!("one {}", "a".repeat(1024));
+        let big_two = format!("two {}", "b".repeat(1024));
+        seed_memory(&paths, "memory", &[&big_one, &big_two]);
+        let mut curator = MemoryCurator::new(&paths).unwrap();
+        let report = curator.run_mechanical_pass().unwrap();
+        assert_eq!(
+            report.pressure_targets,
+            vec!["memory".to_string()],
+            "memory target under pressure, pitfalls not"
+        );
     }
 
     /// REPORT.md is written under `.dirge/memory/.curator_reports/{ts}/`.
     #[test]
     fn run_mechanical_pass_writes_audit_report_to_disk() {
         let (paths, _tmp) = temp_project();
-        write_memory(&paths, "MEMORY.md", &["one fact"]);
+        seed_memory(&paths, "memory", &["one fact"]);
         let mut curator = MemoryCurator::new(&paths).unwrap();
         curator.run_mechanical_pass().unwrap();
         let reports_root = paths.memory_dir().join(".curator_reports");
@@ -680,22 +825,22 @@ mod tests {
         assert!(body.contains("Total entries: 1"));
     }
 
-    /// Removed entries: an entry present last run but absent now
-    /// surfaces as `dropped` in the reconcile report and is
-    /// purged from the sidecar.
+    /// A removed entry stops appearing in subsequent passes — no
+    /// sidecar to reconcile, the row is simply gone.
     #[test]
-    fn run_mechanical_pass_drops_entries_that_disappeared() {
+    fn run_mechanical_pass_reflects_removed_entries() {
         let (paths, _tmp) = temp_project();
-        write_memory(&paths, "MEMORY.md", &["doomed fact"]);
+        seed_memory(&paths, "memory", &["doomed fact"]);
         let mut curator = MemoryCurator::new(&paths).unwrap();
-        curator.run_mechanical_pass().unwrap();
-        // Now remove the entry from disk and re-run.
-        write_memory(&paths, "MEMORY.md", &[]);
+        let report = curator.run_mechanical_pass().unwrap();
+        assert_eq!(report.total_entries, 1);
+
+        let store = crate::extras::memory_db::SqliteMemoryStore::load(&paths).unwrap();
+        store.remove_entry("memory", "doomed fact").unwrap();
+
         let mut curator2 = MemoryCurator::new(&paths).unwrap();
         let report = curator2.run_mechanical_pass().unwrap();
-        assert_eq!(report.reconcile.dropped, 1, "removed entry must drop");
-        let usage = MemoryUsageStore::load(&paths);
-        assert!(usage.is_empty(), "sidecar must be purged");
+        assert_eq!(report.total_entries, 0, "removed entry must disappear");
     }
 
     /// State persistence: a fresh curator instance loads the
@@ -703,7 +848,7 @@ mod tests {
     #[test]
     fn run_mechanical_pass_persists_last_run_timestamp() {
         let (paths, _tmp) = temp_project();
-        write_memory(&paths, "MEMORY.md", &["whatever"]);
+        seed_memory(&paths, "memory", &["whatever"]);
         let mut curator = MemoryCurator::new(&paths).unwrap();
         curator.run_mechanical_pass().unwrap();
         let last_run = curator.state.last_run;
@@ -721,11 +866,8 @@ mod tests {
         let report = MechanicalReport {
             started_at_iso: "2026-05-28T12:00:00Z".to_string(),
             total_entries: 5,
-            reconcile: ReconcileReport {
-                added: 1,
-                retained: 4,
-                dropped: 0,
-            },
+            decayed: 0,
+            pressure_targets: vec![],
             stale_candidates: vec![],
         };
         let md = report.to_markdown();
@@ -741,7 +883,8 @@ mod tests {
         MechanicalReport {
             started_at_iso: "2026-05-28T12:00:00Z".to_string(),
             total_entries: stale.len(),
-            reconcile: ReconcileReport::default(),
+            decayed: 0,
+            pressure_targets: vec![],
             stale_candidates: stale,
         }
     }
@@ -756,6 +899,7 @@ mod tests {
             entry_id: "abc123".to_string(),
             preview: "old fact".to_string(),
             age_days: 45,
+            use_count: 3,
         }]);
         let out = render_curator_input(&report, "fact A\n§\nfact B", "pitfall X");
         assert!(out.contains("## Current MEMORY.md"));
@@ -766,6 +910,18 @@ mod tests {
         assert!(out.contains("abc123"));
         assert!(out.contains("old fact"));
         assert!(out.contains("45"));
+        assert!(out.contains("Uses"), "usage column rendered: {out}");
+    }
+
+    /// dirge-jyks: pressure targets render a scope-widening note in
+    /// the LLM input.
+    #[test]
+    fn render_curator_input_includes_pressure_note() {
+        let mut report = make_report(vec![]);
+        report.pressure_targets = vec!["memory".to_string()];
+        let out = render_curator_input(&report, "fact A", "");
+        assert!(out.contains("## Budget pressure"), "{out}");
+        assert!(out.contains("YOUNGER"), "{out}");
     }
 
     /// Empty memory store renders the `_(empty)_` sentinel
@@ -794,6 +950,7 @@ mod tests {
                 entry_id: "deadbeef00000000".to_string(),
                 preview: "stale pitfall".to_string(),
                 age_days: 100,
+                use_count: 0,
             }],
             tool_actions: vec!["memory".to_string(), "memory".to_string()],
             error: None,

@@ -42,6 +42,9 @@ pub struct Args {
     /// procedural, working, identity. Defaults to "procedural".
     #[serde(default = "default_kind")]
     kind: Option<String>,
+    /// Full-text query for the `search` action (dirge-q8wt).
+    #[serde(default)]
+    query: Option<String>,
 }
 
 fn default_target() -> String {
@@ -62,37 +65,31 @@ impl Tool for MemoryTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "memory".to_string(),
-            description: r#"Persistent long-term memory. Actions: view [target] (read all entries), add (new entry), replace (update by substring match), remove (delete by substring match).
+            description: r#"Persistent long-term memory for project facts and pitfalls.
 
-WHEN TO SAVE:
-- User corrects you or says "remember this" / "don't do that"
-- You discover build commands, test runners, or conventions
-- You learn architecture patterns, library quirks, naming conventions
-- You identify a pitfall — something tried and failed
+SAVE WHEN: the user corrects you or says "remember this"; you discover build/test commands, conventions, architecture patterns, or library quirks; something was tried and failed (pitfall).
 
-TARGETS:
-- "memory": project facts, conventions, build, architecture
-- "pitfalls": anti-patterns, things tried and failed
+TARGETS: "memory" (facts, conventions, build, architecture), "pitfalls" (anti-patterns, things tried and failed).
 
-KINDS (optional, defaults to "procedural"):
-- "semantic": durable facts/preferences
-- "episodic": a specific past event
-- "procedural": how-to / behavioral rule
-- "working": short-lived task context
-- "identity": who the user/agent is
+KINDS (optional, default "procedural"): semantic (durable fact), episodic (past event), procedural (how-to rule), working (short-lived), identity (who the user/agent is).
 
 ACTIONS:
-- view: read all entries in a target (no other args)
-- add: create a new entry (needs content)
-- replace: update by old_text substring (needs old_text + content)
-- remove: delete by old_text substring (needs old_text)"#
+- view: inline entries + breadcrumb index for a target
+- add: new entry (content)
+- replace: update matched entry (old_text + content)
+- remove: archive matched entry (old_text); restorable
+- restore: un-archive a removed entry (old_text)
+- expand: full text of one entry by id/substring (old_text)
+- search: full-text search across all memory (query)
+
+old_text matches a unique substring or the exact "urn:ump:…" id from view/index."#
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["view", "add", "replace", "remove"],
+                        "enum": ["view", "add", "replace", "remove", "restore", "expand", "search"],
                         "description": "The action to perform."
                     },
                     "target": {
@@ -106,7 +103,11 @@ ACTIONS:
                     },
                     "old_text": {
                         "type": "string",
-                        "description": "Short unique substring identifying the entry to replace or remove."
+                        "description": "Short unique substring identifying the entry to replace, remove, restore, or expand — or the entry's exact 'urn:ump:…' id from view's meta / the breadcrumb index."
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Full-text query for the 'search' action."
                     },
                     "kind": {
                         "type": "string",
@@ -203,8 +204,49 @@ ACTIONS:
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
+            "restore" => {
+                let old_text = crate::agent::tools::required_nonblank(
+                    args.old_text.as_deref(),
+                    "old_text",
+                    "restore",
+                )?;
+                let resp = self
+                    .store
+                    .restore(target, old_text)
+                    .map_err(ToolError::Msg)?;
+                crate::agent::review::fire_memory_write(
+                    self.store.as_ref(),
+                    "restore",
+                    target,
+                    old_text,
+                );
+                Ok(serde_json::to_string_pretty(&resp)
+                    .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
+            }
+            // expand/search are reads — no on_memory_write fire.
+            // Both span targets, so `target` is ignored.
+            "expand" => {
+                let old_text = crate::agent::tools::required_nonblank(
+                    args.old_text.as_deref(),
+                    "old_text",
+                    "expand",
+                )?;
+                let resp = self.store.expand(old_text).map_err(ToolError::Msg)?;
+                Ok(serde_json::to_string_pretty(&resp)
+                    .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
+            }
+            "search" => {
+                let query = crate::agent::tools::required_nonblank(
+                    args.query.as_deref(),
+                    "query",
+                    "search",
+                )?;
+                let resp = self.store.search(query).map_err(ToolError::Msg)?;
+                Ok(serde_json::to_string_pretty(&resp)
+                    .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
+            }
             _ => Err(ToolError::Msg(format!(
-                "Unknown action '{}'. Use: view, add, replace, remove.",
+                "Unknown action '{}'. Use: view, add, replace, remove, restore, expand, search.",
                 args.action
             ))),
         }
@@ -225,7 +267,7 @@ fn validate_target(target: &str) -> Result<&str, ToolError> {
 mod tests {
     use super::*;
     use crate::extras::dirge_paths::ProjectPaths;
-    use crate::extras::memory_store::MemoryToolStore;
+    use crate::extras::memory_db::SqliteMemoryStore;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -237,7 +279,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let paths = ProjectPaths::new(&dir);
-        let store: Arc<dyn MemoryProvider> = Arc::new(MemoryToolStore::load(&paths).unwrap());
+        let store: Arc<dyn MemoryProvider> = Arc::new(SqliteMemoryStore::load(&paths).unwrap());
         (store, dir)
     }
 
@@ -261,6 +303,7 @@ mod tests {
             content: Some("build command: cargo build --release".into()),
             old_text: None,
             kind: None,
+            query: None,
         }));
         assert!(result.is_ok(), "add failed: {:?}", result);
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
@@ -274,6 +317,7 @@ mod tests {
             content: None,
             old_text: None,
             kind: None,
+            query: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         let entries = resp["entries"].as_array().unwrap();
@@ -293,6 +337,7 @@ mod tests {
             content: Some("Don't use async in the render loop".into()),
             old_text: None,
             kind: None,
+            query: None,
         }));
         assert!(result.is_ok());
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
@@ -311,6 +356,7 @@ mod tests {
             content: Some("same entry".into()),
             old_text: None,
             kind: None,
+            query: None,
         }))
         .unwrap();
 
@@ -320,6 +366,7 @@ mod tests {
             content: Some("same entry".into()),
             old_text: None,
             kind: None,
+            query: None,
         }));
         assert!(result.is_err());
     }
@@ -336,6 +383,7 @@ mod tests {
             content: Some("build command: cargo build".into()),
             old_text: None,
             kind: None,
+            query: None,
         }))
         .unwrap();
 
@@ -345,6 +393,7 @@ mod tests {
             content: Some("build command: cargo build --release".into()),
             old_text: Some("cargo build".into()),
             kind: None,
+            query: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["success"], true);
@@ -356,6 +405,7 @@ mod tests {
             content: None,
             old_text: None,
             kind: None,
+            query: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         let entries = resp["entries"].as_array().unwrap();
@@ -374,6 +424,7 @@ mod tests {
             content: Some("temp entry to remove".into()),
             old_text: None,
             kind: None,
+            query: None,
         }))
         .unwrap();
 
@@ -383,6 +434,7 @@ mod tests {
             content: None,
             old_text: Some("temp entry".into()),
             kind: None,
+            query: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["success"], true);
@@ -394,6 +446,7 @@ mod tests {
             content: None,
             old_text: None,
             kind: None,
+            query: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["entry_count"], 0);
@@ -411,6 +464,7 @@ mod tests {
             content: None,
             old_text: None,
             kind: None,
+            query: None,
         }));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid target"));
@@ -428,6 +482,7 @@ mod tests {
             content: None,
             old_text: None,
             kind: None,
+            query: None,
         }));
         assert!(result.is_err());
     }
@@ -508,6 +563,7 @@ mod tests {
             content: Some("from-tool".into()),
             old_text: None,
             kind: None,
+            query: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -516,6 +572,7 @@ mod tests {
             content: None,
             old_text: None,
             kind: None,
+            query: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -524,6 +581,7 @@ mod tests {
             content: Some("new".into()),
             old_text: Some("from-tool".into()),
             kind: None,
+            query: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -532,6 +590,7 @@ mod tests {
             content: None,
             old_text: Some("new".into()),
             kind: None,
+            query: None,
         }))
         .unwrap();
 
@@ -610,6 +669,7 @@ mod tests {
             content: None,
             old_text: None,
             kind: None,
+            query: None,
         }))
         .unwrap();
         assert!(
@@ -624,6 +684,7 @@ mod tests {
             content: Some("alpha".into()),
             old_text: None,
             kind: None,
+            query: None,
         }))
         .unwrap();
         // replace → one fire with the new content.
@@ -633,6 +694,7 @@ mod tests {
             content: Some("beta".into()),
             old_text: Some("alpha".into()),
             kind: None,
+            query: None,
         }))
         .unwrap();
         // remove → one fire with the old_text (no new content).
@@ -642,6 +704,7 @@ mod tests {
             content: None,
             old_text: Some("beta".into()),
             kind: None,
+            query: None,
         }))
         .unwrap();
 
@@ -670,7 +733,9 @@ mod tests {
             .expect("SYSTEM_PROMPT should describe the memory tool");
 
         // Extract candidate action words from the prompt.
-        let known_actions = ["view", "add", "replace", "remove"];
+        let known_actions = [
+            "view", "add", "replace", "remove", "restore", "expand", "search",
+        ];
         let prompt_actions: Vec<&str> = known_actions
             .iter()
             .copied()
@@ -698,6 +763,7 @@ mod tests {
             content: Some("seed: build command cargo test".into()),
             old_text: None,
             kind: None,
+            query: None,
         }))
         .expect("seed add should succeed");
 
@@ -709,6 +775,7 @@ mod tests {
                     content: None,
                     old_text: None,
                     kind: None,
+                    query: None,
                 },
                 "add" => Args {
                     action: "add".into(),
@@ -716,6 +783,7 @@ mod tests {
                     content: Some(format!("entry-for-{}", action)),
                     old_text: None,
                     kind: None,
+                    query: None,
                 },
                 "replace" => Args {
                     action: "replace".into(),
@@ -723,6 +791,7 @@ mod tests {
                     content: Some("seed: build command cargo test --release".into()),
                     old_text: Some("seed:".into()),
                     kind: None,
+                    query: None,
                 },
                 "remove" => Args {
                     action: "remove".into(),
@@ -730,6 +799,34 @@ mod tests {
                     content: None,
                     old_text: Some("entry-for-add".into()),
                     kind: None,
+                    query: None,
+                },
+                // Runs after "remove" archived entry-for-add, so the
+                // restore has a tombstoned entry to revive.
+                "restore" => Args {
+                    action: "restore".into(),
+                    target: "memory".into(),
+                    content: None,
+                    old_text: Some("entry-for-add".into()),
+                    kind: None,
+                    query: None,
+                },
+                // Runs after "restore", so entry-for-add is active.
+                "expand" => Args {
+                    action: "expand".into(),
+                    target: "memory".into(),
+                    content: None,
+                    old_text: Some("entry-for-add".into()),
+                    kind: None,
+                    query: None,
+                },
+                "search" => Args {
+                    action: "search".into(),
+                    target: "memory".into(),
+                    content: None,
+                    old_text: None,
+                    kind: None,
+                    query: Some("seed".into()),
                 },
                 _ => unreachable!(),
             };

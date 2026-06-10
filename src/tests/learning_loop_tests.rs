@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::extras::dirge_paths::ProjectPaths;
-use crate::extras::memory_store::MemoryToolStore;
+use crate::extras::memory_db::SqliteMemoryStore;
 use crate::extras::session_db::SessionDb;
 use crate::extras::session_search::SessionSearch;
 use crate::extras::skills::curator::Curator;
@@ -164,7 +164,8 @@ fn session_db_parent_chain_with_end_session_works() {
 fn memory_store_crud_and_snapshot() {
     let (paths, _dir) = temp_project();
 
-    // Pre-populate a memory entry on disk so the snapshot captures it.
+    // Pre-populate a legacy markdown memory file — load() imports it
+    // into the session DB (dirge-18ks) and the snapshot captures it.
     std::fs::create_dir_all(paths.memory_dir()).unwrap();
     crate::fs_atomic::atomic_write_sync(
         &paths.memory_file("MEMORY.md"),
@@ -172,9 +173,9 @@ fn memory_store_crud_and_snapshot() {
     )
     .unwrap();
 
-    let store = MemoryToolStore::load(&paths).unwrap();
+    let store = SqliteMemoryStore::load(&paths).unwrap();
 
-    // Snapshot should include the persisted entry from disk.
+    // Snapshot should include the imported entry.
     let prompt = store.format_for_system_prompt();
     assert!(
         prompt.contains("existing build command"),
@@ -208,9 +209,9 @@ fn memory_store_crud_and_snapshot() {
 #[test]
 fn memory_store_injection_scan_works_with_regex() {
     // Verify regex patterns catch whitespace-evasion attacks.
-    // These must match memory_store.rs's THREAT_PATTERNS.
+    // These must match memory_db.rs's THREAT_PATTERNS.
     let (paths, _dir) = temp_project();
-    let store = MemoryToolStore::load(&paths).unwrap();
+    let store = SqliteMemoryStore::load(&paths).unwrap();
 
     // Whitespace-evasion: extra spaces between words.
     let err = store
@@ -241,7 +242,7 @@ fn memory_store_injection_scan_works_with_regex() {
 #[test]
 fn memory_store_invisible_unicode_is_blocked() {
     let (paths, _dir) = temp_project();
-    let store = MemoryToolStore::load(&paths).unwrap();
+    let store = SqliteMemoryStore::load(&paths).unwrap();
 
     // Full set of invisible characters should be blocked.
     // dirge-q14a: U+FEFF (BOM / ZWNBSP) — was the wrong U+0FEF, which is a
@@ -525,16 +526,25 @@ fn curator_empty_skills_dir_is_no_op() {
 // ═══════════════════════════════════════════════════════════
 
 #[test]
-fn session_db_schema_version_reaches_v6() {
-    // SESS-14 bumped to v6: drops the automatic FTS triggers so
-    // `insert_message` can scrub credentials through `redact_for_fts`
-    // before they land in the FTS index.
+fn session_db_schema_version_reaches_v7() {
+    // dirge-18ks bumped to v7: long-term memory moves into the
+    // session DB (`memories` + `memories_fts`).
     let (db, _dir) = temp_session_db();
     let ver: u32 = db
         .conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(ver, 6, "fresh DB should be at schema version 6");
+    assert_eq!(ver, 7, "fresh DB should be at schema version 7");
+
+    let memories_exists: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('memories')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(memories_exists, 1, "memories table should exist");
 }
 
 #[test]

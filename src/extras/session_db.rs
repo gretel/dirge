@@ -20,7 +20,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 // Used in migrate() to set user_version pragma.
-const SCHEMA_VERSION: u32 = 6;
+const SCHEMA_VERSION: u32 = 7;
 
 /// Thread-safe snapshot of the most recent `SessionDb::open()` failure.
 /// Port of Hermes's `_last_init_error` (hermes_state.py:66-67).
@@ -226,11 +226,42 @@ impl SessionDb {
         Ok(db)
     }
 
+    /// Serialized migration entry point. Several components (session
+    /// persistence, memory store, session search) open this DB, and
+    /// they can open it CONCURRENTLY on a fresh file — without
+    /// serialization both connections read user_version=0 and both
+    /// run v1's CREATE TABLE, so the loser errors out (PR #392 CI).
+    /// BEGIN EXCLUSIVE makes the loser wait (up to the busy timeout),
+    /// then re-read the version the winner committed and skip the
+    /// completed migrations.
     fn migrate(&self) -> Result<(), String> {
+        let _ = self.conn.busy_timeout(std::time::Duration::from_secs(30));
+        self.conn
+            .execute_batch("BEGIN EXCLUSIVE")
+            .map_err(|e| format!("Failed to lock DB for migration: {e}"))?;
+        match self.run_pending_migrations() {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(|e| format!("Failed to commit migrations: {e}")),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Must run under the exclusive transaction `migrate` opened —
+    /// the version read below is only race-free while locked.
+    fn run_pending_migrations(&self) -> Result<(), String> {
         let current: u32 = self
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| format!("Failed to read schema version: {e}"))?;
+
+        if current >= SCHEMA_VERSION {
+            return Ok(());
+        }
 
         if current < 1 {
             self.run_migration_v1()?;
@@ -254,6 +285,10 @@ impl SessionDb {
 
         if current < 6 {
             self.run_migration_v6()?;
+        }
+
+        if current < 7 {
+            self.run_migration_v7()?;
         }
 
         self.conn
@@ -562,6 +597,50 @@ impl SessionDb {
                 return Err(format!("Migration v5 failed on {col}: {e}"));
             }
         }
+        Ok(())
+    }
+
+    /// v7 (dirge-18ks): per-project long-term memory moves from
+    /// MEMORY.md / PITFALLS.md markdown files (+ .meta.json /
+    /// .usage.json sidecars) into the session DB, giving one uniform
+    /// store. `memories` carries the UMP lifecycle fields that were
+    /// previously sidecar-only; `memories_fts` is a STANDALONE FTS5
+    /// table (not external-content) so index deletes are exact even
+    /// though the indexed text is a redacted projection — the v6
+    /// external-content pattern can't delete cleanly when the indexed
+    /// text differs from the content column. Sync is app-managed in
+    /// `extras::memory_db` (no triggers), matching the post-v6
+    /// redact-before-index philosophy.
+    fn run_migration_v7(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS memories (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    uid           TEXT NOT NULL UNIQUE,
+                    target        TEXT NOT NULL CHECK(target IN ('memory','pitfalls')),
+                    kind          TEXT NOT NULL DEFAULT 'procedural',
+                    content       TEXT NOT NULL,
+                    status        TEXT NOT NULL DEFAULT 'active',
+                    tier          TEXT NOT NULL DEFAULT 'hot',
+                    confidence    REAL NOT NULL DEFAULT 0.6,
+                    salience      REAL NOT NULL DEFAULT 0.5,
+                    created_at    TEXT NOT NULL,
+                    updated_at    TEXT NOT NULL,
+                    last_used_at  TEXT,
+                    use_count     INTEGER NOT NULL DEFAULT 0,
+                    superseded_by TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_memories_target_status
+                    ON memories(target, status);
+
+                CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+                    content
+                );
+                ",
+            )
+            .map_err(|e| format!("Migration v7 failed: {e}"))?;
         Ok(())
     }
 

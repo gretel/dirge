@@ -364,11 +364,21 @@ pub(crate) async fn run_memory_curator_review(
         return;
     }
 
-    // Read current MEMORY.md / PITFALLS.md verbatim. These are
-    // the inputs the LLM sees alongside the stale candidate
-    // table.
-    let memory_md = std::fs::read_to_string(paths.memory_file("MEMORY.md")).unwrap_or_default();
-    let pitfalls_md = std::fs::read_to_string(paths.memory_file("PITFALLS.md")).unwrap_or_default();
+    // Render the current memory store verbatim. These are the
+    // inputs the LLM sees alongside the stale candidate table.
+    // dirge-18ks: entries live in the session DB now; `rendered`
+    // keeps the §-delimited shape the prompt always had.
+    let (memory_md, pitfalls_md) = match crate::extras::memory_db::SqliteMemoryStore::load(&paths) {
+        Ok(store) => (store.rendered("memory"), store.rendered("pitfalls")),
+        Err(e) => {
+            tracing::warn!(
+                target: "dirge::memory_curator",
+                error = %e,
+                "Failed to load memory store for curator input",
+            );
+            (String::new(), String::new())
+        }
+    };
     let input =
         crate::extras::memory_curator::render_curator_input(&report, &memory_md, &pitfalls_md);
     let prompt = format!(
@@ -476,8 +486,12 @@ pub(crate) async fn run_cross_session_extraction(
     paths: crate::extras::dirge_paths::ProjectPaths,
     bundle: crate::extras::cross_session_extractor::CrossSessionBundle,
 ) {
-    let memory_md = std::fs::read_to_string(paths.memory_file("MEMORY.md")).unwrap_or_default();
-    let pitfalls_md = std::fs::read_to_string(paths.memory_file("PITFALLS.md")).unwrap_or_default();
+    // dirge-18ks: memory lives in the session DB; render the
+    // §-delimited shape the prompt always had.
+    let (memory_md, pitfalls_md) = match crate::extras::memory_db::SqliteMemoryStore::load(&paths) {
+        Ok(store) => (store.rendered("memory"), store.rendered("pitfalls")),
+        Err(_) => (String::new(), String::new()),
+    };
     let prompt = format!(
         "{}\n\n## ALREADY KNOWN — MEMORY.md\n\n{}\n\n## ALREADY KNOWN — PITFALLS.md\n\n{}\n\n## Recurring cross-session themes (candidates)\n{}",
         crate::extras::cross_session_extractor::CROSS_SESSION_PROMPT,
