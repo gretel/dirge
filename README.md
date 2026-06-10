@@ -53,6 +53,17 @@ and [LSP](docs/lsp.md) rather than embeddings.
 cargo install dirge-agent
 ```
 
+Or install a prebuilt binary with [Homebrew](https://brew.sh) (macOS + Linux):
+
+```bash
+brew install yogthos/dirge/dirge
+# equivalently: brew tap yogthos/dirge && brew install dirge
+```
+
+Homebrew also makes upgrades a one-liner (`brew upgrade dirge`), and on macOS
+it installs without the Gatekeeper quarantine prompt you'd get from
+double-clicking a downloaded tarball.
+
 Want a leaner binary? Opt out of the defaults and pick only what you need:
 
 ```bash
