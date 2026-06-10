@@ -65,8 +65,17 @@ pub trait MemoryProvider: Send + Sync {
     ) -> Result<Value, String>;
 
     /// Drop an entry matched by substring. Same uniqueness rule as
-    /// `replace`.
+    /// `replace`. The builtin backend tombstones rather than deletes
+    /// (dirge-8h22); other backends may hard-delete.
     fn remove(&self, target: &str, old_text: &str) -> Result<Value, String>;
+
+    /// Bring a previously removed (tombstoned/archived) entry back.
+    /// `old_text` matches over archived entries with the same
+    /// substring/id rules as `replace`/`remove`. Default errors so
+    /// backends without an archive don't silently no-op (dirge-8h22).
+    fn restore(&self, _target: &str, _old_text: &str) -> Result<Value, String> {
+        Err("This memory backend does not support restoring removed entries".to_string())
+    }
 
     // ── Optional lifecycle hooks — default no-ops ──────────────
 
@@ -75,7 +84,9 @@ pub trait MemoryProvider: Send + Sync {
     /// backend (e.g. a vector store), audit log, or analytics
     /// sink.
     ///
-    /// `action` is one of `"add"`, `"replace"`, `"remove"`.
+    /// `action` is one of `"add"`, `"replace"`, `"remove"`,
+    /// `"restore"`. Consumers should ignore actions they don't know —
+    /// the set can grow.
     ///
     /// `payload` carries action-specific data — the semantics
     /// differ by action, NOT a generic "new content" field:
@@ -173,6 +184,10 @@ impl MemoryProvider for super::memory_db::SqliteMemoryStore {
 
     fn remove(&self, target: &str, old_text: &str) -> Result<Value, String> {
         super::memory_db::SqliteMemoryStore::remove(self, target, old_text)
+    }
+
+    fn restore(&self, target: &str, old_text: &str) -> Result<Value, String> {
+        super::memory_db::SqliteMemoryStore::restore(self, target, old_text)
     }
 }
 

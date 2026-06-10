@@ -65,7 +65,9 @@ the redundant copies.\n\
 the other. This is rare — only do it when the entry is genuinely two facts wearing one coat.\n\
   4. REMOVE. Only if the entry is clearly obsolete (refers to a deleted file, a renamed binary, \
 a long-superseded approach the project no longer uses). Show your reasoning in your thinking before \
-removing.\n\
+removing. Removal ARCHIVES the entry (it can be restored with `memory(action='restore', ...)`), \
+so a justified removal is recoverable. The `old_text` argument also accepts the entry's exact \
+`urn:ump:...` id from the stale-candidate table below when a substring would be ambiguous.\n\
 \n\
 Do NOT:\n\
   • Add new facts. The curator is for consolidation, not capture. Background review handles capture.\n\

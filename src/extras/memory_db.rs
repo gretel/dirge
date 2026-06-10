@@ -434,11 +434,18 @@ impl SqliteMemoryStore {
         victim
     }
 
-    fn delete_row(conn: &Connection, id: i64) -> Result<(), String> {
-        conn.execute("DELETE FROM memories WHERE id = ?1", params![id])
-            .map_err(|e| format!("Failed to delete entry: {e}"))?;
-        conn.execute("DELETE FROM memories_fts WHERE rowid = ?1", params![id])
-            .map_err(|e| format!("Failed to delete FTS entry: {e}"))?;
+    /// dirge-8h22: nothing is hard-deleted. Eviction and `remove`
+    /// both TOMBSTONE the row — it drops out of views, prompt
+    /// injection, and matching, but stays in the table (and the FTS
+    /// index, which active-only queries must filter) so it can be
+    /// inspected or restored later.
+    fn tombstone_row(conn: &Connection, id: i64) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET status = 'tombstoned', updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )
+        .map_err(|e| format!("Failed to tombstone entry: {e}"))?;
         Ok(())
     }
 
@@ -529,7 +536,7 @@ impl SqliteMemoryStore {
             }
             let victim = Self::least_salient_index(&rows);
             let removed = rows.remove(victim);
-            Self::delete_row(&tx, removed.id)?;
+            Self::tombstone_row(&tx, removed.id)?;
             evicted += 1;
         }
 
@@ -594,8 +601,10 @@ impl SqliteMemoryStore {
         Ok(())
     }
 
-    /// Remove an entry found by substring match. Same ambiguity rules
-    /// as `replace_entry`.
+    /// Remove an entry found by substring match (or exact uid). Same
+    /// ambiguity rules as `replace_entry`. dirge-8h22: removal
+    /// tombstones — the entry leaves views and prompt injection but
+    /// remains restorable via `restore_entry`.
     pub fn remove_entry(&self, target: &str, old_text: &str) -> Result<(), String> {
         let mut conn = self.conn.lock_ignore_poison();
         let tx = conn
@@ -603,9 +612,85 @@ impl SqliteMemoryStore {
             .map_err(|e| format!("Failed to begin transaction: {e}"))?;
         let rows = Self::active_rows(&tx, target)?;
         let idx = find_unique_match(&rows, old_text)?;
-        Self::delete_row(&tx, rows[idx].id)?;
+        Self::tombstone_row(&tx, rows[idx].id)?;
         tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
         Ok(())
+    }
+
+    /// Bring a tombstoned entry back to life (dirge-8h22). Matching
+    /// follows the same substring/uid + ambiguity rules, but over
+    /// TOMBSTONED rows of the target. Errors if an identical active
+    /// entry already exists. Restoring counts against the char budget
+    /// like an add: least-salient active entries are tombstoned to
+    /// make room. Returns the number evicted that way.
+    pub fn restore_entry(&self, target: &str, old_text: &str) -> Result<usize, String> {
+        let mut conn = self.conn.lock_ignore_poison();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("Failed to begin transaction: {e}"))?;
+
+        let tombstoned = Self::tombstoned_rows(&tx, target)?;
+        let idx = find_unique_match(&tombstoned, old_text)?;
+        let revived = &tombstoned[idx];
+
+        let mut rows = Self::active_rows(&tx, target)?;
+        if rows.iter().any(|r| {
+            r.content
+                .trim()
+                .eq_ignore_ascii_case(revived.content.trim())
+        }) {
+            return Err("An identical active entry already exists".to_string());
+        }
+
+        // Same compaction rule as add: make room by archiving the
+        // least-salient active entries.
+        let char_limit = char_limit_for(target);
+        let entry_cost = revived.content.len();
+        let mut evicted = 0usize;
+        while !rows.is_empty() {
+            let current: usize = rows.iter().map(|r| r.content.len() + 3).sum();
+            if current + entry_cost <= char_limit {
+                break;
+            }
+            let victim = Self::least_salient_index(&rows);
+            let removed = rows.remove(victim);
+            Self::tombstone_row(&tx, removed.id)?;
+            evicted += 1;
+        }
+
+        let now = chrono::Utc::now().to_rfc3339();
+        tx.execute(
+            "UPDATE memories SET status = 'active', updated_at = ?1 WHERE id = ?2",
+            params![now, revived.id],
+        )
+        .map_err(|e| format!("Failed to restore entry: {e}"))?;
+        tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
+        Ok(evicted)
+    }
+
+    fn tombstoned_rows(conn: &Connection, target: &str) -> Result<Vec<ActiveRow>, String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, uid, kind, content, confidence, salience, status
+                 FROM memories WHERE target = ?1 AND status = 'tombstoned' ORDER BY id",
+            )
+            .map_err(|e| format!("Failed to prepare query: {e}"))?;
+        let rows = stmt
+            .query_map(params![target], |row| {
+                Ok(ActiveRow {
+                    id: row.get(0)?,
+                    uid: row.get(1)?,
+                    kind: row.get(2)?,
+                    content: row.get(3)?,
+                    confidence: row.get(4)?,
+                    salience: row.get(5)?,
+                    status: row.get(6)?,
+                })
+            })
+            .map_err(|e| format!("Failed to query entries: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(rows)
     }
 
     /// Tool-facing success/view response. Same JSON shape as the
@@ -644,6 +729,16 @@ impl SqliteMemoryStore {
             })
             .collect();
 
+        // dirge-8h22: surface how many archived entries exist so the
+        // model/curator knows there is something to restore.
+        let tombstoned: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE target = ?1 AND status = 'tombstoned'",
+                params![target],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+
         let mut resp = serde_json::json!({
             "success": true,
             "target": target,
@@ -651,6 +746,7 @@ impl SqliteMemoryStore {
             "meta": meta_map,
             "usage": format!("{}% — {}/{} chars", pct, current, limit),
             "entry_count": entries.len(),
+            "tombstoned_count": tombstoned,
         });
         if !message.is_empty() {
             resp["message"] = serde_json::Value::String(message.to_string());
@@ -669,7 +765,7 @@ impl SqliteMemoryStore {
         let evicted = self.add_entry(target, content, kind)?;
         let message = if evicted > 0 {
             format!(
-                "Entry added; compacted {evicted} least-salient entr{} to stay within the memory budget.",
+                "Entry added; archived {evicted} least-salient entr{} to stay within the memory budget (restorable via action='restore').",
                 if evicted == 1 { "y" } else { "ies" }
             )
         } else {
@@ -694,7 +790,25 @@ impl SqliteMemoryStore {
     pub fn remove(&self, target: &str, old_text: &str) -> Result<serde_json::Value, String> {
         self.remove_entry(target, old_text)?;
         let conn = self.conn.lock_ignore_poison();
-        Self::success_response(&conn, target, "Entry removed.")
+        Self::success_response(
+            &conn,
+            target,
+            "Entry archived (restorable via action='restore').",
+        )
+    }
+
+    pub fn restore(&self, target: &str, old_text: &str) -> Result<serde_json::Value, String> {
+        let evicted = self.restore_entry(target, old_text)?;
+        let message = if evicted > 0 {
+            format!(
+                "Entry restored; archived {evicted} least-salient entr{} to stay within the memory budget.",
+                if evicted == 1 { "y" } else { "ies" }
+            )
+        } else {
+            "Entry restored.".to_string()
+        };
+        let conn = self.conn.lock_ignore_poison();
+        Self::success_response(&conn, target, &message)
     }
 
     pub fn view(&self, target: &str) -> serde_json::Value {
@@ -759,7 +873,18 @@ impl SqliteMemoryStore {
 /// semantics: zero matches errors; multiple matches with *different*
 /// content errors with previews; duplicates of identical content
 /// operate on the first.
+///
+/// dirge-8h22: an `old_text` of the form `urn:ump:…` is treated as an
+/// exact entry id instead (ids are surfaced in `view`'s meta map and
+/// in curator reports). Ids never appear in entry content, so the two
+/// matching modes can't collide.
 fn find_unique_match(rows: &[ActiveRow], old_text: &str) -> Result<usize, String> {
+    if old_text.starts_with("urn:ump:") {
+        return match rows.iter().position(|r| r.uid == old_text) {
+            Some(i) => Ok(i),
+            None => Err(format!("No entry found with id '{old_text}'")),
+        };
+    }
     let matches: Vec<usize> = rows
         .iter()
         .enumerate()
@@ -1485,7 +1610,7 @@ mod tests {
             resp["message"]
                 .as_str()
                 .unwrap()
-                .contains("compacted 1 least-salient entry"),
+                .contains("archived 1 least-salient entry"),
             "got: {}",
             resp["message"]
         );
@@ -1532,10 +1657,229 @@ mod tests {
 
         store.remove_entry("memory", "garbage").unwrap();
         let conn = raw_conn(&paths);
-        let total: i64 = conn
-            .query_row("SELECT COUNT(*) FROM memories_fts", [], |r| r.get(0))
+        // dirge-8h22: remove tombstones, so the FTS row survives —
+        // search consumers must join on memories.status. An
+        // active-only join finds nothing.
+        let active_hits: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories_fts f
+                 JOIN memories m ON m.id = f.rowid
+                 WHERE f.content MATCH 'garbage' AND m.status = 'active'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        assert_eq!(total, 0, "remove must purge the index");
+        assert_eq!(
+            active_hits, 0,
+            "tombstoned entries must not surface via FTS"
+        );
+    }
+
+    // ── Tombstone lifecycle (dirge-8h22) ─────────────────────────
+
+    #[test]
+    fn remove_tombstones_instead_of_deleting() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "doomed fact", None).unwrap();
+        store.remove_entry("memory", "doomed").unwrap();
+
+        let view = store.view("memory");
+        assert_eq!(view["entry_count"], 0, "tombstoned entry leaves the view");
+        assert_eq!(view["tombstoned_count"], 1, "but is counted as archived");
+
+        let conn = raw_conn(&paths);
+        let status: String = conn
+            .query_row(
+                "SELECT status FROM memories WHERE content = 'doomed fact'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            status, "tombstoned",
+            "row must survive with tombstoned status"
+        );
+    }
+
+    #[test]
+    fn tombstoned_entries_stay_out_of_the_snapshot() {
+        let (paths, _dir) = temp_project();
+        {
+            let store = SqliteMemoryStore::load(&paths).unwrap();
+            store.add_entry("memory", "keep me", None).unwrap();
+            store.add_entry("memory", "archive me", None).unwrap();
+            store.remove_entry("memory", "archive me").unwrap();
+        }
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let block = store.format_for_system_prompt();
+        assert!(block.contains("keep me"));
+        assert!(!block.contains("archive me"));
+    }
+
+    #[test]
+    fn readd_after_remove_is_not_a_duplicate() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "recurring fact", None).unwrap();
+        store.remove_entry("memory", "recurring").unwrap();
+        store
+            .add_entry("memory", "recurring fact", None)
+            .expect("tombstoned content must not block a fresh add");
+        assert_eq!(store.view("memory")["entry_count"], 1);
+    }
+
+    #[test]
+    fn restore_revives_a_removed_entry() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "valuable fact", Some(MemoryKind::Semantic))
+            .unwrap();
+        let uid_before = store.entries_for_curation().unwrap()[0].uid.clone();
+        store.remove_entry("memory", "valuable").unwrap();
+        assert_eq!(store.view("memory")["entry_count"], 0);
+
+        let evicted = store.restore_entry("memory", "valuable").unwrap();
+        assert_eq!(evicted, 0);
+        let view = store.view("memory");
+        assert_eq!(view["entry_count"], 1);
+        assert_eq!(view["tombstoned_count"], 0);
+        // Identity and classification survive the round trip.
+        assert_eq!(view["meta"]["valuable fact"]["kind"], "semantic");
+        assert_eq!(store.entries_for_curation().unwrap()[0].uid, uid_before);
+    }
+
+    #[test]
+    fn restore_rejects_when_identical_active_entry_exists() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "the fact", None).unwrap();
+        store.remove_entry("memory", "the fact").unwrap();
+        store.add_entry("memory", "the fact", None).unwrap();
+        let err = store.restore_entry("memory", "the fact").unwrap_err();
+        assert!(err.contains("identical active entry"), "got: {err}");
+    }
+
+    #[test]
+    fn restore_no_match_errors() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let err = store.restore_entry("memory", "ghost").unwrap_err();
+        assert!(err.contains("No entry found"), "got: {err}");
+    }
+
+    #[test]
+    fn restore_compacts_to_make_room() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        // Archive a large entry, refill the budget, then restore it.
+        let big = format!("big {}", "a".repeat(1500));
+        store
+            .add_entry("memory", &big, Some(MemoryKind::Identity))
+            .unwrap();
+        store.remove_entry("memory", "big ").unwrap();
+        let filler_one = format!("filler1 {}", "b".repeat(1000));
+        let filler_two = format!("filler2 {}", "c".repeat(1000));
+        store
+            .add_entry("memory", &filler_one, Some(MemoryKind::Working))
+            .unwrap();
+        store
+            .add_entry("memory", &filler_two, Some(MemoryKind::Semantic))
+            .unwrap();
+
+        let evicted = store.restore_entry("memory", "big ").unwrap();
+        assert!(evicted >= 1, "restore must compact like add");
+        let view = store.view("memory");
+        let entries: Vec<String> = view["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e.as_str().unwrap().to_string())
+            .collect();
+        assert!(entries.iter().any(|e| e.starts_with("big")));
+        assert!(
+            !entries.iter().any(|e| e.starts_with("filler1")),
+            "least-salient filler must be archived to make room: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn eviction_victims_are_restorable() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let working = format!("scratch {}", "a".repeat(1000));
+        let durable = format!("durable {}", "b".repeat(1000));
+        store
+            .add_entry("memory", &working, Some(MemoryKind::Working))
+            .unwrap();
+        store
+            .add_entry("memory", &durable, Some(MemoryKind::Semantic))
+            .unwrap();
+        // Overflow → working entry evicted (tombstoned, not deleted).
+        let evicted = store
+            .add_entry("memory", &format!("third {}", "c".repeat(400)), None)
+            .unwrap();
+        assert_eq!(evicted, 1);
+        assert_eq!(store.view("memory")["tombstoned_count"], 1);
+    }
+
+    // ── Id addressing (dirge-8h22) ───────────────────────────────
+
+    #[test]
+    fn uid_addressing_disambiguates_similar_entries() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "build with cargo", None).unwrap();
+        store
+            .add_entry("memory", "test with cargo test", None)
+            .unwrap();
+        // Substring is ambiguous…
+        assert!(store.remove_entry("memory", "cargo").is_err());
+        // …but the uid from view meta is exact.
+        let view = store.view("memory");
+        let uid = view["meta"]["build with cargo"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        store.remove_entry("memory", &uid).unwrap();
+        let view = store.view("memory");
+        assert_eq!(view["entry_count"], 1);
+        assert!(view["entries"][0].as_str().unwrap().contains("test with"));
+    }
+
+    #[test]
+    fn uid_addressing_works_for_replace_and_restore() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "original", None).unwrap();
+        let uid = store.view("memory")["meta"]["original"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        store
+            .replace_entry("memory", &uid, "rewritten", None)
+            .unwrap();
+        assert!(
+            store.view("memory")["entries"][0]
+                .as_str()
+                .unwrap()
+                .contains("rewritten")
+        );
+        store.remove_entry("memory", &uid).unwrap();
+        store.restore_entry("memory", &uid).unwrap();
+        assert_eq!(store.view("memory")["entry_count"], 1);
+    }
+
+    #[test]
+    fn unknown_uid_errors() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "something", None).unwrap();
+        let err = store
+            .remove_entry("memory", "urn:ump:doesnotexist")
+            .unwrap_err();
+        assert!(err.contains("No entry found with id"), "got: {err}");
     }
 
     // ── Legacy markdown import ───────────────────────────────────

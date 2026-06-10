@@ -62,7 +62,7 @@ impl Tool for MemoryTool {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "memory".to_string(),
-            description: r#"Persistent long-term memory. Actions: view [target] (read all entries), add (new entry), replace (update by substring match), remove (delete by substring match).
+            description: r#"Persistent long-term memory for project facts and pitfalls.
 
 WHEN TO SAVE:
 - User corrects you or says "remember this" / "don't do that"
@@ -70,29 +70,25 @@ WHEN TO SAVE:
 - You learn architecture patterns, library quirks, naming conventions
 - You identify a pitfall — something tried and failed
 
-TARGETS:
-- "memory": project facts, conventions, build, architecture
-- "pitfalls": anti-patterns, things tried and failed
+TARGETS: "memory" (facts, conventions, build, architecture), "pitfalls" (anti-patterns, things tried and failed).
 
-KINDS (optional, defaults to "procedural"):
-- "semantic": durable facts/preferences
-- "episodic": a specific past event
-- "procedural": how-to / behavioral rule
-- "working": short-lived task context
-- "identity": who the user/agent is
+KINDS (optional, default "procedural"): semantic (durable fact/preference), episodic (past event), procedural (how-to rule), working (short-lived task context), identity (who the user/agent is).
 
 ACTIONS:
-- view: read all entries in a target (no other args)
-- add: create a new entry (needs content)
-- replace: update by old_text substring (needs old_text + content)
-- remove: delete by old_text substring (needs old_text)"#
+- view: read all entries in a target
+- add: new entry (needs content)
+- replace: update matched entry (needs old_text + content)
+- remove: archive matched entry (needs old_text); restorable
+- restore: un-archive a removed entry (needs old_text)
+
+old_text matches a unique substring, or the exact "urn:ump:…" id from view's meta."#
                 .to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["view", "add", "replace", "remove"],
+                        "enum": ["view", "add", "replace", "remove", "restore"],
                         "description": "The action to perform."
                     },
                     "target": {
@@ -106,7 +102,7 @@ ACTIONS:
                     },
                     "old_text": {
                         "type": "string",
-                        "description": "Short unique substring identifying the entry to replace or remove."
+                        "description": "Short unique substring identifying the entry to replace, remove, or restore — or the entry's exact 'urn:ump:…' id from view's meta."
                     },
                     "kind": {
                         "type": "string",
@@ -203,8 +199,27 @@ ACTIONS:
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
+            "restore" => {
+                let old_text = crate::agent::tools::required_nonblank(
+                    args.old_text.as_deref(),
+                    "old_text",
+                    "restore",
+                )?;
+                let resp = self
+                    .store
+                    .restore(target, old_text)
+                    .map_err(ToolError::Msg)?;
+                crate::agent::review::fire_memory_write(
+                    self.store.as_ref(),
+                    "restore",
+                    target,
+                    old_text,
+                );
+                Ok(serde_json::to_string_pretty(&resp)
+                    .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
+            }
             _ => Err(ToolError::Msg(format!(
-                "Unknown action '{}'. Use: view, add, replace, remove.",
+                "Unknown action '{}'. Use: view, add, replace, remove, restore.",
                 args.action
             ))),
         }
@@ -670,7 +685,7 @@ mod tests {
             .expect("SYSTEM_PROMPT should describe the memory tool");
 
         // Extract candidate action words from the prompt.
-        let known_actions = ["view", "add", "replace", "remove"];
+        let known_actions = ["view", "add", "replace", "remove", "restore"];
         let prompt_actions: Vec<&str> = known_actions
             .iter()
             .copied()
@@ -726,6 +741,15 @@ mod tests {
                 },
                 "remove" => Args {
                     action: "remove".into(),
+                    target: "memory".into(),
+                    content: None,
+                    old_text: Some("entry-for-add".into()),
+                    kind: None,
+                },
+                // Runs after "remove" archived entry-for-add, so the
+                // restore has a tombstoned entry to revive.
+                "restore" => Args {
+                    action: "restore".into(),
                     target: "memory".into(),
                     content: None,
                     old_text: Some("entry-for-add".into()),
