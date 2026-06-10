@@ -110,9 +110,6 @@ fn default_salience_for_kind(kind: MemoryKind) -> f64 {
     }
 }
 
-/// Default confidence (UMP server.ts:255).
-const DEFAULT_CONFIDENCE: f64 = 0.6;
-
 /// Port of UMP id.ts `randomId()`: 128 random bits, base32-encoded
 /// (lowercase, no padding), prefixed with `urn:ump:`.
 fn random_entry_id() -> String {
@@ -311,7 +308,6 @@ struct ActiveRow {
     uid: String,
     kind: String,
     content: String,
-    confidence: f64,
     salience: f64,
     status: String,
     tier: String,
@@ -524,7 +520,7 @@ impl SqliteMemoryStore {
         extra_where: &str,
     ) -> Result<Vec<ActiveRow>, String> {
         let sql = format!(
-            "SELECT id, uid, kind, content, confidence, salience, status, tier, last_used_at
+            "SELECT id, uid, kind, content, salience, status, tier, last_used_at
              FROM memories WHERE target = ?1 AND {extra_where} ORDER BY id"
         );
         let mut stmt = conn
@@ -537,11 +533,10 @@ impl SqliteMemoryStore {
                     uid: row.get(1)?,
                     kind: row.get(2)?,
                     content: row.get(3)?,
-                    confidence: row.get(4)?,
-                    salience: row.get(5)?,
-                    status: row.get(6)?,
-                    tier: row.get(7)?,
-                    last_used_at: row.get(8)?,
+                    salience: row.get(4)?,
+                    status: row.get(5)?,
+                    tier: row.get(6)?,
+                    last_used_at: row.get(7)?,
                 })
             })
             .map_err(|e| format!("Failed to query entries: {e}"))?
@@ -654,15 +649,14 @@ impl SqliteMemoryStore {
         let now = chrono::Utc::now().to_rfc3339();
         conn.execute(
             "INSERT INTO memories
-                (uid, target, kind, content, status, tier, confidence, salience,
+                (uid, target, kind, content, status, tier, salience,
                  created_at, updated_at, use_count)
-             VALUES (?1, ?2, ?3, ?4, 'active', 'hot', ?5, ?6, ?7, ?7, 0)",
+             VALUES (?1, ?2, ?3, ?4, 'active', 'hot', ?5, ?6, ?6, 0)",
             params![
                 random_entry_id(),
                 target,
                 kind.as_str(),
                 content,
-                DEFAULT_CONFIDENCE,
                 default_salience_for_kind(kind),
                 now,
             ],
@@ -996,7 +990,6 @@ impl SqliteMemoryStore {
                         "id": r.uid,
                         "kind": r.kind,
                         "lifecycle": {
-                            "confidence": r.confidence,
                             "salience": r.salience,
                             "status": r.status,
                         }
@@ -1269,17 +1262,15 @@ fn legacy_entry_id(content: &str) -> String {
 
 #[derive(serde::Deserialize)]
 struct LegacyLifecycle {
-    #[serde(default = "legacy_default_confidence")]
-    confidence: f64,
+    // `confidence` is intentionally NOT read — it was dead (dirge-lerb)
+    // and the column is gone. serde ignores unknown fields by default,
+    // so a legacy sidecar carrying it still deserializes.
     #[serde(default = "legacy_default_salience")]
     salience: f64,
     #[serde(default = "legacy_default_status")]
     status: String,
 }
 
-fn legacy_default_confidence() -> f64 {
-    DEFAULT_CONFIDENCE
-}
 fn legacy_default_salience() -> f64 {
     0.5
 }
@@ -1351,16 +1342,14 @@ fn import_markdown_if_present(conn: &Connection, paths: &ProjectPaths) -> Result
             let key = legacy_entry_id(entry);
             let m = meta.get(&key);
             let kind = m.and_then(|m| parse_kind(&m.kind)).unwrap_or_default();
-            let (uid, confidence, salience, status) = match m {
+            let (uid, salience, status) = match m {
                 Some(m) => (
                     m.id.clone(),
-                    m.lifecycle.confidence,
                     m.lifecycle.salience,
                     m.lifecycle.status.clone(),
                 ),
                 None => (
                     random_entry_id(),
-                    DEFAULT_CONFIDENCE,
                     default_salience_for_kind(kind),
                     "active".to_string(),
                 ),
@@ -1372,16 +1361,15 @@ fn import_markdown_if_present(conn: &Connection, paths: &ProjectPaths) -> Result
 
             conn.execute(
                 "INSERT OR IGNORE INTO memories
-                    (uid, target, kind, content, status, tier, confidence, salience,
+                    (uid, target, kind, content, status, tier, salience,
                      created_at, updated_at, use_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'hot', ?6, ?7, ?8, ?9, 0)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'hot', ?6, ?7, ?8, 0)",
                 params![
                     uid,
                     target,
                     kind.as_str(),
                     entry,
                     status,
-                    confidence,
                     salience,
                     created_at,
                     now,
@@ -1935,8 +1923,11 @@ mod tests {
         assert!(meta["id"].as_str().unwrap().starts_with("urn:ump:"));
         assert_eq!(meta["kind"], "procedural");
         assert_eq!(meta["lifecycle"]["status"], "active");
-        assert!(meta["lifecycle"]["confidence"].as_f64().is_some());
         assert!(meta["lifecycle"]["salience"].as_f64().is_some());
+        assert!(
+            meta["lifecycle"]["confidence"].is_null(),
+            "confidence was removed as dead (dirge-lerb)",
+        );
     }
 
     #[test]
@@ -2284,11 +2275,14 @@ mod tests {
         let pit = store.view("pitfalls");
         assert_eq!(pit["entry_count"], 1);
 
-        // Sidecar metadata carried over.
+        // Sidecar metadata carried over. (A legacy sidecar still
+        // carrying the removed `confidence` field imports fine — serde
+        // ignores it; it just isn't surfaced anymore.)
         let meta = &mem["meta"]["build with: cargo build"];
         assert_eq!(meta["id"], "urn:ump:legacyid");
         assert_eq!(meta["kind"], "semantic");
-        assert_eq!(meta["lifecycle"]["confidence"], 0.9);
+        assert_eq!(meta["lifecycle"]["salience"], 0.6);
+        assert!(meta["lifecycle"]["confidence"].is_null());
 
         // Usage first_seen became created_at.
         let entries = store.entries_for_curation().unwrap();
