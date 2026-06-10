@@ -1181,14 +1181,6 @@ impl SqliteMemoryStore {
             .collect::<Vec<_>>()
             .join(ENTRY_DELIMITER)
     }
-
-    /// Lowercased concatenation of all active entry text — the
-    /// cross-session extractor's coarse "already covered" pre-filter.
-    pub fn all_content_lowercased(&self) -> String {
-        let mem = self.rendered("memory");
-        let pit = self.rendered("pitfalls");
-        format!("{mem}\n{pit}").to_lowercase()
-    }
 }
 
 /// Substring matching with the markdown store's exact ambiguity
@@ -1891,17 +1883,6 @@ mod tests {
         store.add_entry("memory", "fact B", None).unwrap();
         assert_eq!(store.rendered("memory"), "fact A\n§\nfact B");
         assert_eq!(store.rendered("pitfalls"), "");
-    }
-
-    #[test]
-    fn all_content_lowercased_spans_both_targets() {
-        let (paths, _dir) = temp_project();
-        let store = SqliteMemoryStore::load(&paths).unwrap();
-        store.add_entry("memory", "Cargo Build", None).unwrap();
-        store.add_entry("pitfalls", "Render LOOP", None).unwrap();
-        let all = store.all_content_lowercased();
-        assert!(all.contains("cargo build"));
-        assert!(all.contains("render loop"));
     }
 
     // ── Response shape parity ────────────────────────────────────
