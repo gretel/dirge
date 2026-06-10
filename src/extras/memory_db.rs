@@ -347,18 +347,6 @@ fn compaction_message(verb: &str, outcome: &CompactionOutcome) -> String {
     message
 }
 
-/// First line of an entry, capped at 80 chars — the breadcrumb-index
-/// preview (same shape the curator's report previews use).
-fn preview_line(content: &str) -> String {
-    let first = content.lines().next().unwrap_or("").trim();
-    if first.chars().count() <= 80 {
-        first.to_string()
-    } else {
-        let cut: String = first.chars().take(77).collect();
-        format!("{cut}...")
-    }
-}
-
 /// An entry handed to the memory curator: enough to derive age and
 /// usage, and to identify the entry in audit reports, without sidecar
 /// bookkeeping.
@@ -516,7 +504,7 @@ impl SqliteMemoryStore {
                     c.uid,
                     c.target,
                     c.kind,
-                    preview_line(&c.content),
+                    crate::text::first_line_preview(&c.content),
                 ));
             }
             out.push_str("</project_memory_index>\n");
@@ -1033,7 +1021,7 @@ impl SqliteMemoryStore {
                 serde_json::json!({
                     "id": r.uid,
                     "kind": r.kind,
-                    "preview": preview_line(&r.content),
+                    "preview": crate::text::first_line_preview(&r.content),
                 })
             })
             .collect();
