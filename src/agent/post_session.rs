@@ -258,9 +258,6 @@ async fn stage_memory_curator(agent: AnyAgent, paths: ProjectPaths) {
                 tracing::info!(
                     target: "dirge::memory_curator",
                     total = %report.total_entries,
-                    added = %report.reconcile.added,
-                    retained = %report.reconcile.retained,
-                    dropped = %report.reconcile.dropped,
                     stale = %report.stale_candidates.len(),
                     "memory curator mechanical pass complete",
                 );

@@ -225,7 +225,7 @@ fn validate_target(target: &str) -> Result<&str, ToolError> {
 mod tests {
     use super::*;
     use crate::extras::dirge_paths::ProjectPaths;
-    use crate::extras::memory_store::MemoryToolStore;
+    use crate::extras::memory_db::SqliteMemoryStore;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEST_COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -237,7 +237,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let paths = ProjectPaths::new(&dir);
-        let store: Arc<dyn MemoryProvider> = Arc::new(MemoryToolStore::load(&paths).unwrap());
+        let store: Arc<dyn MemoryProvider> = Arc::new(SqliteMemoryStore::load(&paths).unwrap());
         (store, dir)
     }
 

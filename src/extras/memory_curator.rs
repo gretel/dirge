@@ -27,12 +27,10 @@
 //! - LLM pass uses a memory-only allow-list — model literally
 //!   cannot reach skill-write tools even if its prompt slips.
 
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::extras::dirge_paths::ProjectPaths;
-use crate::extras::memory_usage::{MemoryUsageStore, ReconcileReport, entry_id};
 
 /// dirge-mo0w PR-2: prompt for the memory curator's LLM
 /// consolidation pass. Analog of `skills/curator::CURATOR_PROMPT`
@@ -92,8 +90,6 @@ const ARCHIVE_AFTER_STALE_DAYS: u64 = 90;
 
 /// Minimum hours between curator runs.
 const INTERVAL_HOURS: u64 = 168; // 7 days
-
-const ENTRY_DELIMITER: &str = "\n§\n";
 
 // ── State ─────────────────────────────────────────────
 
@@ -189,72 +185,56 @@ impl MemoryCurator {
         }
     }
 
-    /// Run the mechanical pass: reconcile telemetry sidecar
-    /// against current entries, identify stale candidates, write
-    /// audit report. No LLM call, no archival. Returns the
-    /// per-run report so callers (tests, follow-on LLM pass) can
-    /// inspect what happened.
+    /// Run the mechanical pass: scan the memories table, identify
+    /// stale candidates by row age, write audit report. No LLM call,
+    /// no archival. Returns the per-run report so callers (tests,
+    /// follow-on LLM pass) can inspect what happened.
+    ///
+    /// dirge-18ks: entry age comes straight from `created_at` on the
+    /// memories row — the `.usage.json` sidecar reconciliation this
+    /// pass used to perform is obsolete (and `created_at` survives
+    /// `replace`, which the content-hash-keyed sidecar did not).
     pub fn run_mechanical_pass(&mut self) -> Result<MechanicalReport, String> {
         let started_at = chrono::Utc::now();
         let started_at_iso = started_at.to_rfc3339();
         let started_at_filename = started_at.format("%Y%m%d-%H%M%S").to_string();
         let now = now_secs();
 
-        // 1. Scan MEMORY.md and PITFALLS.md into (target, entry)
-        //    pairs.
-        let entries = self.scan_entries()?;
+        // 1. Scan active entries from the store.
+        let store = crate::extras::memory_db::SqliteMemoryStore::load(&self.paths)?;
+        let entries = store.entries_for_curation()?;
         let total_entries = entries.len();
 
-        // 2. Reconcile usage sidecar.
-        let mut usage = MemoryUsageStore::load(&self.paths);
-        let entries_slice: Vec<(&str, &str)> = entries
-            .iter()
-            .map(|(t, c)| (t.as_str(), c.as_str()))
-            .collect();
-        let reconcile = usage.reconcile(&entries_slice, &started_at_iso);
-        if let Err(e) = usage.save() {
-            // Don't abort the pass — the report still has value.
-            tracing::warn!(
-                target: "dirge::memory_curator",
-                error = %e,
-                "Failed to save memory usage sidecar",
-            );
-        }
-
-        // 3. Identify stale candidates.
+        // 2. Identify stale candidates by row age.
         let mut stale_candidates: Vec<StaleCandidate> = Vec::new();
-        for (target, content) in &entries {
-            let Some(rec) = usage.get(content) else {
-                continue;
-            };
-            let Ok(first_seen) = chrono::DateTime::parse_from_rfc3339(&rec.first_seen_at) else {
+        for entry in &entries {
+            let Ok(first_seen) = chrono::DateTime::parse_from_rfc3339(&entry.created_at) else {
                 continue;
             };
             let age_secs = started_at.timestamp() - first_seen.timestamp();
             let age_days = (age_secs.max(0) as u64) / 86400;
             if age_days >= STALE_AFTER_DAYS {
                 stale_candidates.push(StaleCandidate {
-                    target: target.clone(),
-                    entry_id: entry_id(content),
-                    preview: preview(content),
+                    target: entry.target.clone(),
+                    entry_id: entry.uid.clone(),
+                    preview: preview(&entry.content),
                     age_days,
                 });
             }
         }
-        stale_candidates.sort_by(|a, b| b.age_days.cmp(&a.age_days));
+        stale_candidates.sort_by_key(|c| std::cmp::Reverse(c.age_days));
 
-        // 4. Update state.
+        // 3. Update state.
         self.state.last_run = Some(now);
         self.state.save(&self.state_path)?;
 
         let report = MechanicalReport {
             started_at_iso: started_at_iso.clone(),
             total_entries,
-            reconcile,
             stale_candidates,
         };
 
-        // 5. Write audit report.
+        // 4. Write audit report.
         let reports_dir = self
             .paths
             .memory_dir()
@@ -266,36 +246,6 @@ impl MemoryCurator {
             .map_err(|e| format!("write report: {e}"))?;
 
         Ok(report)
-    }
-
-    /// Read MEMORY.md and PITFALLS.md from `.dirge/memory/`,
-    /// split on `\n§\n`, return `(target, entry_content)` pairs.
-    /// Empty / missing files contribute nothing — caller treats
-    /// an empty Vec as "no entries to curate".
-    fn scan_entries(&self) -> Result<Vec<(String, String)>, String> {
-        let mut entries: Vec<(String, String)> = Vec::new();
-        for target in ["memory", "pitfalls"] {
-            let file_name = match target {
-                "memory" => "MEMORY.md",
-                "pitfalls" => "PITFALLS.md",
-                _ => continue,
-            };
-            let path = self.paths.memory_dir().join(file_name);
-            if !path.is_file() {
-                continue;
-            }
-            let _ = File::open(&path); // sanity check accessibility
-            let content =
-                std::fs::read_to_string(&path).map_err(|e| format!("read {file_name}: {e}"))?;
-            for raw in content.split(ENTRY_DELIMITER) {
-                let trimmed = raw.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                entries.push((target.to_string(), trimmed.to_string()));
-            }
-        }
-        Ok(entries)
     }
 }
 
@@ -309,7 +259,6 @@ impl MemoryCurator {
 pub struct MechanicalReport {
     pub started_at_iso: String,
     pub total_entries: usize,
-    pub reconcile: ReconcileReport,
     pub stale_candidates: Vec<StaleCandidate>,
 }
 
@@ -333,11 +282,6 @@ impl MechanicalReport {
         let _ = writeln!(out, "# Memory curator — mechanical pass\n");
         let _ = writeln!(out, "- Started: {}", self.started_at_iso);
         let _ = writeln!(out, "- Total entries: {}", self.total_entries);
-        let _ = writeln!(
-            out,
-            "- Reconcile: +{} new / {} retained / -{} dropped",
-            self.reconcile.added, self.reconcile.retained, self.reconcile.dropped,
-        );
         let _ = writeln!(out, "- Stale candidates: {}", self.stale_candidates.len());
 
         if !self.stale_candidates.is_empty() {
@@ -530,10 +474,26 @@ mod tests {
         (paths, dir)
     }
 
-    fn write_memory(paths: &ProjectPaths, name: &str, entries: &[&str]) {
-        let path = paths.memory_dir().join(name);
-        let content = entries.join(ENTRY_DELIMITER);
-        std::fs::write(path, content).unwrap();
+    /// Seed entries through the store API (the only write path now).
+    fn seed_memory(paths: &ProjectPaths, target: &str, entries: &[&str]) {
+        let store = crate::extras::memory_db::SqliteMemoryStore::load(paths).unwrap();
+        for entry in entries {
+            store.add_entry(target, entry, None).unwrap();
+        }
+    }
+
+    /// Backdate an entry's created_at directly in the DB — the test
+    /// stand-in for "this entry has been around for N days".
+    fn backdate_entry(paths: &ProjectPaths, content: &str, days: i64) {
+        let conn = crate::extras::memory_db::raw_conn(paths);
+        let then = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+        let changed = conn
+            .execute(
+                "UPDATE memories SET created_at = ?1 WHERE content = ?2",
+                rusqlite::params![then, content],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "backdate must hit exactly one row");
     }
 
     /// First-ever check SEEDS state (persists last_run) and does
@@ -592,33 +552,29 @@ mod tests {
         assert!(curator.should_run_now(), "after 8 days the gate must open");
     }
 
-    /// Empty memory directory: pass runs cleanly, report shows
+    /// Empty memory store: pass runs cleanly, report shows
     /// zero entries, state advances.
     #[test]
-    fn run_mechanical_pass_handles_empty_memory_dir() {
+    fn run_mechanical_pass_handles_empty_memory_store() {
         let (paths, _tmp) = temp_project();
         let mut curator = MemoryCurator::new(&paths).unwrap();
         let report = curator.run_mechanical_pass().unwrap();
         assert_eq!(report.total_entries, 0);
-        assert_eq!(report.reconcile.added, 0);
         assert_eq!(report.stale_candidates.len(), 0);
         // State advanced.
         assert!(curator.state.last_run.is_some());
     }
 
-    /// Fresh entries get recorded in the usage sidecar and
-    /// surface as "added" in the report, but DON'T appear as
+    /// Fresh entries appear in the report total but DON'T appear as
     /// stale candidates (they're new).
     #[test]
     fn run_mechanical_pass_records_fresh_entries_without_marking_stale() {
         let (paths, _tmp) = temp_project();
-        write_memory(&paths, "MEMORY.md", &["fact 1", "fact 2"]);
-        write_memory(&paths, "PITFALLS.md", &["pitfall 1"]);
+        seed_memory(&paths, "memory", &["fact 1", "fact 2"]);
+        seed_memory(&paths, "pitfalls", &["pitfall 1"]);
         let mut curator = MemoryCurator::new(&paths).unwrap();
         let report = curator.run_mechanical_pass().unwrap();
         assert_eq!(report.total_entries, 3);
-        assert_eq!(report.reconcile.added, 3);
-        assert_eq!(report.reconcile.dropped, 0);
         assert_eq!(
             report.stale_candidates.len(),
             0,
@@ -626,20 +582,13 @@ mod tests {
         );
     }
 
-    /// Entries first observed > 30 days ago surface as stale
-    /// candidates. Simulated by pre-seeding the usage sidecar
-    /// with a backdated `first_seen_at`.
+    /// Entries created > 30 days ago surface as stale candidates.
+    /// Age now comes straight from the row's `created_at`.
     #[test]
-    fn run_mechanical_pass_identifies_entries_first_seen_long_ago_as_stale() {
+    fn run_mechanical_pass_identifies_old_entries_as_stale() {
         let (paths, _tmp) = temp_project();
-        write_memory(&paths, "MEMORY.md", &["old fact", "new fact"]);
-        // Pre-seed the sidecar with backdated "old fact".
-        let mut usage = MemoryUsageStore::load(&paths);
-        let thirty_one_days_ago = chrono::Utc::now() - chrono::Duration::days(31);
-        let now = chrono::Utc::now().to_rfc3339();
-        usage.reconcile(&[("memory", "old fact")], &thirty_one_days_ago.to_rfc3339());
-        usage.reconcile(&[("memory", "old fact"), ("memory", "new fact")], &now);
-        usage.save().unwrap();
+        seed_memory(&paths, "memory", &["old fact", "new fact"]);
+        backdate_entry(&paths, "old fact", 31);
 
         let mut curator = MemoryCurator::new(&paths).unwrap();
         let report = curator.run_mechanical_pass().unwrap();
@@ -657,13 +606,19 @@ mod tests {
             !stale_targets.contains(&"new fact"),
             "fresh entry must NOT be stale: {stale_targets:?}",
         );
+        // Stale candidates are identified by their stable uid now.
+        assert!(
+            report.stale_candidates[0].entry_id.starts_with("urn:ump:"),
+            "candidate id must be the row uid: {:?}",
+            report.stale_candidates[0].entry_id,
+        );
     }
 
     /// REPORT.md is written under `.dirge/memory/.curator_reports/{ts}/`.
     #[test]
     fn run_mechanical_pass_writes_audit_report_to_disk() {
         let (paths, _tmp) = temp_project();
-        write_memory(&paths, "MEMORY.md", &["one fact"]);
+        seed_memory(&paths, "memory", &["one fact"]);
         let mut curator = MemoryCurator::new(&paths).unwrap();
         curator.run_mechanical_pass().unwrap();
         let reports_root = paths.memory_dir().join(".curator_reports");
@@ -680,22 +635,22 @@ mod tests {
         assert!(body.contains("Total entries: 1"));
     }
 
-    /// Removed entries: an entry present last run but absent now
-    /// surfaces as `dropped` in the reconcile report and is
-    /// purged from the sidecar.
+    /// A removed entry stops appearing in subsequent passes — no
+    /// sidecar to reconcile, the row is simply gone.
     #[test]
-    fn run_mechanical_pass_drops_entries_that_disappeared() {
+    fn run_mechanical_pass_reflects_removed_entries() {
         let (paths, _tmp) = temp_project();
-        write_memory(&paths, "MEMORY.md", &["doomed fact"]);
+        seed_memory(&paths, "memory", &["doomed fact"]);
         let mut curator = MemoryCurator::new(&paths).unwrap();
-        curator.run_mechanical_pass().unwrap();
-        // Now remove the entry from disk and re-run.
-        write_memory(&paths, "MEMORY.md", &[]);
+        let report = curator.run_mechanical_pass().unwrap();
+        assert_eq!(report.total_entries, 1);
+
+        let store = crate::extras::memory_db::SqliteMemoryStore::load(&paths).unwrap();
+        store.remove_entry("memory", "doomed fact").unwrap();
+
         let mut curator2 = MemoryCurator::new(&paths).unwrap();
         let report = curator2.run_mechanical_pass().unwrap();
-        assert_eq!(report.reconcile.dropped, 1, "removed entry must drop");
-        let usage = MemoryUsageStore::load(&paths);
-        assert!(usage.is_empty(), "sidecar must be purged");
+        assert_eq!(report.total_entries, 0, "removed entry must disappear");
     }
 
     /// State persistence: a fresh curator instance loads the
@@ -703,7 +658,7 @@ mod tests {
     #[test]
     fn run_mechanical_pass_persists_last_run_timestamp() {
         let (paths, _tmp) = temp_project();
-        write_memory(&paths, "MEMORY.md", &["whatever"]);
+        seed_memory(&paths, "memory", &["whatever"]);
         let mut curator = MemoryCurator::new(&paths).unwrap();
         curator.run_mechanical_pass().unwrap();
         let last_run = curator.state.last_run;
@@ -721,11 +676,6 @@ mod tests {
         let report = MechanicalReport {
             started_at_iso: "2026-05-28T12:00:00Z".to_string(),
             total_entries: 5,
-            reconcile: ReconcileReport {
-                added: 1,
-                retained: 4,
-                dropped: 0,
-            },
             stale_candidates: vec![],
         };
         let md = report.to_markdown();
@@ -741,7 +691,6 @@ mod tests {
         MechanicalReport {
             started_at_iso: "2026-05-28T12:00:00Z".to_string(),
             total_entries: stale.len(),
-            reconcile: ReconcileReport::default(),
             stale_candidates: stale,
         }
     }

@@ -650,12 +650,12 @@ fn migration_from_v2_to_v5_adds_trigram_and_columns() {
     // Open via SessionDb — v3, v4, v5 should fire.
     let db = SessionDb::open(&db_path).unwrap();
 
-    // Verify pragma version is now 5.
+    // Verify pragma version reaches the current schema.
     let ver: u32 = db
         .conn
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(ver, 6, "should be at schema version 6 after migration");
+    assert_eq!(ver, 7, "should be at schema version 7 after migration");
 
     // Trigram table should exist.
     let trigram_exists: i64 = db

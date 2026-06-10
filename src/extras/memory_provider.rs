@@ -133,7 +133,7 @@ pub trait MemoryProvider: Send + Sync {
 }
 
 /// Implementing `MemoryProvider` on the dirge built-in
-/// `MemoryToolStore` makes it the canonical backend without changing
+/// `SqliteMemoryStore` makes it the canonical backend without changing
 /// any of its existing public methods.
 ///
 /// dirge-5feg: this impl deliberately does NOT call `on_memory_write`
@@ -142,22 +142,22 @@ pub trait MemoryProvider: Send + Sync {
 /// custom providers (and providers that wrap this one) get the hook
 /// fired exactly once at the tool layer, without each impl having to
 /// remember to do so.
-impl MemoryProvider for super::memory_store::MemoryToolStore {
+impl MemoryProvider for super::memory_db::SqliteMemoryStore {
     fn name(&self) -> &str {
         "builtin"
     }
 
     fn format_for_system_prompt(&self) -> String {
-        super::memory_store::MemoryToolStore::format_for_system_prompt(self)
+        super::memory_db::SqliteMemoryStore::format_for_system_prompt(self)
     }
 
     fn view(&self, target: &str) -> Value {
-        super::memory_store::MemoryToolStore::view(self, target)
+        super::memory_db::SqliteMemoryStore::view(self, target)
     }
 
     fn add(&self, target: &str, content: &str, kind: Option<&str>) -> Result<Value, String> {
-        let mkind = kind.and_then(super::memory_store::parse_kind);
-        super::memory_store::MemoryToolStore::add(self, target, content, mkind)
+        let mkind = kind.and_then(super::memory_db::parse_kind);
+        super::memory_db::SqliteMemoryStore::add(self, target, content, mkind)
     }
 
     fn replace(
@@ -167,12 +167,12 @@ impl MemoryProvider for super::memory_store::MemoryToolStore {
         content: &str,
         kind: Option<&str>,
     ) -> Result<Value, String> {
-        let mkind = kind.and_then(super::memory_store::parse_kind);
-        super::memory_store::MemoryToolStore::replace(self, target, old_text, content, mkind)
+        let mkind = kind.and_then(super::memory_db::parse_kind);
+        super::memory_db::SqliteMemoryStore::replace(self, target, old_text, content, mkind)
     }
 
     fn remove(&self, target: &str, old_text: &str) -> Result<Value, String> {
-        super::memory_store::MemoryToolStore::remove(self, target, old_text)
+        super::memory_db::SqliteMemoryStore::remove(self, target, old_text)
     }
 }
 
@@ -432,7 +432,7 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         let paths = ProjectPaths::new(&dir);
-        let store = super::super::memory_store::MemoryToolStore::load(&paths).unwrap();
+        let store = super::super::memory_db::SqliteMemoryStore::load(&paths).unwrap();
 
         // Call through the trait — proves the impl forwards.
         let provider: &dyn MemoryProvider = &store;
