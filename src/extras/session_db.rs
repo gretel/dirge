@@ -226,11 +226,42 @@ impl SessionDb {
         Ok(db)
     }
 
+    /// Serialized migration entry point. Several components (session
+    /// persistence, memory store, session search) open this DB, and
+    /// they can open it CONCURRENTLY on a fresh file — without
+    /// serialization both connections read user_version=0 and both
+    /// run v1's CREATE TABLE, so the loser errors out (PR #392 CI).
+    /// BEGIN EXCLUSIVE makes the loser wait (up to the busy timeout),
+    /// then re-read the version the winner committed and skip the
+    /// completed migrations.
     fn migrate(&self) -> Result<(), String> {
+        let _ = self.conn.busy_timeout(std::time::Duration::from_secs(30));
+        self.conn
+            .execute_batch("BEGIN EXCLUSIVE")
+            .map_err(|e| format!("Failed to lock DB for migration: {e}"))?;
+        match self.run_pending_migrations() {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT")
+                .map_err(|e| format!("Failed to commit migrations: {e}")),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK");
+                Err(e)
+            }
+        }
+    }
+
+    /// Must run under the exclusive transaction `migrate` opened —
+    /// the version read below is only race-free while locked.
+    fn run_pending_migrations(&self) -> Result<(), String> {
         let current: u32 = self
             .conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .map_err(|e| format!("Failed to read schema version: {e}"))?;
+
+        if current >= SCHEMA_VERSION {
+            return Ok(());
+        }
 
         if current < 1 {
             self.run_migration_v1()?;

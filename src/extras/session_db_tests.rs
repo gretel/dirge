@@ -18,6 +18,49 @@ fn temp_db() -> (SessionDb, std::path::PathBuf) {
     (db, dir)
 }
 
+/// PR #392 CI failure: several components (session persistence,
+/// memory store, session search) open the same state.db, and tests
+/// build them in parallel. On a FRESH file, concurrent first opens
+/// raced the migration chain — both connections read user_version=0
+/// and both ran v1's CREATE TABLE, so the loser errored out and its
+/// `SqliteMemoryStore::load` returned None. Migrations must be
+/// serialized: every concurrent open of a fresh DB succeeds.
+#[test]
+fn concurrent_first_opens_all_succeed() {
+    let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "dirge-session-db-race-{}-{}",
+        std::process::id(),
+        n
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.db");
+
+    let handles: Vec<_> = (0..8)
+        .map(|_| {
+            let p = path.clone();
+            std::thread::spawn(move || SessionDb::open(&p).map(|_| ()))
+        })
+        .collect();
+    let results: Vec<Result<(), String>> = handles
+        .into_iter()
+        .map(|h| h.join().expect("thread must not panic"))
+        .collect();
+    for (i, r) in results.iter().enumerate() {
+        assert!(r.is_ok(), "concurrent open {i} failed: {r:?}");
+    }
+
+    // The DB ends up fully migrated exactly once.
+    let db = SessionDb::open(&path).unwrap();
+    let ver: u32 = db
+        .conn
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(ver, 7);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn create_and_read_session() {
     let (db, _dir) = temp_db();
