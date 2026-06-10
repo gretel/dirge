@@ -329,7 +329,11 @@ pub struct CompactionOutcome {
 
 /// Tool-response message for an add/restore that may have compacted.
 fn compaction_message(verb: &str, outcome: &CompactionOutcome) -> String {
-    let mut message = format!("{verb}.");
+    // The system-prompt snapshot is frozen at session start, so a new
+    // entry is active from the NEXT session, not the current prompt.
+    // Say so at the point of the write so the model doesn't re-add a
+    // fact it won't see reappear (dirge-kvfm).
+    let mut message = format!("{verb} (active in your memory from the next session).");
     if outcome.demoted > 0 {
         message = format!(
             "{verb}; demoted {} least-salient entr{} to the breadcrumb index to stay within the inline budget (full text via action='expand').",
@@ -1922,7 +1926,10 @@ mod tests {
         assert_eq!(resp["success"], true);
         assert_eq!(resp["target"], "memory");
         assert_eq!(resp["entry_count"], 1);
-        assert_eq!(resp["message"], "Entry added.");
+        assert_eq!(
+            resp["message"],
+            "Entry added (active in your memory from the next session)."
+        );
         assert!(resp["usage"].as_str().unwrap().contains("/2200 chars"));
         let meta = &resp["meta"]["shape check"];
         assert!(meta["id"].as_str().unwrap().starts_with("urn:ump:"));
