@@ -2638,6 +2638,18 @@ mod tests {
         assert_eq!(fts_quote("   "), "");
     }
 
+    /// dirge-yof4: a poisoned project (sessions path occupied by a
+    /// FILE) must surface as a clean Err — the caller degrades to a
+    /// session without memory; nothing may panic.
+    #[test]
+    fn load_fails_cleanly_when_sessions_path_is_a_file() {
+        let (paths, _dir) = temp_project();
+        std::fs::create_dir_all(paths.dirge_dir()).unwrap();
+        std::fs::write(paths.sessions_dir(), b"not a directory").unwrap();
+        let result = SqliteMemoryStore::load(&paths);
+        assert!(result.is_err(), "poisoned sessions path must be an Err");
+    }
+
     #[test]
     fn parse_kind_round_trips() {
         for k in ["semantic", "episodic", "procedural", "working", "identity"] {
