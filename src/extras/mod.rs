@@ -12,6 +12,7 @@ pub mod acp;
 
 pub mod cross_session_extractor;
 pub mod dirge_paths;
+pub mod fts;
 pub mod memory_curator;
 pub mod memory_db;
 pub mod memory_provider;

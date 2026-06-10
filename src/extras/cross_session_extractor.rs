@@ -318,7 +318,7 @@ impl CrossSessionExtractor {
         let mut themes: Vec<RecurringTheme> = Vec::new();
         let mut bundle = String::new();
         for (label, terms) in SEED_THEMES {
-            let query = build_fts_or_query(terms);
+            let query = crate::extras::fts::or_query(terms);
             if query.is_empty() {
                 continue;
             }
@@ -424,20 +424,6 @@ impl CrossSessionExtractor {
         std::fs::create_dir_all(&dir).map_err(|e| format!("create report dir: {e}"))?;
         std::fs::write(dir.join("REPORT.md"), md).map_err(|e| format!("write report: {e}"))
     }
-}
-
-/// Build a sanitized FTS5 OR-query from plain seed terms. Each term
-/// is kept only if it is purely alphanumeric (no FTS5 special chars
-/// — apostrophes, quotes, parens, etc.), so the query can never be a
-/// syntax error. Returns "" when no term survives (caller skips the
-/// theme). dirge-6js7 review HIGH fix.
-fn build_fts_or_query(terms: &[&str]) -> String {
-    let safe: Vec<&str> = terms
-        .iter()
-        .copied()
-        .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()))
-        .collect();
-    safe.join(" OR ")
 }
 
 /// True when every seed term already appears in existing memory.
@@ -733,17 +719,6 @@ mod tests {
         // A term missing → not covered.
         let mem2 = "we run cargo".to_lowercase();
         assert!(!theme_already_covered(&["cargo", "pytest", "make"], &mem2));
-    }
-
-    #[test]
-    fn build_fts_or_query_sanitizes_and_joins() {
-        // Plain terms → OR-joined.
-        assert_eq!(build_fts_or_query(&["build", "cargo"]), "build OR cargo");
-        // Non-alphanumeric terms (apostrophe, paren) are dropped so
-        // the query can never be an FTS5 syntax error.
-        assert_eq!(build_fts_or_query(&["don't", "prefer", "(stop)"]), "prefer",);
-        // All-unsafe → empty (caller skips the theme).
-        assert_eq!(build_fts_or_query(&["don't", "a-b"]), "");
     }
 
     #[test]

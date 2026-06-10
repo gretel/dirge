@@ -359,18 +359,6 @@ fn preview_line(content: &str) -> String {
     }
 }
 
-/// Quote each whitespace token so arbitrary phrasing can never be an
-/// FTS5 syntax error (quotes inside tokens are stripped). Tokens are
-/// implicitly ANDed by FTS5.
-fn fts_quote(query: &str) -> String {
-    query
-        .split_whitespace()
-        .map(|t| format!("\"{}\"", t.replace('"', "")))
-        .filter(|t| t.len() > 2)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 /// An entry handed to the memory curator: enough to derive age and
 /// usage, and to identify the entry in audit reports, without sidecar
 /// bookkeeping.
@@ -941,7 +929,7 @@ impl SqliteMemoryStore {
     /// tiers (dirge-q8wt). Tokens are individually quoted so user
     /// phrasing can't be an FTS5 syntax error; ranked by bm25.
     pub fn search_entries(&self, query: &str) -> Result<serde_json::Value, String> {
-        let fts_query = fts_quote(query);
+        let fts_query = crate::extras::fts::quote_terms(query);
         if fts_query.is_empty() {
             return Ok(serde_json::json!({
                 "success": true,
@@ -2628,14 +2616,6 @@ mod tests {
             "decay floors at 0.1: {ancient}"
         );
         assert!((fresh - 0.5).abs() < 1e-9, "fresh entry untouched: {fresh}");
-    }
-
-    #[test]
-    fn fts_quote_neutralizes_syntax() {
-        assert_eq!(fts_quote("cargo build"), "\"cargo\" \"build\"");
-        assert_eq!(fts_quote("don't"), "\"don't\"");
-        assert_eq!(fts_quote("a \"b\" c"), "\"a\" \"b\" \"c\"");
-        assert_eq!(fts_quote("   "), "");
     }
 
     /// dirge-yof4: a poisoned project (sessions path occupied by a
