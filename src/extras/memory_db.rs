@@ -150,18 +150,37 @@ fn base32_encode(bytes: &[u8]) -> String {
 /// used so prompts keep their shape.
 pub const ENTRY_DELIMITER: &str = "\n§\n";
 
-/// Default char budget for the `memory` target (project facts,
+/// Default char budget for the `memory` target's HOT tier — entries
+/// injected verbatim into every system prompt (project facts,
 /// conventions, build commands, architecture patterns).
 const DEFAULT_MEMORY_CHAR_LIMIT: usize = 2200;
 
-/// Default char budget for the `pitfalls` target (anti-patterns,
-/// caveats, things tried and failed).
+/// Default char budget for the `pitfalls` target's HOT tier
+/// (anti-patterns, caveats, things tried and failed).
 const DEFAULT_PITFALL_CHAR_LIMIT: usize = 1375;
+
+/// dirge-q8wt: budget for the BREADCRUMB tier — entries that
+/// overflowed the hot tier. They cost ~one index line in the prompt
+/// (id + kind + preview) instead of full text, so the tier can hold
+/// 10x the content; the agent pulls full text on demand with
+/// `expand`. Overflow beyond this tombstones the least salient.
+const BREADCRUMB_MEMORY_CHAR_LIMIT: usize = 22_000;
+const BREADCRUMB_PITFALL_CHAR_LIMIT: usize = 13_750;
+
+/// Max results returned by the `search` action.
+const SEARCH_RESULT_LIMIT: usize = 8;
 
 fn char_limit_for(target: &str) -> usize {
     match target {
         "pitfalls" => DEFAULT_PITFALL_CHAR_LIMIT,
         _ => DEFAULT_MEMORY_CHAR_LIMIT,
+    }
+}
+
+fn breadcrumb_limit_for(target: &str) -> usize {
+    match target {
+        "pitfalls" => BREADCRUMB_PITFALL_CHAR_LIMIT,
+        _ => BREADCRUMB_MEMORY_CHAR_LIMIT,
     }
 }
 
@@ -263,6 +282,7 @@ fn truncate_for_error(s: &str) -> String {
 // ── Store ────────────────────────────────────────────────────────────
 
 /// One active row, as the matching/eviction logic sees it.
+#[derive(Clone)]
 struct ActiveRow {
     id: i64,
     uid: String,
@@ -271,6 +291,60 @@ struct ActiveRow {
     confidence: f64,
     salience: f64,
     status: String,
+    tier: String,
+}
+
+/// What a budget compaction did: `demoted` hot entries moved to the
+/// breadcrumb tier; `archived` breadcrumb entries tombstoned by the
+/// follow-on breadcrumb-budget pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionOutcome {
+    pub demoted: usize,
+    pub archived: usize,
+}
+
+/// Tool-response message for an add/restore that may have compacted.
+fn compaction_message(verb: &str, outcome: &CompactionOutcome) -> String {
+    let mut message = format!("{verb}.");
+    if outcome.demoted > 0 {
+        message = format!(
+            "{verb}; demoted {} least-salient entr{} to the breadcrumb index to stay within the inline budget (full text via action='expand').",
+            outcome.demoted,
+            if outcome.demoted == 1 { "y" } else { "ies" }
+        );
+    }
+    if outcome.archived > 0 {
+        message.push_str(&format!(
+            " Archived {} overflow index entr{} (restorable via action='restore').",
+            outcome.archived,
+            if outcome.archived == 1 { "y" } else { "ies" }
+        ));
+    }
+    message
+}
+
+/// First line of an entry, capped at 80 chars — the breadcrumb-index
+/// preview (same shape the curator's report previews use).
+fn preview_line(content: &str) -> String {
+    let first = content.lines().next().unwrap_or("").trim();
+    if first.chars().count() <= 80 {
+        first.to_string()
+    } else {
+        let cut: String = first.chars().take(77).collect();
+        format!("{cut}...")
+    }
+}
+
+/// Quote each whitespace token so arbitrary phrasing can never be an
+/// FTS5 syntax error (quotes inside tokens are stripped). Tokens are
+/// implicitly ANDed by FTS5.
+fn fts_quote(query: &str) -> String {
+    query
+        .split_whitespace()
+        .map(|t| format!("\"{}\"", t.replace('"', "")))
+        .filter(|t| t.len() > 2)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// An entry handed to the memory curator: enough to derive age and
@@ -288,11 +362,21 @@ pub struct CurationEntry {
 /// `pitfalls`). Holds the live DB connection plus a frozen,
 /// threat-scanned snapshot captured at load time for system-prompt
 /// injection.
+/// One frozen-snapshot entry (active at load time, passed the
+/// render-time threat scan).
+struct SnapshotEntry {
+    target: String,
+    kind: String,
+    content: String,
+    uid: String,
+    tier: String,
+}
+
 pub struct SqliteMemoryStore {
     conn: Mutex<Connection>,
-    /// (target, kind, content) of active entries at load time that
-    /// passed the render-time threat scan. Never changes mid-session.
-    snapshot: Vec<(String, String, String)>,
+    /// Active entries at load time that passed the render-time threat
+    /// scan. Never changes mid-session.
+    snapshot: Vec<SnapshotEntry>,
 }
 
 impl SqliteMemoryStore {
@@ -321,21 +405,23 @@ impl SqliteMemoryStore {
         {
             let mut stmt = conn
                 .prepare(
-                    "SELECT target, kind, content FROM memories
-                     WHERE status = 'active' ORDER BY target DESC, id",
+                    "SELECT target, kind, content, uid, tier FROM memories
+                     WHERE status = 'active' ORDER BY id",
                 )
                 .map_err(|e| format!("Failed to prepare snapshot query: {e}"))?;
             let rows = stmt
                 .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
+                    Ok(SnapshotEntry {
+                        target: row.get(0)?,
+                        kind: row.get(1)?,
+                        content: row.get(2)?,
+                        uid: row.get(3)?,
+                        tier: row.get(4)?,
+                    })
                 })
                 .map_err(|e| format!("Failed to query snapshot: {e}"))?;
             for row in rows.flatten() {
-                match scan_for_threats(&row.2) {
+                match scan_for_threats(&row.content) {
                     Ok(()) => snapshot.push(row),
                     Err(reason) => {
                         withheld += 1;
@@ -363,29 +449,30 @@ impl SqliteMemoryStore {
         })
     }
 
-    /// The frozen snapshot formatted for system prompt injection —
-    /// one `<project_memory>` block per non-empty target, entries
-    /// prefixed with their UMP kind tag, same shape the markdown
-    /// store produced. Never changes mid-session.
+    /// The frozen snapshot formatted for system prompt injection.
+    /// HOT-tier entries render verbatim — one `<project_memory>`
+    /// block per non-empty target, entries prefixed with their UMP
+    /// kind tag, same shape the markdown store produced.
+    /// BREADCRUMB-tier entries render as a one-line index (id + kind
+    /// + preview) the agent dereferences with `expand` (dirge-q8wt) —
+    /// the matryoshka stub-and-expand pattern, kept inline in the
+    /// prompt so weak models don't need a multi-step read loop for
+    /// the hot facts. Never changes mid-session.
     pub fn format_for_system_prompt(&self) -> String {
         let mut out = String::new();
-        // `memory` first, then `pitfalls` (snapshot is ordered
-        // target DESC: "memory" > "pitfalls" is false lexically —
-        // 'm' < 'p' — so DESC yields pitfalls first; iterate the
-        // explicit order instead of trusting the sort).
         for target in ["memory", "pitfalls"] {
-            let entries: Vec<&(String, String, String)> = self
+            let entries: Vec<&SnapshotEntry> = self
                 .snapshot
                 .iter()
-                .filter(|(t, _, _)| t == target)
+                .filter(|e| e.target == target && e.tier == "hot")
                 .collect();
             if entries.is_empty() {
                 continue;
             }
             out.push_str("\n<project_memory>\n");
-            for (_, kind, content) in entries {
-                out.push_str(&format!("[{kind}] "));
-                out.push_str(content);
+            for entry in entries {
+                out.push_str(&format!("[{}] ", entry.kind));
+                out.push_str(&entry.content);
                 out.push_str("\n§\n");
             }
             if out.ends_with("\n§\n") {
@@ -393,15 +480,46 @@ impl SqliteMemoryStore {
             }
             out.push_str("\n</project_memory>\n");
         }
+
+        let crumbs: Vec<&SnapshotEntry> = self
+            .snapshot
+            .iter()
+            .filter(|e| e.tier == "breadcrumb")
+            .collect();
+        if !crumbs.is_empty() {
+            out.push_str("\n<project_memory_index>\n");
+            out.push_str(
+                "Overflow memories demoted from the blocks above — still active, just not \
+                 inlined. Fetch full text with memory(action='expand', old_text='<id>'); \
+                 search everything with memory(action='search', query='...').\n",
+            );
+            for c in crumbs {
+                out.push_str(&format!(
+                    "- {} [{}/{}] {}\n",
+                    c.uid,
+                    c.target,
+                    c.kind,
+                    preview_line(&c.content),
+                ));
+            }
+            out.push_str("</project_memory_index>\n");
+        }
         out
     }
 
-    fn active_rows(conn: &Connection, target: &str) -> Result<Vec<ActiveRow>, String> {
+    /// Shared row query. `extra_where` must be a CONSTANT clause from
+    /// this module (tier/status filters) — never interpolate input.
+    fn rows_where(
+        conn: &Connection,
+        target: &str,
+        extra_where: &str,
+    ) -> Result<Vec<ActiveRow>, String> {
+        let sql = format!(
+            "SELECT id, uid, kind, content, confidence, salience, status, tier
+             FROM memories WHERE target = ?1 AND {extra_where} ORDER BY id"
+        );
         let mut stmt = conn
-            .prepare(
-                "SELECT id, uid, kind, content, confidence, salience, status
-                 FROM memories WHERE target = ?1 AND status = 'active' ORDER BY id",
-            )
+            .prepare(&sql)
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
         let rows = stmt
             .query_map(params![target], |row| {
@@ -413,12 +531,27 @@ impl SqliteMemoryStore {
                     confidence: row.get(4)?,
                     salience: row.get(5)?,
                     status: row.get(6)?,
+                    tier: row.get(7)?,
                 })
             })
             .map_err(|e| format!("Failed to query entries: {e}"))?
             .filter_map(|r| r.ok())
             .collect();
         Ok(rows)
+    }
+
+    /// All active entries of a target (both tiers) — the surface for
+    /// duplicate checks and substring/id matching.
+    fn active_rows(conn: &Connection, target: &str) -> Result<Vec<ActiveRow>, String> {
+        Self::rows_where(conn, target, "status = 'active'")
+    }
+
+    fn hot_rows(conn: &Connection, target: &str) -> Result<Vec<ActiveRow>, String> {
+        Self::rows_where(conn, target, "status = 'active' AND tier = 'hot'")
+    }
+
+    fn breadcrumb_rows(conn: &Connection, target: &str) -> Result<Vec<ActiveRow>, String> {
+        Self::rows_where(conn, target, "status = 'active' AND tier = 'breadcrumb'")
     }
 
     /// Index of the entry to evict first under budget pressure: the
@@ -434,8 +567,8 @@ impl SqliteMemoryStore {
         victim
     }
 
-    /// dirge-8h22: nothing is hard-deleted. Eviction and `remove`
-    /// both TOMBSTONE the row — it drops out of views, prompt
+    /// dirge-8h22: nothing is hard-deleted. `remove` and breadcrumb
+    /// overflow TOMBSTONE the row — it drops out of views, prompt
     /// injection, and matching, but stays in the table (and the FTS
     /// index, which active-only queries must filter) so it can be
     /// inspected or restored later.
@@ -447,6 +580,39 @@ impl SqliteMemoryStore {
         )
         .map_err(|e| format!("Failed to tombstone entry: {e}"))?;
         Ok(())
+    }
+
+    /// dirge-q8wt: hot-budget eviction DEMOTES to the breadcrumb tier
+    /// instead of archiving — the entry stays active and searchable,
+    /// it just renders as an index line instead of full text.
+    fn demote_row(conn: &Connection, id: i64) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET tier = 'breadcrumb', updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )
+        .map_err(|e| format!("Failed to demote entry: {e}"))?;
+        Ok(())
+    }
+
+    /// Tombstone least-salient breadcrumb entries until the tier fits
+    /// its budget. Returns how many were archived. Called after any
+    /// demotion into the tier.
+    fn compact_breadcrumbs(conn: &Connection, target: &str) -> Result<usize, String> {
+        let mut crumbs = Self::breadcrumb_rows(conn, target)?;
+        let limit = breadcrumb_limit_for(target);
+        let mut archived = 0usize;
+        while !crumbs.is_empty() {
+            let current: usize = crumbs.iter().map(|r| r.content.len() + 3).sum();
+            if current <= limit {
+                break;
+            }
+            let victim = Self::least_salient_index(&crumbs);
+            let removed = crumbs.remove(victim);
+            Self::tombstone_row(conn, removed.id)?;
+            archived += 1;
+        }
+        Ok(archived)
     }
 
     fn insert_row(
@@ -481,16 +647,17 @@ impl SqliteMemoryStore {
         Ok(id)
     }
 
-    /// Add an entry. Returns the number of OLD entries evicted to make
-    /// room (usually 0). When the char budget is full, the store
-    /// COMPACTS — evicting the least-salient entries (ties: oldest)
-    /// until the new entry fits — instead of failing the write.
+    /// Add an entry to the hot tier. When the hot char budget is
+    /// full, the store COMPACTS — demoting the least-salient hot
+    /// entries (ties: oldest) to the breadcrumb tier until the new
+    /// entry fits — instead of failing the write. Breadcrumb-tier
+    /// overflow then archives (tombstones) its least salient.
     pub fn add_entry(
         &self,
         target: &str,
         content: &str,
         kind: Option<MemoryKind>,
-    ) -> Result<usize, String> {
+    ) -> Result<CompactionOutcome, String> {
         scan_for_threats(content)?;
         let entry = content.trim().to_string();
         if entry.is_empty() {
@@ -502,18 +669,18 @@ impl SqliteMemoryStore {
             .transaction()
             .map_err(|e| format!("Failed to begin transaction: {e}"))?;
 
-        let mut rows = Self::active_rows(&tx, target)?;
-
-        // Reject duplicates (case-insensitive trimmed match).
-        if rows
+        // Reject duplicates (case-insensitive trimmed match) across
+        // BOTH tiers — a demoted entry is still the same fact.
+        let all_active = Self::active_rows(&tx, target)?;
+        if all_active
             .iter()
             .any(|r| r.content.trim().eq_ignore_ascii_case(entry.trim()))
         {
             return Err("Duplicate entry — already exists in memory".to_string());
         }
 
-        // Char budget. Only an entry larger than the WHOLE budget is
-        // genuinely unsaveable (and that's a real error — split it).
+        // Char budget. Only an entry larger than the WHOLE hot budget
+        // is genuinely unsaveable (and that's a real error — split it).
         let char_limit = char_limit_for(target);
         let entry_cost = entry.len();
         if entry_cost > char_limit {
@@ -523,26 +690,32 @@ impl SqliteMemoryStore {
             ));
         }
 
-        // Compact: evict the LEAST-salient entry first — kind-derived
-        // importance, so transient `working` notes go before durable
-        // `identity` / `semantic` facts — breaking ties by age. Each
-        // existing entry costs `len + 3` for its delimiter, matching
-        // the markdown store's accounting.
-        let mut evicted = 0usize;
-        while !rows.is_empty() {
-            let current: usize = rows.iter().map(|r| r.content.len() + 3).sum();
+        // Compact: demote the LEAST-salient hot entry first —
+        // kind-derived importance, so transient `working` notes go
+        // before durable `identity` / `semantic` facts — breaking
+        // ties by age. Each entry costs `len + 3` for its delimiter,
+        // matching the markdown store's accounting.
+        let mut hot = Self::hot_rows(&tx, target)?;
+        let mut demoted = 0usize;
+        while !hot.is_empty() {
+            let current: usize = hot.iter().map(|r| r.content.len() + 3).sum();
             if current + entry_cost <= char_limit {
                 break;
             }
-            let victim = Self::least_salient_index(&rows);
-            let removed = rows.remove(victim);
-            Self::tombstone_row(&tx, removed.id)?;
-            evicted += 1;
+            let victim = Self::least_salient_index(&hot);
+            let removed = hot.remove(victim);
+            Self::demote_row(&tx, removed.id)?;
+            demoted += 1;
         }
 
         Self::insert_row(&tx, target, &entry, kind.unwrap_or_default())?;
+        let archived = if demoted > 0 {
+            Self::compact_breadcrumbs(&tx, target)?
+        } else {
+            0
+        };
         tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
-        Ok(evicted)
+        Ok(CompactionOutcome { demoted, archived })
     }
 
     /// Replace an entry found by substring match. If multiple entries
@@ -620,10 +793,10 @@ impl SqliteMemoryStore {
     /// Bring a tombstoned entry back to life (dirge-8h22). Matching
     /// follows the same substring/uid + ambiguity rules, but over
     /// TOMBSTONED rows of the target. Errors if an identical active
-    /// entry already exists. Restoring counts against the char budget
-    /// like an add: least-salient active entries are tombstoned to
-    /// make room. Returns the number evicted that way.
-    pub fn restore_entry(&self, target: &str, old_text: &str) -> Result<usize, String> {
+    /// entry already exists. The entry returns to the HOT tier, so it
+    /// counts against the hot budget like an add: least-salient hot
+    /// entries are demoted to make room (dirge-q8wt).
+    pub fn restore_entry(&self, target: &str, old_text: &str) -> Result<CompactionOutcome, String> {
         let mut conn = self.conn.lock_ignore_poison();
         let tx = conn
             .transaction()
@@ -633,8 +806,8 @@ impl SqliteMemoryStore {
         let idx = find_unique_match(&tombstoned, old_text)?;
         let revived = &tombstoned[idx];
 
-        let mut rows = Self::active_rows(&tx, target)?;
-        if rows.iter().any(|r| {
+        let active = Self::active_rows(&tx, target)?;
+        if active.iter().any(|r| {
             r.content
                 .trim()
                 .eq_ignore_ascii_case(revived.content.trim())
@@ -642,36 +815,121 @@ impl SqliteMemoryStore {
             return Err("An identical active entry already exists".to_string());
         }
 
-        // Same compaction rule as add: make room by archiving the
-        // least-salient active entries.
+        // Same compaction rule as add: make room in the hot tier by
+        // demoting the least salient.
         let char_limit = char_limit_for(target);
         let entry_cost = revived.content.len();
-        let mut evicted = 0usize;
-        while !rows.is_empty() {
-            let current: usize = rows.iter().map(|r| r.content.len() + 3).sum();
+        let mut hot = Self::hot_rows(&tx, target)?;
+        let mut demoted = 0usize;
+        while !hot.is_empty() {
+            let current: usize = hot.iter().map(|r| r.content.len() + 3).sum();
             if current + entry_cost <= char_limit {
                 break;
             }
-            let victim = Self::least_salient_index(&rows);
-            let removed = rows.remove(victim);
-            Self::tombstone_row(&tx, removed.id)?;
-            evicted += 1;
+            let victim = Self::least_salient_index(&hot);
+            let removed = hot.remove(victim);
+            Self::demote_row(&tx, removed.id)?;
+            demoted += 1;
         }
 
         let now = chrono::Utc::now().to_rfc3339();
         tx.execute(
-            "UPDATE memories SET status = 'active', updated_at = ?1 WHERE id = ?2",
+            "UPDATE memories SET status = 'active', tier = 'hot', updated_at = ?1 WHERE id = ?2",
             params![now, revived.id],
         )
         .map_err(|e| format!("Failed to restore entry: {e}"))?;
+        let archived = if demoted > 0 {
+            Self::compact_breadcrumbs(&tx, target)?
+        } else {
+            0
+        };
         tx.commit().map_err(|e| format!("Failed to commit: {e}"))?;
-        Ok(evicted)
+        Ok(CompactionOutcome { demoted, archived })
+    }
+
+    /// Fetch one entry's full text by id or unique substring, across
+    /// both targets and tiers (dirge-q8wt) — the dereference half of
+    /// the breadcrumb index. Records a usage signal (`use_count`,
+    /// `last_used_at`) that later curation can rank by.
+    pub fn expand_entry(&self, old_text: &str) -> Result<serde_json::Value, String> {
+        let conn = self.conn.lock_ignore_poison();
+        let memory_rows = Self::active_rows(&conn, "memory")?;
+        let memory_count = memory_rows.len();
+        let mut rows = memory_rows;
+        rows.extend(Self::active_rows(&conn, "pitfalls")?);
+        let idx = find_unique_match(&rows, old_text)?;
+        let row = &rows[idx];
+        let target = if idx < memory_count {
+            "memory"
+        } else {
+            "pitfalls"
+        };
+
+        let now = chrono::Utc::now().to_rfc3339();
+        conn.execute(
+            "UPDATE memories SET use_count = use_count + 1, last_used_at = ?1 WHERE id = ?2",
+            params![now, row.id],
+        )
+        .map_err(|e| format!("Failed to record usage: {e}"))?;
+
+        Ok(serde_json::json!({
+            "success": true,
+            "id": row.uid,
+            "target": target,
+            "kind": row.kind,
+            "tier": row.tier,
+            "content": row.content,
+        }))
+    }
+
+    /// Full-text search over all ACTIVE entries, both targets and
+    /// tiers (dirge-q8wt). Tokens are individually quoted so user
+    /// phrasing can't be an FTS5 syntax error; ranked by bm25.
+    pub fn search_entries(&self, query: &str) -> Result<serde_json::Value, String> {
+        let fts_query = fts_quote(query);
+        if fts_query.is_empty() {
+            return Ok(serde_json::json!({
+                "success": true,
+                "query": query,
+                "count": 0,
+                "results": [],
+            }));
+        }
+        let conn = self.conn.lock_ignore_poison();
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.uid, m.target, m.kind, m.tier, m.content
+                 FROM memories_fts
+                 JOIN memories m ON m.id = memories_fts.rowid
+                 WHERE memories_fts MATCH ?1 AND m.status = 'active'
+                 ORDER BY rank LIMIT ?2",
+            )
+            .map_err(|e| format!("Failed to prepare search: {e}"))?;
+        let results: Vec<serde_json::Value> = stmt
+            .query_map(params![fts_query, SEARCH_RESULT_LIMIT as i64], |row| {
+                Ok(serde_json::json!({
+                    "id": row.get::<_, String>(0)?,
+                    "target": row.get::<_, String>(1)?,
+                    "kind": row.get::<_, String>(2)?,
+                    "tier": row.get::<_, String>(3)?,
+                    "content": row.get::<_, String>(4)?,
+                }))
+            })
+            .map_err(|e| format!("Failed to search: {e}"))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(serde_json::json!({
+            "success": true,
+            "query": query,
+            "count": results.len(),
+            "results": results,
+        }))
     }
 
     fn tombstoned_rows(conn: &Connection, target: &str) -> Result<Vec<ActiveRow>, String> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, uid, kind, content, confidence, salience, status
+                "SELECT id, uid, kind, content, confidence, salience, status, tier
                  FROM memories WHERE target = ?1 AND status = 'tombstoned' ORDER BY id",
             )
             .map_err(|e| format!("Failed to prepare query: {e}"))?;
@@ -685,6 +943,7 @@ impl SqliteMemoryStore {
                     confidence: row.get(4)?,
                     salience: row.get(5)?,
                     status: row.get(6)?,
+                    tier: row.get(7)?,
                 })
             })
             .map_err(|e| format!("Failed to query entries: {e}"))?
@@ -694,13 +953,17 @@ impl SqliteMemoryStore {
     }
 
     /// Tool-facing success/view response. Same JSON shape as the
-    /// markdown store so the model-visible contract doesn't change.
+    /// markdown store (`entries`/`meta`/`usage`), with the breadcrumb
+    /// tier as an index alongside — `entries` is the HOT tier only,
+    /// matching what the system prompt inlines; breadcrumb entries
+    /// show as id+preview and are fetched with expand (dirge-q8wt).
     fn success_response(
         conn: &Connection,
         target: &str,
         message: &str,
     ) -> Result<serde_json::Value, String> {
-        let rows = Self::active_rows(conn, target)?;
+        let all_rows = Self::active_rows(conn, target)?;
+        let rows: Vec<&ActiveRow> = all_rows.iter().filter(|r| r.tier == "hot").collect();
         let entries: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
         let current: usize = entries.iter().map(|e| e.len()).sum::<usize>()
             + entries.len().saturating_sub(1) * ENTRY_DELIMITER.len();
@@ -739,6 +1002,21 @@ impl SqliteMemoryStore {
             )
             .unwrap_or(0);
 
+        // dirge-q8wt: breadcrumb-tier entries appear as an index
+        // (id + kind + preview), mirroring their system-prompt shape;
+        // full text via expand.
+        let breadcrumbs: Vec<serde_json::Value> = all_rows
+            .iter()
+            .filter(|r| r.tier == "breadcrumb")
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.uid,
+                    "kind": r.kind,
+                    "preview": preview_line(&r.content),
+                })
+            })
+            .collect();
+
         let mut resp = serde_json::json!({
             "success": true,
             "target": target,
@@ -747,6 +1025,8 @@ impl SqliteMemoryStore {
             "usage": format!("{}% — {}/{} chars", pct, current, limit),
             "entry_count": entries.len(),
             "tombstoned_count": tombstoned,
+            "breadcrumb_count": breadcrumbs.len(),
+            "breadcrumbs": breadcrumbs,
         });
         if !message.is_empty() {
             resp["message"] = serde_json::Value::String(message.to_string());
@@ -762,15 +1042,8 @@ impl SqliteMemoryStore {
         content: &str,
         kind: Option<MemoryKind>,
     ) -> Result<serde_json::Value, String> {
-        let evicted = self.add_entry(target, content, kind)?;
-        let message = if evicted > 0 {
-            format!(
-                "Entry added; archived {evicted} least-salient entr{} to stay within the memory budget (restorable via action='restore').",
-                if evicted == 1 { "y" } else { "ies" }
-            )
-        } else {
-            "Entry added.".to_string()
-        };
+        let outcome = self.add_entry(target, content, kind)?;
+        let message = compaction_message("Entry added", &outcome);
         let conn = self.conn.lock_ignore_poison();
         Self::success_response(&conn, target, &message)
     }
@@ -798,17 +1071,18 @@ impl SqliteMemoryStore {
     }
 
     pub fn restore(&self, target: &str, old_text: &str) -> Result<serde_json::Value, String> {
-        let evicted = self.restore_entry(target, old_text)?;
-        let message = if evicted > 0 {
-            format!(
-                "Entry restored; archived {evicted} least-salient entr{} to stay within the memory budget.",
-                if evicted == 1 { "y" } else { "ies" }
-            )
-        } else {
-            "Entry restored.".to_string()
-        };
+        let outcome = self.restore_entry(target, old_text)?;
+        let message = compaction_message("Entry restored", &outcome);
         let conn = self.conn.lock_ignore_poison();
         Self::success_response(&conn, target, &message)
+    }
+
+    pub fn expand(&self, old_text: &str) -> Result<serde_json::Value, String> {
+        self.expand_entry(old_text)
+    }
+
+    pub fn search(&self, query: &str) -> Result<serde_json::Value, String> {
+        self.search_entries(query)
     }
 
     pub fn view(&self, target: &str) -> serde_json::Value {
@@ -1321,12 +1595,15 @@ mod tests {
         // Two entries that nearly fill the 2200 budget.
         let oldest = format!("oldest {}", "a".repeat(1000));
         let newer = format!("newer {}", "b".repeat(1000));
-        assert_eq!(store.add_entry("memory", &oldest, None).unwrap(), 0);
-        assert_eq!(store.add_entry("memory", &newer, None).unwrap(), 0);
-        // Third entry overflows — must evict, not fail.
+        assert_eq!(store.add_entry("memory", &oldest, None).unwrap().demoted, 0);
+        assert_eq!(store.add_entry("memory", &newer, None).unwrap().demoted, 0);
+        // Third entry overflows — must compact, not fail.
         let newest = format!("newest {}", "c".repeat(500));
-        let evicted = store.add_entry("memory", &newest, None).unwrap();
-        assert!(evicted >= 1, "over-budget add must compact, not fail");
+        let outcome = store.add_entry("memory", &newest, None).unwrap();
+        assert!(
+            outcome.demoted >= 1,
+            "over-budget add must compact, not fail"
+        );
         let view = store.view("memory");
         let entries: Vec<String> = view["entries"]
             .as_array()
@@ -1337,8 +1614,19 @@ mod tests {
         assert!(entries.iter().any(|e| e.starts_with("newest")));
         assert!(
             !entries.iter().any(|e| e.starts_with("oldest")),
-            "equal salience → oldest evicted first: {entries:?}"
+            "equal salience → oldest demoted first: {entries:?}"
         );
+        // dirge-q8wt: the demoted entry is NOT gone — it lives in the
+        // breadcrumb index, still active.
+        assert_eq!(view["breadcrumb_count"], 1);
+        assert!(
+            view["breadcrumbs"][0]["preview"]
+                .as_str()
+                .unwrap()
+                .starts_with("oldest"),
+            "demoted entry must appear in the breadcrumb index"
+        );
+        assert_eq!(view["tombstoned_count"], 0, "demotion is not archival");
     }
 
     #[test]
@@ -1354,10 +1642,10 @@ mod tests {
             .add_entry("memory", &working, Some(MemoryKind::Working))
             .unwrap();
         let semantic = format!("semantic {}", "c".repeat(500));
-        let evicted = store
+        let outcome = store
             .add_entry("memory", &semantic, Some(MemoryKind::Semantic))
             .unwrap();
-        assert_eq!(evicted, 1);
+        assert_eq!(outcome.demoted, 1);
         let view = store.view("memory");
         let entries: Vec<String> = view["entries"]
             .as_array()
@@ -1371,7 +1659,7 @@ mod tests {
         );
         assert!(
             !entries.iter().any(|e| e.starts_with("working")),
-            "low-salience working entry must be evicted first: {entries:?}"
+            "low-salience working entry must be demoted first: {entries:?}"
         );
     }
 
@@ -1610,7 +1898,7 @@ mod tests {
             resp["message"]
                 .as_str()
                 .unwrap()
-                .contains("archived 1 least-salient entry"),
+                .contains("demoted 1 least-salient entry to the breadcrumb index"),
             "got: {}",
             resp["message"]
         );
@@ -1740,8 +2028,8 @@ mod tests {
         store.remove_entry("memory", "valuable").unwrap();
         assert_eq!(store.view("memory")["entry_count"], 0);
 
-        let evicted = store.restore_entry("memory", "valuable").unwrap();
-        assert_eq!(evicted, 0);
+        let outcome = store.restore_entry("memory", "valuable").unwrap();
+        assert_eq!(outcome.demoted, 0);
         let view = store.view("memory");
         assert_eq!(view["entry_count"], 1);
         assert_eq!(view["tombstoned_count"], 0);
@@ -1788,8 +2076,8 @@ mod tests {
             .add_entry("memory", &filler_two, Some(MemoryKind::Semantic))
             .unwrap();
 
-        let evicted = store.restore_entry("memory", "big ").unwrap();
-        assert!(evicted >= 1, "restore must compact like add");
+        let outcome = store.restore_entry("memory", "big ").unwrap();
+        assert!(outcome.demoted >= 1, "restore must compact like add");
         let view = store.view("memory");
         let entries: Vec<String> = view["entries"]
             .as_array()
@@ -1800,12 +2088,12 @@ mod tests {
         assert!(entries.iter().any(|e| e.starts_with("big")));
         assert!(
             !entries.iter().any(|e| e.starts_with("filler1")),
-            "least-salient filler must be archived to make room: {entries:?}"
+            "least-salient filler must be demoted to make room: {entries:?}"
         );
     }
 
     #[test]
-    fn eviction_victims_are_restorable() {
+    fn eviction_victims_are_demoted_not_archived() {
         let (paths, _dir) = temp_project();
         let store = SqliteMemoryStore::load(&paths).unwrap();
         let working = format!("scratch {}", "a".repeat(1000));
@@ -1816,12 +2104,22 @@ mod tests {
         store
             .add_entry("memory", &durable, Some(MemoryKind::Semantic))
             .unwrap();
-        // Overflow → working entry evicted (tombstoned, not deleted).
-        let evicted = store
+        // Overflow → working entry demoted to the breadcrumb tier
+        // (dirge-q8wt), not archived.
+        let outcome = store
             .add_entry("memory", &format!("third {}", "c".repeat(400)), None)
             .unwrap();
-        assert_eq!(evicted, 1);
-        assert_eq!(store.view("memory")["tombstoned_count"], 1);
+        assert_eq!(outcome.demoted, 1);
+        let view = store.view("memory");
+        assert_eq!(view["breadcrumb_count"], 1);
+        assert_eq!(view["tombstoned_count"], 0);
+        // Still expandable by id.
+        let id = view["breadcrumbs"][0]["id"].as_str().unwrap().to_string();
+        let expanded = store.expand_entry(&id).unwrap();
+        assert!(
+            expanded["content"].as_str().unwrap().starts_with("scratch"),
+            "demoted entry must remain expandable: {expanded}"
+        );
     }
 
     // ── Id addressing (dirge-8h22) ───────────────────────────────
@@ -1994,6 +2292,169 @@ mod tests {
         let store = SqliteMemoryStore::load(&paths).unwrap();
         assert_eq!(store.view("memory")["entry_count"], 0);
         assert!(!paths.memory_file("MEMORY.md.imported").exists());
+    }
+
+    // ── Breadcrumb tier + expand/search (dirge-q8wt) ─────────────
+
+    /// Demoted entries render as an index in the system prompt —
+    /// id + kind + preview, with the expand affordance spelled out —
+    /// while hot entries stay verbatim.
+    #[test]
+    fn snapshot_renders_breadcrumb_index() {
+        let (paths, _dir) = temp_project();
+        {
+            let store = SqliteMemoryStore::load(&paths).unwrap();
+            let big_working = format!("demote-me {}", "a".repeat(1200));
+            store
+                .add_entry("memory", &big_working, Some(MemoryKind::Working))
+                .unwrap();
+            store
+                .add_entry(
+                    "memory",
+                    &format!("keep-me {}", "b".repeat(1200)),
+                    Some(MemoryKind::Identity),
+                )
+                .unwrap();
+        }
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        let block = store.format_for_system_prompt();
+        assert!(block.contains("keep-me"), "hot entry inlined: {block}");
+        assert!(
+            block.contains("<project_memory_index>"),
+            "index block present: {block}"
+        );
+        assert!(
+            block.contains("expand"),
+            "index must teach the expand affordance: {block}"
+        );
+        assert!(
+            block.contains("demote-me") && block.contains("urn:ump:"),
+            "index line carries id + preview: {block}"
+        );
+        // The demoted entry's FULL text must not be inlined — only
+        // its 80-char preview.
+        assert!(
+            !block.contains(&"a".repeat(200)),
+            "breadcrumb entries render as previews, not full text"
+        );
+    }
+
+    #[test]
+    fn expand_returns_full_text_and_records_usage() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "the flux capacitor needs plutonium", None)
+            .unwrap();
+        let resp = store.expand_entry("flux capacitor").unwrap();
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["target"], "memory");
+        assert_eq!(resp["tier"], "hot");
+        assert_eq!(resp["content"], "the flux capacitor needs plutonium");
+
+        let _ = store.expand_entry("flux capacitor").unwrap();
+        let conn = raw_conn(&paths);
+        let (count, last_used): (i64, Option<String>) = conn
+            .query_row(
+                "SELECT use_count, last_used_at FROM memories WHERE content LIKE 'the flux%'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 2, "each expand bumps use_count");
+        assert!(last_used.is_some(), "expand stamps last_used_at");
+    }
+
+    #[test]
+    fn expand_spans_both_targets() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("pitfalls", "never cross the streams", None)
+            .unwrap();
+        let resp = store.expand_entry("cross the streams").unwrap();
+        assert_eq!(resp["target"], "pitfalls");
+    }
+
+    #[test]
+    fn search_finds_entries_across_targets_and_tiers() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store
+            .add_entry("memory", "project uses tokio for async runtime", None)
+            .unwrap();
+        store
+            .add_entry(
+                "pitfalls",
+                "blocking calls inside tokio tasks stall the runtime",
+                None,
+            )
+            .unwrap();
+        let resp = store.search_entries("tokio runtime").unwrap();
+        assert_eq!(resp["success"], true);
+        assert_eq!(resp["count"], 2, "both targets searched: {resp}");
+
+        // Tombstoned entries don't surface.
+        store.remove_entry("memory", "tokio for async").unwrap();
+        let resp = store.search_entries("tokio runtime").unwrap();
+        assert_eq!(resp["count"], 1, "tombstoned entry must not surface");
+    }
+
+    #[test]
+    fn search_survives_fts5_syntax_in_query() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        store.add_entry("memory", "don't use unwrap", None).unwrap();
+        // Apostrophes, quotes, parens — all FTS5 syntax hazards.
+        let resp = store.search_entries("don't (use) \"unwrap\"").unwrap();
+        assert_eq!(resp["success"], true, "syntax must never error: {resp}");
+    }
+
+    /// Breadcrumb-tier overflow archives its least salient — the
+    /// second stage of the demotion cascade.
+    #[test]
+    fn breadcrumb_overflow_archives_least_salient() {
+        let (paths, _dir) = temp_project();
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        // Force many demotions: hot budget 2200, breadcrumb 22000.
+        // 13 entries of ~2000 chars: ~1 stays hot, ~11 fit the
+        // breadcrumb budget, the rest must be archived.
+        for i in 0..13 {
+            let entry = format!("bulk-{i:02} {}", "x".repeat(1990));
+            store
+                .add_entry("memory", &entry, Some(MemoryKind::Working))
+                .unwrap();
+        }
+        let view = store.view("memory");
+        let crumbs = view["breadcrumb_count"].as_i64().unwrap();
+        let tombs = view["tombstoned_count"].as_i64().unwrap();
+        assert!(crumbs >= 1, "demotions populate the breadcrumb tier");
+        assert!(
+            tombs >= 1,
+            "breadcrumb overflow must archive: crumbs={crumbs} tombs={tombs}"
+        );
+        // Breadcrumb tier respects its budget.
+        let conn = raw_conn(&paths);
+        let crumb_chars: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(LENGTH(content) + 3), 0) FROM memories
+                 WHERE target='memory' AND status='active' AND tier='breadcrumb'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            crumb_chars as usize <= BREADCRUMB_MEMORY_CHAR_LIMIT,
+            "breadcrumb tier stays within budget: {crumb_chars}"
+        );
+    }
+
+    #[test]
+    fn fts_quote_neutralizes_syntax() {
+        assert_eq!(fts_quote("cargo build"), "\"cargo\" \"build\"");
+        assert_eq!(fts_quote("don't"), "\"don't\"");
+        assert_eq!(fts_quote("a \"b\" c"), "\"a\" \"b\" \"c\"");
+        assert_eq!(fts_quote("   "), "");
     }
 
     #[test]

@@ -77,6 +77,19 @@ pub trait MemoryProvider: Send + Sync {
         Err("This memory backend does not support restoring removed entries".to_string())
     }
 
+    /// Fetch one entry's full text by id or unique substring, across
+    /// targets — the dereference half of the breadcrumb index
+    /// (dirge-q8wt). Default errors for backends without tiering.
+    fn expand(&self, _old_text: &str) -> Result<Value, String> {
+        Err("This memory backend does not support expanding entries".to_string())
+    }
+
+    /// Full-text search across all active entries (dirge-q8wt).
+    /// Default errors for backends without a search index.
+    fn search(&self, _query: &str) -> Result<Value, String> {
+        Err("This memory backend does not support searching entries".to_string())
+    }
+
     // ── Optional lifecycle hooks — default no-ops ──────────────
 
     /// Notify the provider that a memory write just happened via
@@ -188,6 +201,14 @@ impl MemoryProvider for super::memory_db::SqliteMemoryStore {
 
     fn restore(&self, target: &str, old_text: &str) -> Result<Value, String> {
         super::memory_db::SqliteMemoryStore::restore(self, target, old_text)
+    }
+
+    fn expand(&self, old_text: &str) -> Result<Value, String> {
+        super::memory_db::SqliteMemoryStore::expand(self, old_text)
+    }
+
+    fn search(&self, query: &str) -> Result<Value, String> {
+        super::memory_db::SqliteMemoryStore::search(self, query)
     }
 }
 
