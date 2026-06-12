@@ -161,6 +161,51 @@ pub fn decide_after_usage(
     ctx_max: u64,
     already_folded_this_turn: bool,
 ) -> PostUsageDecision {
+    decide_after_usage_with_threshold(prompt_tokens, ctx_max, already_folded_this_turn, None)
+}
+
+/// Process-wide early-fold threshold, installed once at startup from
+/// `Config::compaction_fold_threshold` via [`init_fold_threshold`]. Lets a
+/// user opt into MiMo-style earlier checkpointing without threading the
+/// value through the whole loop config — same OnceLock-set-once convention
+/// as `timeout::Timeouts::init`. Unset → the [`HISTORY_FOLD_THRESHOLD`]
+/// default.
+static FOLD_THRESHOLD_OVERRIDE: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+
+/// Install the configured early-fold threshold process-wide. Idempotent —
+/// the first call wins; later calls are ignored. Called once at startup
+/// after config load. `None` (or never calling this) keeps the default.
+pub fn init_fold_threshold(override_fraction: Option<f64>) {
+    let _ = FOLD_THRESHOLD_OVERRIDE.set(override_fraction);
+}
+
+/// Clamp a configured early-fold threshold into a safe range. An override
+/// may only make the NORMAL fold fire *earlier* — never later than the
+/// default and never below a floor that would fold almost immediately —
+/// so the aggressive/force bands above it keep their ordering. An explicit
+/// `override_fraction` wins (used by callers and tests); otherwise the
+/// startup-installed process global is consulted; out-of-range or absent
+/// values fall back to [`HISTORY_FOLD_THRESHOLD`].
+pub fn effective_fold_threshold(override_fraction: Option<f64>) -> f64 {
+    let candidate = override_fraction.or_else(|| FOLD_THRESHOLD_OVERRIDE.get().copied().flatten());
+    match candidate {
+        Some(f) if f.is_finite() && (0.3..=HISTORY_FOLD_THRESHOLD).contains(&f) => f,
+        _ => HISTORY_FOLD_THRESHOLD,
+    }
+}
+
+/// As [`decide_after_usage`], but with a configurable early-fold threshold
+/// (MiMo's "checkpoint/compress earlier" knob). A lower threshold folds —
+/// and therefore writes the durable checkpoint — sooner and from more
+/// coherent context, at the cost of more frequent folds. The aggressive
+/// and force-summary bands are unchanged; the override is clamped by
+/// [`effective_fold_threshold`] so it can only lower the normal band.
+pub fn decide_after_usage_with_threshold(
+    prompt_tokens: Option<u64>,
+    ctx_max: u64,
+    already_folded_this_turn: bool,
+    fold_threshold_override: Option<f64>,
+) -> PostUsageDecision {
     let Some(prompt_tokens) = prompt_tokens else {
         return PostUsageDecision {
             kind: PostUsageDecisionKind::None,
@@ -216,7 +261,7 @@ pub fn decide_after_usage(
         };
     }
 
-    if ratio > HISTORY_FOLD_THRESHOLD {
+    if ratio > effective_fold_threshold(fold_threshold_override) {
         return PostUsageDecision {
             kind: PostUsageDecisionKind::Fold,
             prompt_tokens,
@@ -261,6 +306,51 @@ pub fn estimate_turn_start(estimate_tokens: u64, ctx_max: u64) -> TurnStartEstim
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============================================================
+    // early-fold threshold override
+    // ============================================================
+
+    /// The override is clamped: a value in `0.3..=0.75` is honored; out of
+    /// range or absent falls back to the default. Uses explicit params so
+    /// it doesn't depend on the process-global install.
+    #[test]
+    fn effective_fold_threshold_clamps_override() {
+        assert_eq!(effective_fold_threshold(Some(0.5)), 0.5);
+        assert_eq!(effective_fold_threshold(Some(0.3)), 0.3);
+        assert_eq!(
+            effective_fold_threshold(Some(0.9)),
+            HISTORY_FOLD_THRESHOLD,
+            "above the default is rejected (can't fold later)"
+        );
+        assert_eq!(
+            effective_fold_threshold(Some(0.05)),
+            HISTORY_FOLD_THRESHOLD,
+            "below the floor is rejected"
+        );
+        assert_eq!(
+            effective_fold_threshold(Some(f64::NAN)),
+            HISTORY_FOLD_THRESHOLD
+        );
+        assert_eq!(effective_fold_threshold(None), HISTORY_FOLD_THRESHOLD);
+    }
+
+    /// A lower override folds sooner: a ratio that is healthy at the
+    /// default (0.75) becomes a Fold under an earlier threshold, while the
+    /// aggressive/force bands above it are unchanged.
+    #[test]
+    fn lower_override_folds_earlier() {
+        // 60% of the window: no fold at the default threshold…
+        let d = decide_after_usage_with_threshold(Some(76_800), 128_000, false, None);
+        assert_eq!(d.kind, PostUsageDecisionKind::None);
+        // …but folds with an early 0.5 threshold.
+        let d = decide_after_usage_with_threshold(Some(76_800), 128_000, false, Some(0.5));
+        assert_eq!(d.kind, PostUsageDecisionKind::Fold);
+        assert!(!d.aggressive, "still the normal band, not aggressive");
+        // The force-summary band is independent of the override.
+        let d = decide_after_usage_with_threshold(Some(110_000), 128_000, false, Some(0.5));
+        assert_eq!(d.kind, PostUsageDecisionKind::ExitWithSummary);
+    }
 
     // ============================================================
     // decide_after_usage

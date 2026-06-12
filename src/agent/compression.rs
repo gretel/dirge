@@ -154,8 +154,22 @@ pub const PROTECT_TAIL_DEFAULT: usize = 5;
 ///
 /// [`HISTORY_FOLD_THRESHOLD`]: crate::agent::agent_loop::context_manager::HISTORY_FOLD_THRESHOLD
 pub fn should_compress(prompt_tokens: u64, context_window: u64) -> bool {
-    use crate::agent::agent_loop::context_manager::HISTORY_FOLD_THRESHOLD;
-    let threshold = (HISTORY_FOLD_THRESHOLD * context_window as f64) as u64;
+    should_compress_with_threshold(prompt_tokens, context_window, None)
+}
+
+/// As [`should_compress`], but honoring a configurable early-fold
+/// threshold so the summarizer gate stays in lockstep with
+/// [`decide_after_usage_with_threshold`] when an override is set.
+///
+/// [`decide_after_usage_with_threshold`]: crate::agent::agent_loop::context_manager::decide_after_usage_with_threshold
+pub fn should_compress_with_threshold(
+    prompt_tokens: u64,
+    context_window: u64,
+    fold_threshold_override: Option<f64>,
+) -> bool {
+    use crate::agent::agent_loop::context_manager::effective_fold_threshold;
+    let threshold =
+        (effective_fold_threshold(fold_threshold_override) * context_window as f64) as u64;
     prompt_tokens > threshold
 }
 

@@ -559,6 +559,10 @@ async fn main() -> anyhow::Result<()> {
     // them via `timeout::Timeouts::get()` so a `[timeouts]` config override
     // applies across LSP / MCP / bash / the stream loop from one place.
     timeout::Timeouts::init(cfg.resolve_timeouts());
+    // Install the optional early-fold threshold process-wide (mirrors the
+    // timeouts install): the compaction decision + summarizer gate consult
+    // it so an earlier checkpoint cadence applies from one place.
+    crate::agent::agent_loop::context_manager::init_fold_threshold(cfg.compaction_fold_threshold);
     let mut context = context::load(cli.resolve_no_context_files(&cfg));
     // dirge-ykeu: load user-defined agent profiles. Done here (not in
     // context::load) because the lowest-precedence tier is `config.json`
