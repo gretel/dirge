@@ -15,6 +15,10 @@ pub struct MemoryTool {
     // the call sites. `Arc<MemoryToolStore>` is the default and
     // coerces to this trait object via unsizing.
     store: Arc<dyn MemoryProvider>,
+    /// Optional cross-project (global) memory tier. When present, an action
+    /// with `scope: "global"` routes here instead of the per-project
+    /// `store`; absent, a global request falls back to the project store.
+    global_store: Option<Arc<dyn MemoryProvider>>,
 }
 
 impl MemoryTool {
@@ -27,6 +31,23 @@ impl MemoryTool {
             permission,
             ask_tx,
             store,
+            global_store: None,
+        }
+    }
+
+    /// Attach the global (cross-project) memory tier. `None` is a no-op.
+    pub fn with_global(mut self, global_store: Option<Arc<dyn MemoryProvider>>) -> Self {
+        self.global_store = global_store;
+        self
+    }
+
+    /// Pick the store an action targets. `scope == "global"` selects the
+    /// global tier when configured; everything else (including a global
+    /// request with no global tier) uses the per-project store.
+    fn scoped_store(&self, scope: Option<&str>) -> &Arc<dyn MemoryProvider> {
+        match scope {
+            Some("global") => self.global_store.as_ref().unwrap_or(&self.store),
+            _ => &self.store,
         }
     }
 }
@@ -45,6 +66,11 @@ pub struct Args {
     /// Full-text query for the `search` action (dirge-q8wt).
     #[serde(default)]
     query: Option<String>,
+    /// Memory scope: "project" (default) for facts about THIS repo, or
+    /// "global" for durable cross-project user preferences that should
+    /// follow the user everywhere.
+    #[serde(default)]
+    scope: Option<String>,
 }
 
 fn default_target() -> String {
@@ -113,6 +139,11 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                         "type": "string",
                         "enum": ["semantic", "episodic", "procedural", "working", "identity"],
                         "description": "The UMP memory kind. Defaults to 'procedural'. See KINDS above."
+                    },
+                    "scope": {
+                        "type": "string",
+                        "enum": ["project", "global"],
+                        "description": "Where the entry lives: 'project' (default) for facts about THIS repo; 'global' for durable user preferences that should follow the user across every project."
                     }
                 },
                 "required": ["action"]
@@ -124,10 +155,12 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
         check_perm(&self.permission, &self.ask_tx, "memory", &args.action).await?;
 
         let target = validate_target(&args.target)?;
+        // Route to the project or global tier per `scope` (default project).
+        let store = self.scoped_store(args.scope.as_deref());
 
         match args.action.as_str() {
             "view" => {
-                let resp = self.store.view(target);
+                let resp = store.view(target);
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
@@ -148,16 +181,10 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                     "content",
                     "add",
                 )?;
-                let resp = self
-                    .store
+                let resp = store
                     .add(target, content, args.kind.as_deref())
                     .map_err(ToolError::Msg)?;
-                crate::agent::review::fire_memory_write(
-                    self.store.as_ref(),
-                    "add",
-                    target,
-                    content,
-                );
+                crate::agent::review::fire_memory_write(store.as_ref(), "add", target, content);
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
@@ -172,16 +199,10 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                     "content",
                     "replace",
                 )?;
-                let resp = self
-                    .store
+                let resp = store
                     .replace(target, old_text, content, args.kind.as_deref())
                     .map_err(ToolError::Msg)?;
-                crate::agent::review::fire_memory_write(
-                    self.store.as_ref(),
-                    "replace",
-                    target,
-                    content,
-                );
+                crate::agent::review::fire_memory_write(store.as_ref(), "replace", target, content);
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
@@ -191,16 +212,8 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                     "old_text",
                     "remove",
                 )?;
-                let resp = self
-                    .store
-                    .remove(target, old_text)
-                    .map_err(ToolError::Msg)?;
-                crate::agent::review::fire_memory_write(
-                    self.store.as_ref(),
-                    "remove",
-                    target,
-                    old_text,
-                );
+                let resp = store.remove(target, old_text).map_err(ToolError::Msg)?;
+                crate::agent::review::fire_memory_write(store.as_ref(), "remove", target, old_text);
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
@@ -210,12 +223,9 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                     "old_text",
                     "restore",
                 )?;
-                let resp = self
-                    .store
-                    .restore(target, old_text)
-                    .map_err(ToolError::Msg)?;
+                let resp = store.restore(target, old_text).map_err(ToolError::Msg)?;
                 crate::agent::review::fire_memory_write(
-                    self.store.as_ref(),
+                    store.as_ref(),
                     "restore",
                     target,
                     old_text,
@@ -231,7 +241,7 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                     "old_text",
                     "expand",
                 )?;
-                let resp = self.store.expand(old_text).map_err(ToolError::Msg)?;
+                let resp = store.expand(old_text).map_err(ToolError::Msg)?;
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
@@ -241,7 +251,7 @@ old_text matches a unique substring or the exact "urn:ump:…" id from view/inde
                     "query",
                     "search",
                 )?;
-                let resp = self.store.search(query).map_err(ToolError::Msg)?;
+                let resp = store.search(query).map_err(ToolError::Msg)?;
                 Ok(serde_json::to_string_pretty(&resp)
                     .unwrap_or_else(|_| r#"{"error":"serialization failed"}"#.to_string()))
             }
@@ -290,6 +300,43 @@ mod tests {
             .unwrap()
     }
 
+    /// `scope: "global"` routes the write to the global tier, leaving the
+    /// project store untouched. A second independent store stands in for
+    /// the global tier.
+    #[test]
+    fn scope_global_routes_to_the_global_store() {
+        let (project, _pd) = temp_store();
+        let (global, _gd) = temp_store();
+        let tool = MemoryTool::new(project.clone(), None, None).with_global(Some(global.clone()));
+        let rt = make_runtime();
+
+        rt.block_on(tool.call(Args {
+            action: "add".into(),
+            target: "memory".into(),
+            content: Some("user prefers TDD".into()),
+            old_text: None,
+            kind: None,
+            query: None,
+            scope: Some("global".into()),
+        }))
+        .expect("global add should succeed");
+
+        assert!(
+            global
+                .view("memory")
+                .to_string()
+                .contains("user prefers TDD"),
+            "the entry must land in the global store"
+        );
+        assert!(
+            !project
+                .view("memory")
+                .to_string()
+                .contains("user prefers TDD"),
+            "the project store must be untouched"
+        );
+    }
+
     #[test]
     fn test_add_and_view() {
         let (store, _dir) = temp_store();
@@ -304,6 +351,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }));
         assert!(result.is_ok(), "add failed: {:?}", result);
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
@@ -318,6 +366,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         let entries = resp["entries"].as_array().unwrap();
@@ -338,6 +387,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }));
         assert!(result.is_ok());
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
@@ -357,6 +407,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
 
@@ -367,6 +418,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }));
         assert!(result.is_err());
     }
@@ -384,6 +436,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
 
@@ -394,6 +447,7 @@ mod tests {
             old_text: Some("cargo build".into()),
             kind: None,
             query: None,
+            scope: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["success"], true);
@@ -406,6 +460,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         let entries = resp["entries"].as_array().unwrap();
@@ -425,6 +480,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
 
@@ -435,6 +491,7 @@ mod tests {
             old_text: Some("temp entry".into()),
             kind: None,
             query: None,
+            scope: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["success"], true);
@@ -447,6 +504,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }));
         let resp: serde_json::Value = serde_json::from_str(&result.unwrap()).expect("valid JSON");
         assert_eq!(resp["entry_count"], 0);
@@ -465,6 +523,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }));
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid target"));
@@ -483,6 +542,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }));
         assert!(result.is_err());
     }
@@ -564,6 +624,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -573,6 +634,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -582,6 +644,7 @@ mod tests {
             old_text: Some("from-tool".into()),
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
         rt.block_on(tool.call(Args {
@@ -591,6 +654,7 @@ mod tests {
             old_text: Some("new".into()),
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
 
@@ -670,6 +734,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
         assert!(
@@ -685,6 +750,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
         // replace → one fire with the new content.
@@ -695,6 +761,7 @@ mod tests {
             old_text: Some("alpha".into()),
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
         // remove → one fire with the old_text (no new content).
@@ -705,6 +772,7 @@ mod tests {
             old_text: Some("beta".into()),
             kind: None,
             query: None,
+            scope: None,
         }))
         .unwrap();
 
@@ -764,6 +832,7 @@ mod tests {
             old_text: None,
             kind: None,
             query: None,
+            scope: None,
         }))
         .expect("seed add should succeed");
 
@@ -776,6 +845,7 @@ mod tests {
                     old_text: None,
                     kind: None,
                     query: None,
+                    scope: None,
                 },
                 "add" => Args {
                     action: "add".into(),
@@ -784,6 +854,7 @@ mod tests {
                     old_text: None,
                     kind: None,
                     query: None,
+                    scope: None,
                 },
                 "replace" => Args {
                     action: "replace".into(),
@@ -792,6 +863,7 @@ mod tests {
                     old_text: Some("seed:".into()),
                     kind: None,
                     query: None,
+                    scope: None,
                 },
                 "remove" => Args {
                     action: "remove".into(),
@@ -800,6 +872,7 @@ mod tests {
                     old_text: Some("entry-for-add".into()),
                     kind: None,
                     query: None,
+                    scope: None,
                 },
                 // Runs after "remove" archived entry-for-add, so the
                 // restore has a tombstoned entry to revive.
@@ -810,6 +883,7 @@ mod tests {
                     old_text: Some("entry-for-add".into()),
                     kind: None,
                     query: None,
+                    scope: None,
                 },
                 // Runs after "restore", so entry-for-add is active.
                 "expand" => Args {
@@ -819,6 +893,7 @@ mod tests {
                     old_text: Some("entry-for-add".into()),
                     kind: None,
                     query: None,
+                    scope: None,
                 },
                 "search" => Args {
                     action: "search".into(),
@@ -827,6 +902,7 @@ mod tests {
                     old_text: None,
                     kind: None,
                     query: Some("seed".into()),
+                    scope: None,
                 },
                 _ => unreachable!(),
             };

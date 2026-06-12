@@ -30,6 +30,21 @@ pub(crate) fn append_memory_to_preamble(
     }
 }
 
+/// Append the GLOBAL (cross-project) memory tier's block, under a header
+/// that distinguishes it from the project memory above so the model knows
+/// these are durable user preferences carried across every project. No-op
+/// when the global store is empty.
+pub(crate) fn append_global_memory_to_preamble(
+    preamble: &mut String,
+    provider: &std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>,
+) {
+    let block = provider.format_for_system_prompt();
+    if !block.is_empty() {
+        preamble.push_str("\n\n## Global memory (cross-project user preferences)\n");
+        preamble.push_str(&block);
+    }
+}
+
 /// Assemble the always-on base preamble — `SYSTEM_PROMPT`,
 /// `TODO_TOOLS_PROMPT`, and the in-session `SKILLS_GUIDANCE`
 /// (dirge-xxun, mirroring hermes `SKILLS_GUIDANCE`). Other contextual

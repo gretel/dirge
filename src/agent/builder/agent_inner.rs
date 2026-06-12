@@ -158,6 +158,22 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
             }
             Err(_) => None,
         };
+    // Global (cross-project) memory tier — inject its snapshot too, under a
+    // distinct header, so durable user preferences reach the prompt
+    // regardless of which project this is. Best-effort: a load failure just
+    // omits the global block.
+    if let Ok(global) =
+        tokio::task::spawn_blocking(crate::extras::memory_db::SqliteMemoryStore::load_global)
+            .await
+            .unwrap_or_else(|_| Err("spawn_blocking join failed".to_string()))
+    {
+        let global_provider: Arc<dyn crate::extras::memory_provider::MemoryProvider> =
+            Arc::new(global);
+        crate::agent::builder::preamble::append_global_memory_to_preamble(
+            &mut preamble,
+            &global_provider,
+        );
+    }
     let skill_manager = crate::extras::skills::manager::SkillManager::new(&paths);
     let mut usage_store = crate::extras::skills::usage::UsageStore::load(&paths).ok();
 

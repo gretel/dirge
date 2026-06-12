@@ -115,16 +115,17 @@ pub struct DynamicToolSearch {
 pub(crate) async fn register_memory_tool(
     tools: &mut Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
     memory_store: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+    global_store: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
     permission: Option<PermCheck>,
     ask_tx: Option<AskSender>,
 ) {
     use crate::agent::agent_loop::{RigToolAdapter, types::ToolExecutionMode};
     match memory_store {
         Some(store) => {
-            let adapter =
-                RigToolAdapter::new(Box::new(tools::MemoryTool::new(store, permission, ask_tx)))
-                    .await
-                    .with_execution_mode(ToolExecutionMode::Sequential);
+            let tool = tools::MemoryTool::new(store, permission, ask_tx).with_global(global_store);
+            let adapter = RigToolAdapter::new(Box::new(tool))
+                .await
+                .with_execution_mode(ToolExecutionMode::Sequential);
             tools.push(std::sync::Arc::new(adapter));
         }
         None => {
@@ -388,9 +389,17 @@ pub async fn build_loop_tools(
     // Writes to the memory store — Sequential. dirge-yof4: a load
     // failure degrades to a session without the memory tool instead
     // of panicking agent construction.
+    // Global (cross-project) memory tier — durable user prefs that follow
+    // the user across repos. Best-effort: a load failure just means no
+    // global scope this session.
+    let global_store: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>> =
+        crate::extras::memory_db::SqliteMemoryStore::load_global()
+            .ok()
+            .map(|s| std::sync::Arc::new(s) as _);
     register_memory_tool(
         &mut tools,
         memory_store.clone(),
+        global_store,
         permission.clone(),
         ask_tx.clone(),
     )

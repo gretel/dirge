@@ -35,6 +35,14 @@ pub(crate) fn dirs_path() -> PathBuf {
     }
 }
 
+/// Path to the GLOBAL, cross-project memory database. Unlike per-project
+/// memory (under each repo's `.dirge/sessions/state.db`), this is a single
+/// db in the user data dir so durable user preferences follow the user
+/// across every project.
+pub(crate) fn global_memory_db_path() -> PathBuf {
+    dirs_path().join("global-memory.db")
+}
+
 pub(crate) fn config_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("DIRGE_CONFIG_DIR") {
         return PathBuf::from(dir);

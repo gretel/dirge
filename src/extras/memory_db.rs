@@ -400,6 +400,38 @@ impl SqliteMemoryStore {
 
         import_markdown_if_present(&conn, paths)?;
 
+        Self::from_connection(conn)
+    }
+
+    /// Open the GLOBAL, cross-project memory store: durable user
+    /// preferences that should follow the user across every project,
+    /// backed by a single db in the user data dir (not a repo's
+    /// `.dirge/`). Same schema and snapshot/threat-scan path as the
+    /// per-project store, minus the project markdown import. Callers treat
+    /// an open error as "no global tier" (`.ok()`).
+    pub fn load_global() -> Result<Self, String> {
+        Self::load_global_at(&crate::session::storage::global_memory_db_path())
+    }
+
+    /// [`load_global`] against an explicit path — the seam tests use to
+    /// stay off the shared process-global location.
+    pub fn load_global_at(path: &std::path::Path) -> Result<Self, String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create global memory dir: {e}"))?;
+        }
+        let db = SessionDb::open(path)?;
+        let conn = db.conn;
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| format!("Failed to set busy timeout: {e}"))?;
+        Self::from_connection(conn)
+    }
+
+    /// Build a store from an open, migrated connection: capture the frozen,
+    /// threat-scanned snapshot used for system-prompt injection. Shared by
+    /// the per-project [`load`](Self::load) and the global
+    /// [`load_global_at`](Self::load_global_at).
+    fn from_connection(conn: Connection) -> Result<Self, String> {
         // Frozen snapshot — defense-in-depth re-scan before the text
         // is injected into the SYSTEM PROMPT (the highest-trust
         // surface). Rows normally pass the write-path scan, but the
@@ -1443,6 +1475,38 @@ mod tests {
         let store = SqliteMemoryStore::load(&paths).unwrap();
         assert!(store.snapshot.is_empty());
         assert_eq!(store.format_for_system_prompt(), "");
+    }
+
+    /// The global (cross-project) tier is a wholly separate store: an
+    /// entry added to one is invisible to the other. `load_global_at`
+    /// keeps the test off the shared process-global path.
+    #[test]
+    fn global_and_project_stores_are_independent() {
+        let (paths, _pdir) = temp_project();
+        let project = SqliteMemoryStore::load(&paths).unwrap();
+
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let gdir =
+            std::env::temp_dir().join(format!("dirge-memdb-global-{}-{}", std::process::id(), n));
+        let _ = std::fs::remove_dir_all(&gdir);
+        let global = SqliteMemoryStore::load_global_at(&gdir.join("global-memory.db")).unwrap();
+
+        project
+            .add_entry("memory", "project-only: cargo build", None)
+            .unwrap();
+        global
+            .add_entry("memory", "global-only: user prefers TDD", None)
+            .unwrap();
+
+        let pv = project.view("memory").to_string();
+        assert!(pv.contains("project-only"), "project sees its own entry");
+        assert!(!pv.contains("global-only"), "project must not see global");
+
+        let gv = global.view("memory").to_string();
+        assert!(gv.contains("global-only"), "global sees its own entry");
+        assert!(!gv.contains("project-only"), "global must not see project");
+
+        let _ = std::fs::remove_dir_all(&gdir);
     }
 
     #[test]
