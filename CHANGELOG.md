@@ -6,6 +6,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-06-12
+
+Long-horizon session work, porting ideas from MiMo-Code onto dirge's
+existing loop and memory rather than bolting on parallel machinery.
+
+### Added
+- **Durable session checkpoint (schema v10).** Each conversation gets a
+  `session_checkpoints` row holding the regenerated fold summary plus a
+  write-once verbatim-intent slot, keyed by a stable `origin_id`. Written
+  on every compaction fold; SQLite-backed in the per-project state.db.
+- **Incremental checkpointing (default on).** Refreshes the durable
+  checkpoint at 20%-interval usage thresholds (20/40/60/80% for windows up
+  to 200K; 10% to 500K; 5% above; disabled under 25K) in a background
+  task, without folding — so a resume after a quit/crash recovers a fresh
+  state instead of falling back to lossy compaction. The destructive fold
+  still fires at 0.75. Disabled in headless `-p`/`--loop` (nothing there
+  persists it). Disable with `incremental_checkpoint = false`.
+- **Goal gate (`--goal`).** Opt-in natural-language stop condition for
+  autonomous runs: at each finalization an independent judge (the critic
+  provider) rules whether the condition holds; if not, its reason
+  re-enters the loop, bounded so a mis-stated goal can't spin forever.
+  Requires a configured `critic_provider`.
+- **Global memory tier (default on).** A cross-project memory store
+  (single db in the user data dir) injected into the prompt under its own
+  header; the `memory` tool gains a `scope: "global"` argument for durable
+  user preferences that follow you across repos. Isolated from project
+  memory.
+- **`compaction_fold_threshold` config** (0.3–0.75) to fold — and thus
+  checkpoint — earlier, from more coherent context.
+
+### Fixed
+- **Resume now picks up where it left off.** A fold rotates the session id
+  and leaves the old file behind, so resuming by the id you started with
+  loaded a stale pre-fold snapshot. Conversations now carry a stable
+  `origin_id` across folds; resume resolves any id to the live chain tip,
+  and the session list collapses a folded conversation to one entry
+  instead of one per rotation.
+
 ## [0.6.1] - 2026-06-11
 
 ### Fixed
