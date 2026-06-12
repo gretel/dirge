@@ -173,6 +173,9 @@ impl AnyAgent {
         // F6 tier 3: thread the bounded critic (only Some when
         // critic_provider is configured). `None` → no critic.
         cfg.critic_fn = self.critic_fn.clone();
+        // Goal gate stop condition (`--goal`). Engages only when
+        // `critic_fn` above is also present (it's the judge).
+        cfg.goal = self.goal.clone();
         // dirge-008x: thread the in-loop compaction summarizer so the
         // proactive folds run LLM summarization (built in `build_agent`).
         cfg.summarize_fn = self.summarize_fn.clone();

@@ -409,6 +409,9 @@ pub async fn build_agent(
     // builder; this wires it through the agent_loop path so `run_print`
     // and the interactive flow both honor it.
     agent = agent.with_max_turns(Some(cli.resolve_max_agent_turns(cfg)));
+    // Goal gate stop condition. Off unless `--goal` is set (and a critic
+    // provider is configured to judge it); harmless otherwise.
+    agent = agent.with_goal(cli.goal.clone());
 
     agent
 }

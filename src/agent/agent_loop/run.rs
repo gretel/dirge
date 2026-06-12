@@ -153,6 +153,9 @@ enum FollowUpSource {
     Verifier,
     /// Bounded LLM critic judgment (at most once per run).
     Critic,
+    /// Goal gate: user-defined stop condition not yet met. Re-enters the
+    /// loop, bounded by [`super::goal::MAX_GOAL_REACT`].
+    Goal,
     /// Unfinished-todo nudge (bounded by [`MAX_TODO_NUDGES`]).
     Todo,
     /// No gate fired — the run may finalize.
@@ -199,6 +202,7 @@ async fn poll_finalization_follow_up(
     system_prompt: &str,
     new_messages: &[LoopMessage],
     critic_done: &mut bool,
+    goal_reacts: &mut u8,
     todo_nudges: &mut u8,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
     // 1. Caller hook (pi lines 256-262) — highest priority.
@@ -229,6 +233,24 @@ async fn poll_finalization_follow_up(
             if !msgs.is_empty() {
                 return (msgs, FollowUpSource::Critic);
             }
+        }
+    }
+    // 3.5 Goal gate — user-defined stop condition. Unlike the one-shot
+    //     critic, this PERSISTS across finalizations: each time the model
+    //     tries to stop, an independent judge (the critic provider, reused)
+    //     rules whether the stated condition holds; if not, its reason
+    //     re-enters the loop. Bounded by MAX_GOAL_REACT so a mis-stated or
+    //     unsatisfiable goal can't loop forever. Active only when a goal is
+    //     set AND a judge is configured — off for default/interactive runs.
+    if *goal_reacts < super::goal::MAX_GOAL_REACT
+        && let Some(goal) = &config.goal
+        && let Some(judge) = &config.critic_fn
+    {
+        let transcript = build_critic_transcript(new_messages);
+        let msgs = super::goal::run_goal_gate(judge, goal, system_prompt, &transcript).await;
+        if !msgs.is_empty() {
+            *goal_reacts += 1;
+            return (msgs, FollowUpSource::Goal);
         }
     }
     // 4. vix-port — final gate: nudge the model to finish or clear unfinished
@@ -800,6 +822,10 @@ pub async fn run_loop(
 
     // F6 tier 3: the bounded LLM critic fires at most once per run.
     let mut critic_done = false;
+
+    // Goal gate: counts re-entries so a user-defined stop condition that
+    // never resolves can't loop past MAX_GOAL_REACT.
+    let mut goal_reacts: u8 = 0;
 
     // vix-port: don't let the model end a turn while it still has unfinished
     // todos (bounded by MAX_TODO_NUDGES; vix caps at 3, session.go:1551).
@@ -1437,6 +1463,7 @@ pub async fn run_loop(
             &current_context.system_prompt,
             &new_messages,
             &mut critic_done,
+            &mut goal_reacts,
             &mut todo_nudges,
         )
         .await;

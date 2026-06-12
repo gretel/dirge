@@ -447,6 +447,7 @@ mod tests {
             file_touch_tracker: None,
             verifier: None,
             critic_fn: None,
+            goal: None,
             max_turns: None,
         }
     }
@@ -761,6 +762,7 @@ mod tests {
             file_touch_tracker: None,
             verifier: None,
             critic_fn: None,
+            goal: None,
             max_turns: None,
         };
         let signal = AbortSignal::new();

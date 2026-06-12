@@ -397,6 +397,11 @@ pub struct LoopSpawnConfig {
     /// `LoopConfig.critic_fn`. `None` = off (default).
     pub critic_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
 
+    /// Goal gate: optional natural-language stop condition, threaded into
+    /// `LoopConfig.goal`. Active only when also given a `critic_fn` (the
+    /// gate's judge). `None` = off (default).
+    pub goal: Option<String>,
+
     /// dirge-nqr: hard cap on assistant turns within a single run.
     /// `None` = unlimited. Forwarded to `LoopConfig.max_turns`.
     pub max_turns: Option<usize>,
@@ -449,6 +454,7 @@ impl LoopSpawnConfig {
             file_touch_tracker: None,
             verifier: None,
             critic_fn: None,
+            goal: None,
             max_turns: None,
             bg_store: None,
             memory_provider: None,
@@ -522,6 +528,7 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
         file_touch_tracker: cfg.file_touch_tracker.clone(),
         verifier: cfg.verifier.clone(),
         critic_fn: cfg.critic_fn.clone(),
+        goal: cfg.goal.clone(),
         max_turns: cfg.max_turns,
     };
 

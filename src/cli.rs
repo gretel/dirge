@@ -69,6 +69,12 @@ pub struct Cli {
     )]
     pub session: Option<String>,
 
+    #[arg(
+        long = "goal",
+        help = "Natural-language stop condition for autonomous runs (e.g. 'all tests pass and changes committed'). At each finalization an independent judge decides whether it's met; if not, the run continues (bounded). Requires a configured critic_provider as the judge."
+    )]
+    pub goal: Option<String>,
+
     #[arg(long = "no-session", help = "Ephemeral mode, do not save")]
     pub no_session: bool,
 

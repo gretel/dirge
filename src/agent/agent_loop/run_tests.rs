@@ -95,6 +95,7 @@ fn build_config() -> LoopConfig {
         file_touch_tracker: None,
         verifier: None,
         critic_fn: None,
+        goal: None,
         max_turns: None,
     }
 }
@@ -2395,9 +2396,17 @@ async fn finalization_hook_short_circuits_lower_gates() {
     }));
 
     let mut critic_done = false;
+    let mut goal_reacts = 0u8;
     let mut todo_nudges = 0u8;
-    let (msgs, source) =
-        poll_finalization_follow_up(&config, "sys", &[], &mut critic_done, &mut todo_nudges).await;
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut goal_reacts,
+        &mut todo_nudges,
+    )
+    .await;
 
     assert_eq!(source, FollowUpSource::Hook);
     assert_eq!(msgs.len(), 1);
@@ -2415,12 +2424,130 @@ async fn finalization_hook_short_circuits_lower_gates() {
 async fn finalization_all_gates_silent_yields_none() {
     let config = build_config(); // hook/verifier/critic all None
     let mut critic_done = false;
+    let mut goal_reacts = 0u8;
     let mut todo_nudges = MAX_TODO_NUDGES; // todo gate bounded out
-    let (msgs, source) =
-        poll_finalization_follow_up(&config, "sys", &[], &mut critic_done, &mut todo_nudges).await;
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut goal_reacts,
+        &mut todo_nudges,
+    )
+    .await;
 
     assert!(msgs.is_empty());
     assert_eq!(source, FollowUpSource::None);
+}
+
+/// Goal gate: an unmet stop condition re-enters the loop and counts the
+/// re-entry. `critic_done = true` isolates the goal gate from the
+/// one-shot critic so we observe it specifically.
+#[tokio::test]
+async fn finalization_goal_unmet_reenters_and_counts() {
+    use crate::agent::agent_loop::critic::CriticFn;
+    let mut config = build_config();
+    config.goal = Some("all tests pass and committed".into());
+    let judge: CriticFn =
+        Arc::new(|_p| Box::pin(async { Ok("GOAL: UNMET\n- tests still failing".to_string()) }));
+    config.critic_fn = Some(judge);
+
+    let mut critic_done = true; // skip the one-shot critic
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut goal_reacts,
+        &mut todo_nudges,
+    )
+    .await;
+
+    assert_eq!(source, FollowUpSource::Goal);
+    assert_eq!(goal_reacts, 1, "an unmet goal counts one re-entry");
+    assert_eq!(msgs.len(), 1);
+}
+
+/// A met goal lets the run finalize and does NOT count a re-entry.
+#[tokio::test]
+async fn finalization_goal_met_finalizes() {
+    use crate::agent::agent_loop::critic::CriticFn;
+    let mut config = build_config();
+    config.goal = Some("all tests pass".into());
+    let judge: CriticFn = Arc::new(|_p| Box::pin(async { Ok("GOAL: MET".to_string()) }));
+    config.critic_fn = Some(judge);
+
+    let mut critic_done = true;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut goal_reacts,
+        &mut todo_nudges,
+    )
+    .await;
+
+    assert!(msgs.is_empty());
+    assert_eq!(source, FollowUpSource::None);
+    assert_eq!(goal_reacts, 0);
+}
+
+/// Once the re-entry bound is reached, an unmet goal no longer blocks —
+/// the run finalizes rather than looping forever on a bad stop condition.
+#[tokio::test]
+async fn finalization_goal_bound_stops_reentry() {
+    use crate::agent::agent_loop::critic::CriticFn;
+    let mut config = build_config();
+    config.goal = Some("unsatisfiable".into());
+    let judge: CriticFn = Arc::new(|_p| Box::pin(async { Ok("GOAL: UNMET".to_string()) }));
+    config.critic_fn = Some(judge);
+
+    let mut critic_done = true;
+    let mut goal_reacts = crate::agent::agent_loop::goal::MAX_GOAL_REACT;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut goal_reacts,
+        &mut todo_nudges,
+    )
+    .await;
+
+    assert!(msgs.is_empty());
+    assert_eq!(source, FollowUpSource::None, "bound reached → finalize");
+}
+
+/// Goal gate stays OFF when no judge is configured, even with a goal set —
+/// it reuses the critic provider, so no provider means no gate.
+#[tokio::test]
+async fn finalization_goal_without_judge_is_inert() {
+    let mut config = build_config();
+    config.goal = Some("all tests pass".into());
+    config.critic_fn = None; // no judge
+
+    let mut critic_done = true;
+    let mut goal_reacts = 0u8;
+    let mut todo_nudges = MAX_TODO_NUDGES;
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &[],
+        &mut critic_done,
+        &mut goal_reacts,
+        &mut todo_nudges,
+    )
+    .await;
+
+    assert!(msgs.is_empty());
+    assert_eq!(source, FollowUpSource::None);
+    assert_eq!(goal_reacts, 0);
 }
 
 /// A tool that always fails. Distinct args per call so the storm

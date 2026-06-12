@@ -398,6 +398,14 @@ pub struct LoopConfig {
     /// finalization on substantive runs. `None` = no critic (default).
     pub critic_fn: Option<super::critic::CriticFn>,
 
+    /// Goal gate: an opt-in natural-language stop condition for
+    /// autonomous runs. When `Some` AND `critic_fn` is configured (the
+    /// gate reuses the critic provider as its judge), each finalization
+    /// is held until an independent judge rules the condition met, bounded
+    /// by [`super::goal::MAX_GOAL_REACT`]. `None` = no gate (default), so
+    /// interactive and unparameterized runs are unaffected.
+    pub goal: Option<String>,
+
     /// dirge-nqr: hard cap on assistant turns within a single run.
     /// `None` = unlimited (matches the legacy behaviour). When set,
     /// the run loop terminates after `max_turns` assistant turns
@@ -543,6 +551,7 @@ impl std::fmt::Debug for LoopConfig {
             )
             .field("verifier", &self.verifier.as_ref().map(|_| "<gate>"))
             .field("critic_fn", &self.critic_fn.as_ref().map(|_| "<critic>"))
+            .field("goal", &self.goal)
             .field("max_turns", &self.max_turns)
             .finish()
     }
@@ -585,6 +594,7 @@ impl Clone for LoopConfig {
             file_touch_tracker: self.file_touch_tracker.clone(),
             verifier: self.verifier.clone(),
             critic_fn: self.critic_fn.clone(),
+            goal: self.goal.clone(),
             max_turns: self.max_turns,
         }
     }

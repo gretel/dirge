@@ -84,6 +84,10 @@ pub struct AnyAgent {
     /// time when `ConfigRole::Critic` resolves (i.e. `critic_provider`
     /// is configured). Forwarded to `LoopConfig.critic_fn`. `None` = off.
     critic_fn: Option<crate::agent::agent_loop::critic::CriticFn>,
+    /// Goal gate: optional natural-language stop condition for autonomous
+    /// runs (`--goal`). Forwarded to `LoopConfig.goal`; active only when a
+    /// `critic_fn` (the judge) is also present. `None` = off (default).
+    goal: Option<String>,
     /// dirge-008x: in-loop LLM compaction summarizer. Built at
     /// `build_agent` time from the main model and forwarded to
     /// `LoopSpawnConfig.summarize_fn`, so the proactive folds in
@@ -162,6 +166,7 @@ impl AnyAgent {
             escalation_stream_fn: None,
             escalation_provider_name: None,
             critic_fn: None,
+            goal: None,
             summarize_fn: None,
             context_depth_reminder_threshold: None,
             max_turns: None,
@@ -289,6 +294,14 @@ impl AnyAgent {
     /// only when `ConfigRole::Critic` resolves (`critic_provider` set).
     pub fn with_critic(mut self, critic_fn: crate::agent::agent_loop::critic::CriticFn) -> Self {
         self.critic_fn = Some(critic_fn);
+        self
+    }
+
+    /// Set the goal gate's stop condition. An empty/blank string clears it
+    /// (treated as no goal). The gate only engages when a critic provider
+    /// is also configured to serve as the judge.
+    pub fn with_goal(mut self, goal: Option<String>) -> Self {
+        self.goal = goal.filter(|g| !g.trim().is_empty());
         self
     }
 

@@ -391,6 +391,7 @@ mod tests {
             file_touch_tracker: None,
             verifier: None,
             critic_fn: None,
+            goal: None,
             max_turns: None,
         };
         config.get_steering_messages = Some(steering_from_queue(queue.clone(), QueueMode::All));
