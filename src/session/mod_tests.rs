@@ -1,5 +1,24 @@
 use super::*;
 
+/// A fresh session is its own origin: `effective_origin` falls back to
+/// `id` while `origin_id` is None.
+#[test]
+fn effective_origin_falls_back_to_id_when_unset() {
+    let s = Session::new("openrouter", "test/model", 0);
+    assert!(s.origin_id.is_none());
+    assert_eq!(s.effective_origin(), s.id.as_str());
+}
+
+/// Once set (the fold handler copies the chain's origin forward),
+/// `effective_origin` returns it regardless of the rotated `id`.
+#[test]
+fn effective_origin_returns_origin_id_when_set() {
+    let mut s = Session::new("openrouter", "test/model", 0);
+    s.origin_id = Some(compact_str::CompactString::new("conv-root"));
+    assert_eq!(s.effective_origin(), "conv-root");
+    assert_ne!(s.effective_origin(), s.id.as_str());
+}
+
 /// The verbatim first user message is the checkpoint's drift anchor:
 /// it skips any leading system/assistant messages and ignores later
 /// user turns.

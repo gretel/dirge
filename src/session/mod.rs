@@ -219,6 +219,18 @@ pub struct Session {
     #[serde(default)]
     pub schema_version: u32,
     pub id: CompactString,
+    /// Stable conversation identity, carried unchanged across every
+    /// compaction fold (a fold rotates `id` but copies `origin_id`
+    /// forward). `None` means "this session is its own origin" — a
+    /// fresh session that has never folded, or a pre-`origin_id` file
+    /// whose `id` IS the origin. Always read it through
+    /// [`Session::effective_origin`], never the raw field, so the
+    /// `None` case resolves to `id`. This is the single key that ties a
+    /// conversation together: resume resolves an id to its origin then
+    /// loads the chain tip, the session list dedups by it, and the v10
+    /// checkpoint is keyed by it.
+    #[serde(default)]
+    pub origin_id: Option<CompactString>,
     pub name: CompactString,
     pub messages: Vec<SessionMessage>,
     pub compactions: Vec<Compaction>,
@@ -360,6 +372,11 @@ impl Session {
         Session {
             schema_version: SCHEMA_VERSION,
             id: CompactString::new(Uuid::new_v4().to_string()),
+            // A fresh session is its own origin; the fold handler copies
+            // this forward on rotation. Left None so `effective_origin`
+            // resolves to `id` until the first fold gives the chain a
+            // distinct tip.
+            origin_id: None,
             name: CompactString::new(""),
             messages: Vec::new(),
             compactions: Vec::new(),
@@ -482,6 +499,15 @@ impl Session {
 
     pub fn add_message(&mut self, role: MessageRole, content: &str) {
         self.add_message_with_tool_calls(role, content, Vec::new());
+    }
+
+    /// The conversation's stable identity. Returns `origin_id` when set,
+    /// otherwise falls back to `id` (a never-folded or pre-`origin_id`
+    /// session is its own origin). This is the key for resume tip
+    /// resolution, session-list dedup, and the v10 checkpoint — always
+    /// prefer it over the raw `origin_id` field.
+    pub fn effective_origin(&self) -> &str {
+        self.origin_id.as_deref().unwrap_or(&self.id)
     }
 
     /// The verbatim text of the conversation's first user message, or

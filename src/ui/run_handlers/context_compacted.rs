@@ -61,11 +61,15 @@ pub(crate) async fn handle_context_compacted(
         let _ = db.set_parent_session(new_session_id, &old_sid);
         // Persist the durable session checkpoint (schema v10): the
         // structured fold summary plus the verbatim first prompt, keyed
-        // by the ROOT id so a resume after any number of rotations
-        // recovers it. Co-located with the rotation state it derives
-        // from; no-op when the pass produced no summary.
+        // by the conversation's stable origin id so a resume that
+        // resolves any chain member to its origin recovers it. Co-located
+        // with the rotation state it derives from; no-op when the pass
+        // produced no summary. `effective_origin` still reads the
+        // pre-rotation origin here — the carry-forward below happens
+        // after this block.
+        let origin = ctx.session.effective_origin().to_string();
         let intent = ctx.session.first_user_prompt().unwrap_or("");
-        db.checkpoint_after_fold(intent, new_session_id, summary);
+        db.checkpoint_after_fold(&origin, intent, summary);
     }
     // SESS-2 follow-up #1: mutate the in-memory Session to match the
     // rotation and push a Compaction entry, then persist to disk. Without
@@ -83,6 +87,13 @@ pub(crate) async fn handle_context_compacted(
     // on-disk JSON still had the old id — providers querying either store
     // saw inconsistent triple state.
     let parent_id = ctx.session.id.to_string();
+    // Carry the conversation's stable origin forward onto the rotated
+    // session BEFORE swapping `id`: on the first fold `effective_origin`
+    // is still the original id (origin_id was None), which becomes the
+    // chain's permanent origin; later folds re-stamp the same value.
+    // This is the id resume/list/checkpoint all key on.
+    let origin = ctx.session.effective_origin().to_string();
+    ctx.session.origin_id = Some(compact_str::CompactString::new(origin));
     ctx.session.id = compact_str::CompactString::new(new_session_id);
     if let Err(e) = crate::session::storage::save_session(ctx.session) {
         tracing::warn!(
