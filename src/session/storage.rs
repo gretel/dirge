@@ -978,7 +978,11 @@ pub fn load_session_tip(id: &str) -> anyhow::Result<Session> {
     }
     let mut tip = requested;
     for entry in std::fs::read_dir(&dir)? {
-        let entry = entry?;
+        // Skip a bad directory entry rather than aborting resume: a
+        // concurrent fold/cleanup can delete a sibling file mid-scan, and
+        // the seed session already loaded fine — a plain load would have
+        // succeeded, so the tip scan must degrade to it, not error out.
+        let Ok(entry) = entry else { continue };
         let path = entry.path();
         if path.extension().is_some_and(|e| e == "json")
             && let Ok(json) = std::fs::read_to_string(&path)

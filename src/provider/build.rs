@@ -410,7 +410,19 @@ pub async fn build_agent(
     // and the interactive flow both honor it.
     agent = agent.with_max_turns(Some(cli.resolve_max_agent_turns(cfg)));
     // Goal gate stop condition. Off unless `--goal` is set (and a critic
-    // provider is configured to judge it); harmless otherwise.
+    // provider is configured to judge it); harmless otherwise. Warn on the
+    // misconfiguration where a goal is given but no judge resolves — the
+    // gate would silently never fire.
+    if cli.goal.as_deref().is_some_and(|g| !g.trim().is_empty())
+        && cfg
+            .resolve_role(crate::config::ConfigRole::Critic)
+            .is_none()
+    {
+        tracing::warn!(
+            target: "dirge::goal",
+            "--goal is set but no critic_provider is configured to judge it; the goal gate will not fire",
+        );
+    }
     agent = agent.with_goal(cli.goal.clone());
 
     agent
