@@ -16,6 +16,20 @@ use crate::context::ContextFiles;
 use crate::provider::AnyAgent;
 use crate::ui::run_handlers::{AgentBuildDeps, RunCtx};
 
+/// Prepend the conversation's verbatim original request to a fold
+/// summary so it anchors resumed context. The summary's own `## Goal`
+/// can drift as the body is re-summarized fold after fold; the original
+/// ask rides along verbatim through the existing summary-injection path
+/// (`convert_history`), symmetric for headless and TUI resume without
+/// touching that hot path's many callers. Empty intent or summary
+/// returns the summary unchanged.
+fn anchor_summary_with_intent(intent: &str, summary: &str) -> String {
+    if intent.is_empty() || summary.is_empty() {
+        return summary.to_string();
+    }
+    format!("Original request: {intent}\n\n{summary}")
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn handle_context_compacted(
     ctx: &mut RunCtx<'_>,
@@ -47,6 +61,13 @@ pub(crate) async fn handle_context_compacted(
     // "compression", insert the new session.
     let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
     let paths = crate::extras::dirge_paths::ProjectPaths::new(&cwd);
+    // The conversation's stable origin and its durable verbatim intent.
+    // Prefer the checkpoint's write-once original — it survives later
+    // folds where the first user prompt has already been folded out of
+    // the live messages — falling back to the current first user prompt
+    // on the first fold.
+    let origin = ctx.session.effective_origin().to_string();
+    let mut intent = ctx.session.first_user_prompt().unwrap_or("").to_string();
     if let Ok(db) = crate::extras::session_db::SessionDb::open(&paths.session_db_path()) {
         let old_sid = format!("dirge-{}", crate::text::short_id(ctx.session.id.as_str()));
         let _ = db.end_session(&old_sid, "compression");
@@ -59,17 +80,19 @@ pub(crate) async fn handle_context_compacted(
             &now,
         );
         let _ = db.set_parent_session(new_session_id, &old_sid);
+        // On a later fold the original ask is no longer in the live
+        // messages; recover it from the write-once checkpoint slot.
+        if let Some(cp) = db.get_checkpoint(&origin).ok().flatten()
+            && !cp.intent.is_empty()
+        {
+            intent = cp.intent;
+        }
         // Persist the durable session checkpoint (schema v10): the
-        // structured fold summary plus the verbatim first prompt, keyed
-        // by the conversation's stable origin id so a resume that
-        // resolves any chain member to its origin recovers it. Co-located
-        // with the rotation state it derives from; no-op when the pass
-        // produced no summary. `effective_origin` still reads the
-        // pre-rotation origin here — the carry-forward below happens
-        // after this block.
-        let origin = ctx.session.effective_origin().to_string();
-        let intent = ctx.session.first_user_prompt().unwrap_or("");
-        db.checkpoint_after_fold(&origin, intent, summary);
+        // structured fold summary plus the verbatim intent, keyed by the
+        // stable origin id so a resume that resolves any chain member to
+        // its origin recovers it. The slot is write-once, so passing the
+        // recovered intent here keeps the original.
+        db.checkpoint_after_fold(&origin, &intent, summary);
     }
     // SESS-2 follow-up #1: mutate the in-memory Session to match the
     // rotation and push a Compaction entry, then persist to disk. Without
@@ -78,8 +101,12 @@ pub(crate) async fn handle_context_compacted(
     // lines 380-397.
     let token_savings = tokens_before.saturating_sub(tokens_after);
     if !summary.is_empty() {
+        // Anchor the verbatim original request at the head of the stored
+        // summary so it reaches resumed context through the existing
+        // summary-injection path.
+        let anchored = anchor_summary_with_intent(&intent, summary);
         ctx.session
-            .compress_reporting(summary.to_string(), first_kept_index, token_savings);
+            .compress_reporting(anchored, first_kept_index, token_savings);
     }
     // dirge-hs61: capture the outgoing id, do ALL the mutations (id
     // rotation + disk save), THEN fire the on_session_switch hook. Pre-fix
@@ -142,4 +169,23 @@ pub(crate) async fn handle_context_compacted(
         Color::DarkGrey,
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anchor_prepends_verbatim_intent() {
+        assert_eq!(
+            anchor_summary_with_intent("fix the resume bug", "## Goal\nresume works"),
+            "Original request: fix the resume bug\n\n## Goal\nresume works"
+        );
+    }
+
+    #[test]
+    fn anchor_is_a_noop_when_intent_or_summary_empty() {
+        assert_eq!(anchor_summary_with_intent("", "the summary"), "the summary");
+        assert_eq!(anchor_summary_with_intent("intent", ""), "");
+    }
 }
