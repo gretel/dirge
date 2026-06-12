@@ -13,7 +13,7 @@
 //! - Schema versioning with migrations
 //! - FTS5 content sync triggers for auto-indexing
 
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -22,7 +22,7 @@ use regex::Regex;
 // Used in migrate() to set user_version pragma. pub(crate) so tests
 // assert against the constant instead of a hardcoded number that
 // breaks on every migration.
-pub(crate) const SCHEMA_VERSION: u32 = 9;
+pub(crate) const SCHEMA_VERSION: u32 = 10;
 
 /// Thread-safe snapshot of the most recent `SessionDb::open()` failure.
 /// Port of Hermes's `_last_init_error` (hermes_state.py:66-67).
@@ -299,6 +299,10 @@ impl SessionDb {
 
         if current < 9 {
             self.run_migration_v9()?;
+        }
+
+        if current < 10 {
+            self.run_migration_v10()?;
         }
 
         self.conn
@@ -713,6 +717,31 @@ impl SessionDb {
         Ok(())
     }
 
+    /// v10 (feat/session-checkpoint): durable structured session state.
+    /// One row per session holding the evolved compaction artifact — the
+    /// regenerated multi-section `summary` plus a write-once `intent`
+    /// slot that anchors the original goal across folds and resumes. This
+    /// replaces nothing yet; it's the store the checkpoint path writes to
+    /// instead of the transient index-0 summary message. Kept in SQLite
+    /// (not a markdown file) so it shares the per-project state.db.
+    fn run_migration_v10(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS session_checkpoints (
+                    session_id   TEXT PRIMARY KEY,
+                    intent       TEXT NOT NULL DEFAULT '',
+                    summary      TEXT NOT NULL DEFAULT '',
+                    revision     INTEGER NOT NULL DEFAULT 0,
+                    created_at   TEXT NOT NULL,
+                    updated_at   TEXT NOT NULL
+                );
+                ",
+            )
+            .map_err(|e| format!("Migration v10 failed: {e}"))?;
+        Ok(())
+    }
+
     /// Delete all of a session's messages, keeping both FTS indexes
     /// consistent (dirge-slj2). This is the ONLY safe way to delete
     /// message rows: `messages_fts` is an external-content FTS5 table
@@ -1109,6 +1138,71 @@ impl SessionDb {
             }
         }
         Ok(current)
+    }
+}
+
+/// A session's durable structured state (v10). `intent` is the
+/// write-once drift anchor; `summary` is the latest regenerated body;
+/// `revision` counts folds since insert.
+// No production caller yet — the compaction/resume wiring lands in the
+// next step (same staging as `delete_session_messages` above).
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct SessionCheckpoint {
+    pub session_id: String,
+    pub intent: String,
+    pub summary: String,
+    pub revision: i64,
+}
+
+#[allow(dead_code)] // production caller lands with the compaction wiring step
+impl SessionDb {
+    /// Write a session checkpoint. The FIRST call for a session inserts
+    /// `intent` and `summary` at revision 0. Every later call replaces
+    /// `summary` and bumps `revision` but LEAVES `intent` untouched — the
+    /// `ON CONFLICT` clause deliberately omits it, so the original goal
+    /// can't drift as the body is re-summarized fold after fold. Pass the
+    /// best-known intent each time; it's only honored on insert.
+    pub fn upsert_checkpoint(
+        &self,
+        session_id: &str,
+        intent: &str,
+        summary: &str,
+    ) -> Result<(), String> {
+        let now = chrono::Utc::now().to_rfc3339();
+        self.conn
+            .execute(
+                "INSERT INTO session_checkpoints
+                     (session_id, intent, summary, revision, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, 0, ?4, ?4)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                     summary    = excluded.summary,
+                     revision   = revision + 1,
+                     updated_at = excluded.updated_at",
+                params![session_id, intent, summary, now],
+            )
+            .map_err(|e| format!("Failed to upsert checkpoint: {e}"))?;
+        Ok(())
+    }
+
+    /// Load a session's checkpoint, or `None` if it has none yet.
+    pub fn get_checkpoint(&self, session_id: &str) -> Result<Option<SessionCheckpoint>, String> {
+        self.conn
+            .query_row(
+                "SELECT session_id, intent, summary, revision
+                 FROM session_checkpoints WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok(SessionCheckpoint {
+                        session_id: row.get(0)?,
+                        intent: row.get(1)?,
+                        summary: row.get(2)?,
+                        revision: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(|e| format!("Failed to read checkpoint: {e}"))
     }
 }
 

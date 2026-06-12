@@ -903,3 +903,116 @@ fn migration_from_v2_to_v5_adds_trigram_and_columns() {
         [],
     );
 }
+
+// --- v10: session_checkpoints (durable structured session state) ---
+
+/// A fresh DB carries the v10 checkpoint table.
+#[test]
+fn schema_v10_creates_session_checkpoints() {
+    let (db, _dir) = temp_db();
+    let cols: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('session_checkpoints')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        cols > 0,
+        "session_checkpoints table must exist on a fresh DB"
+    );
+}
+
+/// First upsert inserts intent + summary at revision 0; reading it back
+/// round-trips every field.
+#[test]
+fn checkpoint_first_upsert_round_trips() {
+    let (db, _dir) = temp_db();
+    db.upsert_checkpoint("s1", "fix the resume bug", "## Goal\nresume works")
+        .unwrap();
+    let cp = db
+        .get_checkpoint("s1")
+        .unwrap()
+        .expect("checkpoint present");
+    assert_eq!(cp.intent, "fix the resume bug");
+    assert_eq!(cp.summary, "## Goal\nresume works");
+    assert_eq!(cp.revision, 0);
+}
+
+/// The intent slot is the drift anchor: written once on insert, never
+/// rewritten by later upserts. The summary body IS replaced and the
+/// revision bumps each fold.
+#[test]
+fn checkpoint_intent_is_immutable_summary_is_replaced() {
+    let (db, _dir) = temp_db();
+    db.upsert_checkpoint("s1", "original intent", "first body")
+        .unwrap();
+    // Later folds pass a possibly-drifted intent — it must be ignored.
+    db.upsert_checkpoint("s1", "DRIFTED intent", "second body")
+        .unwrap();
+    db.upsert_checkpoint("s1", "", "third body").unwrap();
+
+    let cp = db.get_checkpoint("s1").unwrap().unwrap();
+    assert_eq!(
+        cp.intent, "original intent",
+        "intent must never be rewritten"
+    );
+    assert_eq!(cp.summary, "third body", "summary is the latest fold");
+    assert_eq!(cp.revision, 2, "revision bumps once per fold after insert");
+}
+
+/// Distinct sessions keep independent checkpoints; an absent session
+/// reads back as None.
+#[test]
+fn checkpoint_is_per_session() {
+    let (db, _dir) = temp_db();
+    db.upsert_checkpoint("a", "intent a", "body a").unwrap();
+    db.upsert_checkpoint("b", "intent b", "body b").unwrap();
+    assert_eq!(db.get_checkpoint("a").unwrap().unwrap().summary, "body a");
+    assert_eq!(db.get_checkpoint("b").unwrap().unwrap().intent, "intent b");
+    assert!(db.get_checkpoint("missing").unwrap().is_none());
+}
+
+/// A pre-v10 DB (checkpoint table absent, version pinned to 9) gains the
+/// table on reopen without disturbing existing memories.
+#[test]
+fn schema_v10_migrates_from_v9() {
+    let n = DB_COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("dirge-v10-migrate-{}-{}", std::process::id(), n));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("state.db");
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, uid TEXT NOT NULL UNIQUE,
+                 target TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'procedural',
+                 content TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
+                 tier TEXT NOT NULL DEFAULT 'hot', salience REAL NOT NULL DEFAULT 0.5,
+                 created_at TEXT NOT NULL, updated_at TEXT NOT NULL, last_used_at TEXT,
+                 use_count INTEGER NOT NULL DEFAULT 0, superseded_by TEXT
+             );
+             INSERT INTO memories (uid, target, content, created_at, updated_at)
+                 VALUES ('urn:ump:keep', 'memory', 'survives the migration', 'x', 'x');
+             PRAGMA user_version = 9;",
+        )
+        .unwrap();
+    }
+    let db = SessionDb::open(&path).unwrap();
+    // Table now exists and is usable.
+    db.upsert_checkpoint("s1", "intent", "body").unwrap();
+    assert_eq!(db.get_checkpoint("s1").unwrap().unwrap().summary, "body");
+    // Pre-existing memory survived.
+    let kept: i64 = db
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories WHERE uid = 'urn:ump:keep'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 1, "v10 migration must not disturb existing memories");
+    let _ = std::fs::remove_dir_all(&dir);
+}
