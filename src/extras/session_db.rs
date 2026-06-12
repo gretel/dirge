@@ -1185,6 +1185,29 @@ impl SessionDb {
         Ok(())
     }
 
+    /// Persist the durable checkpoint after a compaction fold. Keyed by
+    /// the ROOT session id (walk the parent chain via `resolve_parent`)
+    /// so a resume by the id the conversation started with recovers it
+    /// however many times the session has rotated. `intent` is the
+    /// verbatim first user prompt, honored only on the first write (the
+    /// slot is write-once). An empty `summary` is a no-op: a prune-only
+    /// pass produced no structured state worth storing.
+    pub fn checkpoint_after_fold(&self, intent: &str, new_session_id: &str, summary: &str) {
+        if summary.is_empty() {
+            return;
+        }
+        let root = self
+            .resolve_parent(new_session_id)
+            .unwrap_or_else(|_| new_session_id.to_string());
+        if let Err(e) = self.upsert_checkpoint(&root, intent, summary) {
+            tracing::warn!(
+                target: "dirge::session",
+                error = %e,
+                "failed to persist session checkpoint after fold",
+            );
+        }
+    }
+
     /// Load a session's checkpoint, or `None` if it has none yet.
     pub fn get_checkpoint(&self, session_id: &str) -> Result<Option<SessionCheckpoint>, String> {
         self.conn

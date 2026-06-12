@@ -484,6 +484,18 @@ impl Session {
         self.add_message_with_tool_calls(role, content, Vec::new());
     }
 
+    /// The verbatim text of the conversation's first user message, or
+    /// `None` if no user turn has been recorded yet. This is the durable
+    /// session checkpoint's write-once "intent" anchor (schema v10) — the
+    /// original ask, kept exactly as typed so it can't be re-summarized
+    /// away as the body folds.
+    pub fn first_user_prompt(&self) -> Option<&str> {
+        self.messages
+            .iter()
+            .find(|m| m.role == MessageRole::User)
+            .map(|m| m.content.as_str())
+    }
+
     /// Same as `add_message` but attaches structured tool-call
     /// entries to the new message. Used by the runner to persist
     /// assistant turns that invoked tools so `convert_history`

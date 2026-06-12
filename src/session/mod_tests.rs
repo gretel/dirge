@@ -1,5 +1,26 @@
 use super::*;
 
+/// The verbatim first user message is the checkpoint's drift anchor:
+/// it skips any leading system/assistant messages and ignores later
+/// user turns.
+#[test]
+fn first_user_prompt_is_the_verbatim_first_user_message() {
+    let mut s = Session::new("openrouter", "test/model", 0);
+    s.add_message(MessageRole::System, "system preamble");
+    s.add_message(MessageRole::User, "the original ask");
+    s.add_message(MessageRole::Assistant, "working on it");
+    s.add_message(MessageRole::User, "a follow-up");
+    assert_eq!(s.first_user_prompt(), Some("the original ask"));
+}
+
+/// No user message yet → no anchor.
+#[test]
+fn first_user_prompt_is_none_without_a_user_message() {
+    let mut s = Session::new("openrouter", "test/model", 0);
+    s.add_message(MessageRole::System, "only system");
+    assert_eq!(s.first_user_prompt(), None);
+}
+
 /// New messages get a fresh UUID and a non-zero timestamp. P4a's
 /// whole point.
 #[test]

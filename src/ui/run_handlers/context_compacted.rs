@@ -59,6 +59,13 @@ pub(crate) async fn handle_context_compacted(
             &now,
         );
         let _ = db.set_parent_session(new_session_id, &old_sid);
+        // Persist the durable session checkpoint (schema v10): the
+        // structured fold summary plus the verbatim first prompt, keyed
+        // by the ROOT id so a resume after any number of rotations
+        // recovers it. Co-located with the rotation state it derives
+        // from; no-op when the pass produced no summary.
+        let intent = ctx.session.first_user_prompt().unwrap_or("");
+        db.checkpoint_after_fold(intent, new_session_id, summary);
     }
     // SESS-2 follow-up #1: mutate the in-memory Session to match the
     // rotation and push a Compaction entry, then persist to disk. Without

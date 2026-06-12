@@ -974,6 +974,44 @@ fn checkpoint_is_per_session() {
     assert!(db.get_checkpoint("missing").unwrap().is_none());
 }
 
+/// After a fold the checkpoint is keyed by the ROOT session id (walk the
+/// parent chain), so a resume by the id the conversation started with
+/// recovers it however many times the session rotated. The rotating
+/// child id must NOT carry its own checkpoint.
+#[test]
+fn checkpoint_after_fold_keys_by_root() {
+    let (db, _dir) = temp_db();
+    db.insert_session("dirge-root", "cli", "m", "p", "2026-01-01T00:00:00Z")
+        .unwrap();
+    db.insert_session("dirge-child", "cli", "m", "p", "2026-01-01T00:01:00Z")
+        .unwrap();
+    db.set_parent_session("dirge-child", "dirge-root").unwrap();
+
+    // The fold rotated to dirge-child and produced a summary.
+    db.checkpoint_after_fold("verbatim first ask", "dirge-child", "## Goal\ndone");
+
+    let cp = db
+        .get_checkpoint("dirge-root")
+        .unwrap()
+        .expect("checkpoint stored under the root id");
+    assert_eq!(cp.intent, "verbatim first ask");
+    assert_eq!(cp.summary, "## Goal\ndone");
+    assert!(
+        db.get_checkpoint("dirge-child").unwrap().is_none(),
+        "must not be keyed by the rotating child id"
+    );
+}
+
+/// A prune-only pass yields no summary — nothing to checkpoint.
+#[test]
+fn checkpoint_after_fold_skips_empty_summary() {
+    let (db, _dir) = temp_db();
+    db.insert_session("dirge-root", "cli", "m", "p", "2026-01-01T00:00:00Z")
+        .unwrap();
+    db.checkpoint_after_fold("intent", "dirge-root", "");
+    assert!(db.get_checkpoint("dirge-root").unwrap().is_none());
+}
+
 /// A pre-v10 DB (checkpoint table absent, version pinned to 9) gains the
 /// table on reopen without disturbing existing memories.
 #[test]
