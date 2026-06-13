@@ -1034,3 +1034,20 @@ fn mode_reassert_payload_is_throttled() {
         "after the interval → re-asserts (self-heal)"
     );
 }
+
+/// Scrollback eviction (front drain past MAX_SCROLLBACK) bumps the
+/// eviction generation — the counter the Ctrl+O collapse guard relies on
+/// to know an absolute line anchor has been invalidated.
+#[test]
+fn eviction_generation_bumps_when_scrollback_overflows() {
+    let mut r = Renderer::new().expect("renderer");
+    assert_eq!(r.eviction_generation(), 0);
+    // MAX_SCROLLBACK is 20_000; push enough to trigger at least one drain.
+    for i in 0..20_050 {
+        let _ = r.write_line(&format!("l{i}"), Color::White);
+    }
+    assert!(
+        r.eviction_generation() >= 1,
+        "front eviction must bump the generation"
+    );
+}
