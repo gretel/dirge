@@ -274,37 +274,78 @@ pub fn strip_non_sgr_escapes(s: &str) -> std::borrow::Cow<'_, str> {
 /// scroll regions) also strip cleanly — anything a misbehaving
 /// producer might leave behind in the buffer.
 pub fn strip_ansi(s: &str) -> String {
-    let bytes = s.as_bytes();
+    if !s.contains('\x1b') {
+        return s.to_string();
+    }
     let mut out = String::with_capacity(s.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'[' {
-            // CSI introducer. Skip to (and past) the final byte in
-            // the 0x40..=0x7E range.
-            let mut j = i + 2;
-            while j < bytes.len() && !(0x40..=0x7e).contains(&bytes[j]) {
-                j += 1;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        // Drop the WHOLE escape sequence (including SGR) so the result is
+        // the exact set of glyphs the chat painter shows: `paint_line`
+        // runs `strip_non_sgr_escapes` (drops every non-SGR sequence) then
+        // `into_text` (consumes the kept SGR into styling), leaving the
+        // same fully-stripped text. Keeping the two in lockstep is what
+        // makes mouse selection / clipboard map to the right cells; the
+        // old version kept OSC/DCS/RIS payloads that the painter dropped,
+        // which mis-mapped selection on any line with such an escape.
+        match chars.next() {
+            Some('[') => {
+                // CSI: drop through the final byte (0x40..=0x7e).
+                let mut n = 0;
+                for next in &mut chars {
+                    if (0x40..=0x7e).contains(&(next as u32)) {
+                        break;
+                    }
+                    n += 1;
+                    if n >= 256 {
+                        break;
+                    }
+                }
             }
-            i = j.saturating_add(1).min(bytes.len());
-            continue;
+            Some(']') => {
+                // OSC: drop through BEL or ST (ESC \).
+                let mut n = 0;
+                while let Some(next) = chars.next() {
+                    if next == '\x07' {
+                        break;
+                    }
+                    if next == '\x1b' {
+                        let mut peek = chars.clone();
+                        if peek.next() == Some('\\') {
+                            chars = peek;
+                            break;
+                        }
+                    }
+                    n += 1;
+                    if n >= 256 {
+                        break;
+                    }
+                }
+            }
+            Some('P') | Some('X') | Some('^') | Some('_') => {
+                // DCS / SOS / PM / APC: drop through ST (ESC \).
+                let mut prev = '\0';
+                let mut n = 0;
+                for next in &mut chars {
+                    if prev == '\x1b' && next == '\\' {
+                        break;
+                    }
+                    prev = next;
+                    n += 1;
+                    if n >= 4096 {
+                        break;
+                    }
+                }
+            }
+            // Two-byte ESC sequence (RIS `\x1bc`, index, save/restore, …):
+            // drop both bytes.
+            Some(_) => {}
+            None => break,
         }
-        // Single ESC not followed by `[` — drop it alone to be
-        // safe (could be an OSC/DCS start; better not to copy).
-        if bytes[i] == 0x1b {
-            i += 1;
-            continue;
-        }
-        // UTF-8 step.
-        let step = match bytes[i] {
-            b if b < 0x80 => 1,
-            b if b < 0xC0 => 1,
-            b if b < 0xE0 => 2,
-            b if b < 0xF0 => 3,
-            _ => 4,
-        };
-        let end = (i + step).min(bytes.len());
-        out.push_str(&s[i..end]);
-        i = end;
     }
     out
 }
@@ -379,11 +420,40 @@ mod tests {
     }
 
     #[test]
-    fn strip_ansi_drops_lone_esc() {
-        // ESC not followed by `[` — drop it on its own to keep the
-        // clipboard payload safe (could be the head of an OSC/DCS).
-        let s = "a\x1bb";
-        assert_eq!(strip_ansi(s), "ab");
+    fn strip_ansi_drops_two_byte_esc_sequence() {
+        // ESC + a byte is a two-byte escape (RIS `\x1bc`, index `\x1bD`, …);
+        // drop both so the result matches what the painter renders.
+        assert_eq!(strip_ansi("a\x1bcb"), "ab");
+    }
+
+    #[test]
+    fn strip_ansi_drops_osc_and_dcs_fully() {
+        // OSC (title) and DCS payloads are dropped whole — not left as
+        // residue — so they don't desync the selection char model from the
+        // painted glyphs.
+        assert_eq!(strip_ansi("a\x1b]0;title\x07b"), "ab");
+        assert_eq!(strip_ansi("a\x1bPq...data\x1b\\b"), "ab");
+        // The mouse-break escape and an SGR around plain text.
+        assert_eq!(strip_ansi("x\x1b[?1000l\x1b[32mok\x1b[0m"), "xok");
+    }
+
+    /// Selection maps over `strip_ansi`; the painter shows
+    /// `strip_non_sgr_escapes` then SGR-parsed-away. The two must produce
+    /// the same visible glyphs for any escape, or click-select mis-maps.
+    #[test]
+    fn strip_ansi_matches_painter_glyphs() {
+        for s in [
+            "plain",
+            "a\x1b[31mred\x1b[0mb",
+            "a\x1b]0;t\x07b", // OSC
+            "a\x1bcb",        // RIS
+            "a\x1b[?1000lb",  // private-mode reset
+            "a\x1b[2;5Hb",    // cursor move
+        ] {
+            // painter residue = drop non-SGR, then drop the kept SGR.
+            let painter = strip_ansi(&strip_non_sgr_escapes(s));
+            assert_eq!(strip_ansi(s), painter, "mismatch for {s:?}");
+        }
     }
 
     #[test]

@@ -583,14 +583,13 @@ impl Renderer {
         // /dev/tty, the same sink the guard's setup uses) heals it within one
         // interval. Done before the 8ms paint throttle below so it keeps
         // firing even while paints are coalesced.
-        if let Some(bytes) =
-            mode_reassert_payload(self.last_mode_reassert, std::time::Instant::now())
-        {
+        let now = std::time::Instant::now();
+        if let Some(bytes) = mode_reassert_payload(self.last_mode_reassert, now) {
             if let Some(mut tty) = crate::ui::terminal::open_tty_for_write() {
                 let _ = tty.write_all(bytes);
                 let _ = tty.flush();
             }
-            self.last_mode_reassert = Some(std::time::Instant::now());
+            self.last_mode_reassert = Some(now);
         }
 
         // Re-clamp the scroll offset to the CURRENT geometry every frame. The
