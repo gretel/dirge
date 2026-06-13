@@ -55,9 +55,17 @@ pub(crate) enum ExpandTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExpandToggle {
     /// An expansion is showing — collapse it. `start` is where it was
-    /// appended; `expected_len` is the buffer length recorded at expand
-    /// time (truncate only if the buffer still matches).
-    Collapse { start: usize, expected_len: usize },
+    /// appended, `expected_len` the buffer length recorded at expand time,
+    /// and `eviction_gen` the renderer's eviction counter then. The handler
+    /// truncates back to `start` only if BOTH the length still matches AND
+    /// the eviction counter is unchanged — so a front-eviction that shifted
+    /// indices (even if the length coincidentally returns) can't truncate
+    /// live content.
+    Collapse {
+        start: usize,
+        expected_len: usize,
+        eviction_gen: u64,
+    },
     /// Collapsed with something to show — expand it.
     Expand,
     /// Nothing has been truncated yet — no-op.
@@ -66,11 +74,12 @@ pub(crate) enum ExpandToggle {
 
 /// Decide the toggle action from the current anchor and whether any
 /// expandable source exists.
-pub(crate) fn expand_toggle(anchor: Option<(usize, usize)>, has_source: bool) -> ExpandToggle {
+pub(crate) fn expand_toggle(anchor: Option<(usize, usize, u64)>, has_source: bool) -> ExpandToggle {
     match anchor {
-        Some((start, expected_len)) => ExpandToggle::Collapse {
+        Some((start, expected_len, eviction_gen)) => ExpandToggle::Collapse {
             start,
             expected_len,
+            eviction_gen,
         },
         None if has_source => ExpandToggle::Expand,
         None => ExpandToggle::Nothing,
@@ -162,13 +171,13 @@ pub(crate) struct UiState {
     /// thinking burst (`last_thinking`) and tool output (`last_collapsed`).
     pub(crate) expand_target: ExpandTarget,
     /// Drives the expand ↔ collapse toggle. `None` when collapsed. When
-    /// expanded, holds `(start, expected_len)`: the buffer index where the
-    /// full block was appended, and the buffer length right after. Collapse
-    /// truncates back to `start` only if the buffer is still that length
-    /// (i.e. the expansion is still the tail) — so streamed output or
-    /// buffer-cap eviction after expanding can't make collapse delete real
-    /// content.
-    pub(crate) expansion_anchor: Option<(usize, usize)>,
+    /// expanded, holds `(start, expected_len, eviction_gen)`: the buffer
+    /// index where the full block was appended, the buffer length right
+    /// after, and the renderer's front-eviction counter then. Collapse
+    /// truncates back to `start` only if the length still matches AND the
+    /// eviction counter is unchanged — so streamed output or buffer-cap
+    /// eviction after expanding can't make collapse delete real content.
+    pub(crate) expansion_anchor: Option<(usize, usize, u64)>,
 
     // ── User toggles ─────────────────────────────────────────────────
     pub(crate) show_reasoning: bool,
@@ -401,10 +410,11 @@ mod tests {
     #[test]
     fn toggle_collapses_when_shown() {
         assert_eq!(
-            expand_toggle(Some((10, 18)), true),
+            expand_toggle(Some((10, 18, 3)), true),
             ExpandToggle::Collapse {
                 start: 10,
-                expected_len: 18
+                expected_len: 18,
+                eviction_gen: 3,
             }
         );
     }

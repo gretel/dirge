@@ -346,6 +346,13 @@ pub struct Renderer {
     /// app). `tui_redraw` re-emits them on a throttle so dirge self-heals
     /// within one interval of any such leak. `None` until the first paint.
     last_mode_reassert: Option<std::time::Instant>,
+    /// Bumped each time scrollback eviction drains lines from the FRONT of
+    /// `buffer`, which shifts every absolute line index down. Consumers
+    /// holding an absolute index across appends (the Ctrl+O expansion
+    /// anchor) capture this and bail if it changed — a buffer-length
+    /// coincidence alone can't tell whether an eviction invalidated the
+    /// index.
+    eviction_generation: u64,
     buffer: Vec<LineEntry>,
     partial: CompactString,
     partial_color: Color,
@@ -504,6 +511,7 @@ impl Renderer {
             needs_paint: false,
             last_paint: None,
             last_mode_reassert: None,
+            eviction_generation: 0,
             buffer: Vec::new(),
             partial: CompactString::new(""),
             partial_color: Color::White,
@@ -1256,6 +1264,12 @@ impl Renderer {
         self.buffer.len()
     }
 
+    /// Counter of front-eviction events. A held absolute line index is
+    /// only valid while this is unchanged (see `eviction_generation`).
+    pub fn eviction_generation(&self) -> u64 {
+        self.eviction_generation
+    }
+
     #[allow(dead_code)]
     pub fn buffer_lines(&self) -> Vec<&str> {
         self.buffer.iter().map(|e| e.text.as_str()).collect()
@@ -1507,6 +1521,9 @@ impl Renderer {
         if self.buffer.len() > MAX_SCROLLBACK {
             let drop_n = DRAIN_CHUNK;
             self.buffer.drain(..drop_n);
+            // Front eviction shifts every absolute index down — invalidate
+            // any held line anchor (see `eviction_generation`).
+            self.eviction_generation = self.eviction_generation.wrapping_add(1);
             // Adjust absolute line indices used by selection +
             // scrolling. `lines` field tracks the same counter
             // used by selection_indices_stay_absolute_under_streaming_appends

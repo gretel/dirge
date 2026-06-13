@@ -1544,17 +1544,24 @@ pub async fn run_interactive(
                                 ExpandToggle::Collapse {
                                     start,
                                     expected_len,
+                                    eviction_gen,
                                 } => {
-                                    // Only truncate if the expansion is still
-                                    // the tail (nothing streamed / evicted
-                                    // since) — otherwise leave it as history.
-                                    if renderer.buffer_len() == expected_len {
+                                    // Truncate back to the expansion only if it
+                                    // is still the tail AND no front-eviction
+                                    // shifted indices since (a length match
+                                    // alone can coincide after eviction and
+                                    // delete live content). Otherwise just drop
+                                    // the anchor and leave it as history.
+                                    if renderer.buffer_len() == expected_len
+                                        && renderer.eviction_generation() == eviction_gen
+                                    {
                                         renderer.replace_from(start, Vec::new());
                                     }
                                     ui.expansion_anchor = None;
                                 }
                                 ExpandToggle::Expand => {
                                     let start = renderer.buffer_len();
+                                    let gen_before = renderer.eviction_generation();
                                     match crate::ui::state::select_expand_source(
                                         live,
                                         ui.expand_target,
@@ -1583,8 +1590,16 @@ pub async fn run_interactive(
                                         ExpandSource::None => {}
                                     }
                                     let end = renderer.buffer_len();
-                                    if end > start {
-                                        ui.expansion_anchor = Some((start, end));
+                                    // Record the anchor only if the append
+                                    // didn't trip eviction (which would have
+                                    // shifted `start`). If it did, the block
+                                    // stays as history and can't be collapsed —
+                                    // benign, and far better than a stale index.
+                                    if end > start
+                                        && renderer.eviction_generation() == gen_before
+                                    {
+                                        ui.expansion_anchor =
+                                            Some((start, end, renderer.eviction_generation()));
                                     }
                                 }
                                 ExpandToggle::Nothing => {}

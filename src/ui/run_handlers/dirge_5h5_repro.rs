@@ -222,7 +222,7 @@ struct State {
     last_collapsed: Option<crate::ui::tool_display::CollapsedToolResult>,
     last_thinking: Option<String>,
     expand_target: crate::ui::state::ExpandTarget,
-    expansion_anchor: Option<(usize, usize)>,
+    expansion_anchor: Option<(usize, usize, u64)>,
     last_user_prompt: String,
     active_plan: Option<crate::agent::plan::runtime::ActivePlan>,
 }

@@ -86,7 +86,7 @@ pub(super) struct RunCtx<'a> {
     /// burst before clearing `reasoning_buf`.
     pub last_thinking: &'a mut Option<String>,
     pub expand_target: &'a mut crate::ui::state::ExpandTarget,
-    pub expansion_anchor: &'a mut Option<(usize, usize)>,
+    pub expansion_anchor: &'a mut Option<(usize, usize, u64)>,
     pub last_user_prompt: &'a mut String,
     pub cli: &'a Cli,
     pub cfg: &'a Config,
