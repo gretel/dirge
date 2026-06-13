@@ -469,6 +469,9 @@ pub async fn run_interactive(
                 tool_calls_buf: &mut ui.tool_calls_buf,
                 tool_calls_this_run: &mut ui.tool_calls_this_run,
                 last_collapsed: &mut ui.last_collapsed,
+                last_thinking: &mut ui.last_thinking,
+                expand_target: &mut ui.expand_target,
+                expansion_anchor: &mut ui.expansion_anchor,
                 last_user_prompt: &mut ui.last_user_prompt,
                 cli,
                 cfg,
@@ -1525,29 +1528,66 @@ pub async fn run_interactive(
                             continue;
                         }
 
-                        // dirge-fjqk: Ctrl+O expands on demand. While the agent
-                        // is thinking (buffered reasoning present), reveal it in
-                        // a plain, color-reset block (no markdown stream → no
-                        // bleed). Otherwise reprint the last collapsed tool
-                        // result in full (restores that affordance).
+                        // dirge-fjqk + expand-toggle: Ctrl+O toggles the last
+                        // truncated block — a thinking burst (live or just
+                        // completed) or a collapsed tool/command result.
+                        // Expand appends the full block at the bottom; a second
+                        // press collapses it. Unlike before, the thinking burst
+                        // is retained after the turn, so it stays expandable
+                        // once the response is showing.
                         if action == Some(KeyAction::Expand) {
-                            if !ui.reasoning_buf.is_empty() {
-                                renderer.write_line("  ╭─ thinking ─", theme::thinking())?;
-                                for line in ui.reasoning_buf.lines() {
-                                    renderer.write_line(
-                                        &format!("  │ {}", sanitize_output(line)),
-                                        theme::thinking(),
-                                    )?;
+                            use crate::ui::state::{ExpandSource, ExpandToggle};
+                            let live = !ui.reasoning_buf.is_empty();
+                            let has_source =
+                                live || ui.last_collapsed.is_some() || ui.last_thinking.is_some();
+                            match crate::ui::state::expand_toggle(ui.expansion_anchor, has_source) {
+                                ExpandToggle::Collapse {
+                                    start,
+                                    expected_len,
+                                } => {
+                                    // Only truncate if the expansion is still
+                                    // the tail (nothing streamed / evicted
+                                    // since) — otherwise leave it as history.
+                                    if renderer.buffer_len() == expected_len {
+                                        renderer.replace_from(start, Vec::new());
+                                    }
+                                    ui.expansion_anchor = None;
                                 }
-                                renderer.write_line("  ╰─", theme::thinking())?;
-                                renderer.write_line("", Color::White)?;
-                            } else if let Some(collapsed) = &ui.last_collapsed {
-                                const EXPAND_CAP_BYTES: usize = 64 * 1024;
-                                crate::ui::tool_display::render_collapsed_in_full(
-                                    &mut renderer,
-                                    collapsed,
-                                    EXPAND_CAP_BYTES,
-                                )?;
+                                ExpandToggle::Expand => {
+                                    let start = renderer.buffer_len();
+                                    match crate::ui::state::select_expand_source(
+                                        live,
+                                        ui.expand_target,
+                                        ui.last_collapsed.is_some(),
+                                        ui.last_thinking.is_some(),
+                                    ) {
+                                        ExpandSource::LiveThinking => {
+                                            let text = ui.reasoning_buf.clone();
+                                            render_thinking_block(&mut renderer, &text)?;
+                                        }
+                                        ExpandSource::Thinking => {
+                                            if let Some(text) = ui.last_thinking.clone() {
+                                                render_thinking_block(&mut renderer, &text)?;
+                                            }
+                                        }
+                                        ExpandSource::Tool => {
+                                            if let Some(collapsed) = &ui.last_collapsed {
+                                                const EXPAND_CAP_BYTES: usize = 64 * 1024;
+                                                crate::ui::tool_display::render_collapsed_in_full(
+                                                    &mut renderer,
+                                                    collapsed,
+                                                    EXPAND_CAP_BYTES,
+                                                )?;
+                                            }
+                                        }
+                                        ExpandSource::None => {}
+                                    }
+                                    let end = renderer.buffer_len();
+                                    if end > start {
+                                        ui.expansion_anchor = Some((start, end));
+                                    }
+                                }
+                                ExpandToggle::Nothing => {}
                             }
                             renderer.request_repaint();
                             continue;
@@ -1783,12 +1823,15 @@ pub async fn run_interactive(
                         input.set_wrap_width(renderer.input_wrap_w());
                         if let Some(text) = input.handle_key(key) {
                             // Review #4: any submission starts a new
-                            // turn — drop the collapsed-result stash
-                            // so Ctrl+O doesn't expand a tool result
-                            // from a previous, unrelated turn. New
-                            // truncations during the turn populate
-                            // it again.
+                            // turn — drop the expand-toggle stash so
+                            // Ctrl+O doesn't expand (or, via a stale
+                            // anchor, mis-truncate) content from a
+                            // previous, unrelated turn. New thinking /
+                            // truncations during the turn repopulate it.
                             ui.last_collapsed = None;
+                            ui.last_thinking = None;
+                            ui.expand_target = crate::ui::state::ExpandTarget::None;
+                            ui.expansion_anchor = None;
                             #[cfg(feature = "loop")]
                             if loop_state.as_ref().is_some_and(|ls| ls.active) && !text.starts_with('/') {
                                 // Queue the message instead of dropping it.
@@ -3511,6 +3554,22 @@ fn render_question_options(
 /// #387 follow-up: (re)render the in-progress custom-answer text at
 /// `input_anchor`, soft-wrapped to the content width. Mirrors the former
 /// innermost loop's render.
+/// Append a thinking burst as a plain, color-reset block (no markdown
+/// stream → no style bleed) for the Ctrl+O expand toggle. Used for both the
+/// live in-flight buffer and a retained completed burst.
+fn render_thinking_block(renderer: &mut Renderer, text: &str) -> std::io::Result<()> {
+    renderer.write_line("  ╭─ thinking ─", crate::ui::theme::thinking())?;
+    for line in text.lines() {
+        renderer.write_line(
+            &format!("  │ {}", sanitize_output(line)),
+            crate::ui::theme::thinking(),
+        )?;
+    }
+    renderer.write_line("  ╰─", crate::ui::theme::thinking())?;
+    renderer.write_line("", Color::White)?;
+    Ok(())
+}
+
 fn render_custom_entry(renderer: &mut Renderer, buf: &str, input_anchor: usize) {
     let wrap_w = renderer.content_width().saturating_sub(4).max(1);
     let (rows, _, _) = crate::ui::renderer::wrap_editor(buf, buf.len(), wrap_w);

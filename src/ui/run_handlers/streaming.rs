@@ -75,7 +75,9 @@ pub(crate) fn handle_token(
         // End-of-reasoning marker. The reasoning stays rendered in the
         // scroll; we just stop tracking it so the next reasoning burst
         // anchors at a fresh buffer position below the streamed content.
-        ctx.reasoning_buf.clear();
+        // `end_reasoning` stashes the burst first so Ctrl+O can still
+        // expand it once the response is showing.
+        ctx.end_reasoning();
         *ctx.reasoning_start_line = None;
     }
     let safe = sanitize_output(text);

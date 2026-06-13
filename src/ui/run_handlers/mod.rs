@@ -81,6 +81,12 @@ pub(super) struct RunCtx<'a> {
     pub tool_calls_buf: &'a mut Vec<crate::session::ToolCallEntry>,
     pub tool_calls_this_run: &'a mut u32,
     pub last_collapsed: &'a mut Option<CollapsedToolResult>,
+    /// Persisted thinking + Ctrl+O toggle state (see `UiState`). Threaded
+    /// here so the turn-boundary handlers can stash the completed thinking
+    /// burst before clearing `reasoning_buf`.
+    pub last_thinking: &'a mut Option<String>,
+    pub expand_target: &'a mut crate::ui::state::ExpandTarget,
+    pub expansion_anchor: &'a mut Option<(usize, usize)>,
     pub last_user_prompt: &'a mut String,
     pub cli: &'a Cli,
     pub cfg: &'a Config,
@@ -88,6 +94,33 @@ pub(super) struct RunCtx<'a> {
     /// mid-flight so the `Done` handler runs the reviewer loop after the
     /// implement turn; `None` on the normal single-agent path.
     pub active_plan: &'a mut Option<crate::agent::plan::runtime::ActivePlan>,
+}
+
+impl RunCtx<'_> {
+    /// End the current thinking burst at a turn boundary: stash it so the
+    /// Ctrl+O toggle can still expand it after the response is showing
+    /// (previously the buffer was simply cleared and the thinking became
+    /// unrecoverable), then clear the in-flight buffer. A non-empty burst
+    /// becomes the freshest expand target and resets the toggle to
+    /// collapsed; an empty burst just clears.
+    pub(super) fn end_reasoning(&mut self) {
+        if !self.reasoning_buf.is_empty() {
+            *self.last_thinking = Some(self.reasoning_buf.clone());
+            *self.expand_target = crate::ui::state::ExpandTarget::Thinking;
+            *self.expansion_anchor = None;
+        }
+        self.reasoning_buf.clear();
+    }
+
+    /// Mark a just-rendered tool result as the freshest Ctrl+O target when
+    /// it was actually truncated (`last_collapsed` is `Some`). Resets the
+    /// toggle to collapsed so the next Ctrl+O expands this output.
+    pub(super) fn note_tool_truncation(&mut self) {
+        if self.last_collapsed.is_some() {
+            *self.expand_target = crate::ui::state::ExpandTarget::Tool;
+            *self.expansion_anchor = None;
+        }
+    }
 }
 
 /// Shared immutable inputs to [`crate::provider::build_agent`], bundled so

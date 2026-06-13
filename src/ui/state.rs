@@ -39,6 +39,73 @@ use super::tool_display::CollapsedToolResult;
 /// `TOOL_ACTIVITY_CAP` local.
 pub(crate) const TOOL_ACTIVITY_CAP: usize = 8;
 
+/// Which collapsed block the Ctrl+O expand/collapse toggle targets — the
+/// most recently truncated thinking burst or tool/command output. `None`
+/// means nothing has been truncated yet, so Ctrl+O is a no-op.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ExpandTarget {
+    #[default]
+    None,
+    Thinking,
+    Tool,
+}
+
+/// What the Ctrl+O keypress should do this time, given the current toggle
+/// state. Pure decision, applied by the handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpandToggle {
+    /// An expansion is showing — collapse it. `start` is where it was
+    /// appended; `expected_len` is the buffer length recorded at expand
+    /// time (truncate only if the buffer still matches).
+    Collapse { start: usize, expected_len: usize },
+    /// Collapsed with something to show — expand it.
+    Expand,
+    /// Nothing has been truncated yet — no-op.
+    Nothing,
+}
+
+/// Decide the toggle action from the current anchor and whether any
+/// expandable source exists.
+pub(crate) fn expand_toggle(anchor: Option<(usize, usize)>, has_source: bool) -> ExpandToggle {
+    match anchor {
+        Some((start, expected_len)) => ExpandToggle::Collapse {
+            start,
+            expected_len,
+        },
+        None if has_source => ExpandToggle::Expand,
+        None => ExpandToggle::Nothing,
+    }
+}
+
+/// Which block to expand when expanding. A thinking burst still streaming
+/// (`live`) always wins; otherwise the most-recent target is preferred,
+/// falling back to whichever of tool/thinking output is available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpandSource {
+    LiveThinking,
+    Thinking,
+    Tool,
+    None,
+}
+
+pub(crate) fn select_expand_source(
+    live: bool,
+    target: ExpandTarget,
+    has_tool: bool,
+    has_thinking: bool,
+) -> ExpandSource {
+    if live {
+        return ExpandSource::LiveThinking;
+    }
+    match target {
+        ExpandTarget::Tool if has_tool => ExpandSource::Tool,
+        ExpandTarget::Thinking if has_thinking => ExpandSource::Thinking,
+        _ if has_tool => ExpandSource::Tool,
+        _ if has_thinking => ExpandSource::Thinking,
+        _ => ExpandSource::None,
+    }
+}
+
 /// The event loop's model — single source of truth for the interactive UI.
 pub(crate) struct UiState {
     // ── Agent-run lifecycle ──────────────────────────────────────────
@@ -86,6 +153,22 @@ pub(crate) struct UiState {
     pub(crate) chamber_top_end: Option<usize>,
     /// Last truncated tool output (Ctrl+O reprints it in full).
     pub(crate) last_collapsed: Option<CollapsedToolResult>,
+    /// Most recent COMPLETED thinking burst, retained after `reasoning_buf`
+    /// is cleared at the turn boundary so Ctrl+O can still expand it once
+    /// the response is showing (it couldn't before — `reasoning_buf` was
+    /// gone).
+    pub(crate) last_thinking: Option<String>,
+    /// Which truncated block Ctrl+O targets — the most recent of the
+    /// thinking burst (`last_thinking`) and tool output (`last_collapsed`).
+    pub(crate) expand_target: ExpandTarget,
+    /// Drives the expand ↔ collapse toggle. `None` when collapsed. When
+    /// expanded, holds `(start, expected_len)`: the buffer index where the
+    /// full block was appended, and the buffer length right after. Collapse
+    /// truncates back to `start` only if the buffer is still that length
+    /// (i.e. the expansion is still the tail) — so streamed output or
+    /// buffer-cap eviction after expanding can't make collapse delete real
+    /// content.
+    pub(crate) expansion_anchor: Option<(usize, usize)>,
 
     // ── User toggles ─────────────────────────────────────────────────
     pub(crate) show_reasoning: bool,
@@ -268,6 +351,9 @@ impl UiState {
             chamber_top_start: None,
             chamber_top_end: None,
             last_collapsed: None,
+            last_thinking: None,
+            expand_target: ExpandTarget::None,
+            expansion_anchor: None,
 
             show_reasoning: false,
             todo_tools_enabled: false,
@@ -295,5 +381,67 @@ impl UiState {
     /// lock briefly; ignores poisoning.
     pub(crate) fn interjection_len(&self) -> usize {
         self.interjection_queue.lock().map(|q| q.len()).unwrap_or(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn toggle_expands_when_collapsed_with_a_source() {
+        assert_eq!(expand_toggle(None, true), ExpandToggle::Expand);
+    }
+
+    #[test]
+    fn toggle_is_noop_when_nothing_truncated() {
+        assert_eq!(expand_toggle(None, false), ExpandToggle::Nothing);
+    }
+
+    #[test]
+    fn toggle_collapses_when_shown() {
+        assert_eq!(
+            expand_toggle(Some((10, 18)), true),
+            ExpandToggle::Collapse {
+                start: 10,
+                expected_len: 18
+            }
+        );
+    }
+
+    #[test]
+    fn live_thinking_always_wins() {
+        assert_eq!(
+            select_expand_source(true, ExpandTarget::Tool, true, true),
+            ExpandSource::LiveThinking
+        );
+    }
+
+    #[test]
+    fn source_prefers_target_then_falls_back() {
+        // Honor the most-recent target when it's available.
+        assert_eq!(
+            select_expand_source(false, ExpandTarget::Tool, true, true),
+            ExpandSource::Tool
+        );
+        assert_eq!(
+            select_expand_source(false, ExpandTarget::Thinking, true, true),
+            ExpandSource::Thinking
+        );
+        // Target says Tool but there's no tool output → fall back to thinking.
+        assert_eq!(
+            select_expand_source(false, ExpandTarget::Tool, false, true),
+            ExpandSource::Thinking
+        );
+        // No target set → prefer tool when present.
+        assert_eq!(
+            select_expand_source(false, ExpandTarget::None, true, false),
+            ExpandSource::Tool
+        );
+        // Nothing available.
+        assert_eq!(
+            select_expand_source(false, ExpandTarget::None, false, false),
+            ExpandSource::None
+        );
     }
 }

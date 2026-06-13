@@ -104,7 +104,9 @@ pub(crate) fn handle_tool_call(
     }
     ctx.response_buf.clear();
     *ctx.response_start_line = None;
-    ctx.reasoning_buf.clear();
+    // Stash the thinking before the tool chamber takes over so Ctrl+O can
+    // still expand it.
+    ctx.end_reasoning();
     *ctx.reasoning_start_line = None;
     // Tool-call line: rounded chamber TOP border with the tool name on it.
     // Output lines below get `│ ` chamber rows; closed by `╰────╯` after the
