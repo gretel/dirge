@@ -358,6 +358,8 @@ pub(crate) async fn handle_tool_result(
             *ctx.tool_chamber_open = false;
         }
     }
+    // If this output was truncated, make it the freshest Ctrl+O target.
+    ctx.note_tool_truncation();
     // Clear after consuming so a future stray ToolResult
     // can't be coloured with a stale tool name.
     *ctx.last_tool_name = None;

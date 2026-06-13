@@ -335,7 +335,9 @@ pub(crate) async fn handle_done(
     *ctx.agent_line_started = false;
     ctx.response_buf.clear();
     *ctx.response_start_line = None;
-    ctx.reasoning_buf.clear();
+    // Stash the turn's thinking before clearing so Ctrl+O can still expand
+    // it after the turn completes.
+    ctx.end_reasoning();
     *ctx.reasoning_start_line = None;
 
     #[cfg(feature = "loop")]
