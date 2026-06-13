@@ -174,6 +174,94 @@ pub fn strip_escapes(s: &str, policy: StripPolicy) -> String {
     result
 }
 
+/// Strip every escape sequence EXCEPT SGR (`\x1b[…m`) — the color/style
+/// codes dirge's own markdown renderer bakes into `LineEntry::text` and
+/// that the chat painter parses back into ratatui spans. Everything else —
+/// cursor moves, scroll regions, private-mode sets/resets (`\x1b[?1000l`
+/// …), alt-screen toggles, OSC, DCS, RIS — is dropped, so a control
+/// sequence that slipped past content sanitization (a plugin custom
+/// message, an unsanitized writer) can never reach a terminal cell and
+/// corrupt global terminal state. Defense-in-depth behind the startup
+/// mode-set and the paint-loop re-assert.
+///
+/// Returns the input borrowed when it has no ESC at all — the common case
+/// — so plain lines allocate nothing.
+pub fn strip_non_sgr_escapes(s: &str) -> std::borrow::Cow<'_, str> {
+    if !s.contains('\x1b') {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                // CSI: collect through the final byte (0x40..=0x7e); keep
+                // the whole sequence only when it's SGR (final byte `m`).
+                let mut seq = String::from("\x1b[");
+                let mut sgr = false;
+                let mut n = 0;
+                for next in &mut chars {
+                    seq.push(next);
+                    if (0x40..=0x7e).contains(&(next as u32)) {
+                        sgr = next == 'm';
+                        break;
+                    }
+                    n += 1;
+                    if n >= 256 {
+                        break;
+                    }
+                }
+                if sgr {
+                    out.push_str(&seq);
+                }
+            }
+            Some(']') => {
+                // OSC: drop through BEL or ST (ESC \). Mirrors strip_escapes.
+                let mut n = 0;
+                while let Some(next) = chars.next() {
+                    if next == '\x07' {
+                        break;
+                    }
+                    if next == '\x1b' {
+                        let mut peek = chars.clone();
+                        if peek.next() == Some('\\') {
+                            chars = peek;
+                            break;
+                        }
+                    }
+                    n += 1;
+                    if n >= 256 {
+                        break;
+                    }
+                }
+            }
+            Some('P') | Some('X') | Some('^') | Some('_') => {
+                // DCS / SOS / PM / APC: drop through ST (ESC \).
+                let mut prev = '\0';
+                let mut n = 0;
+                for next in &mut chars {
+                    if prev == '\x1b' && next == '\\' {
+                        break;
+                    }
+                    prev = next;
+                    n += 1;
+                    if n >= 4096 {
+                        break;
+                    }
+                }
+            }
+            // Single-byte ESC sequence (incl. RIS `\x1bc`): drop both.
+            Some(_) => {}
+            None => break,
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Strip ANSI CSI escape sequences (`\x1b[…m` and friends) from `s`,
 /// returning a clean printable string. Used by clipboard / selection
 /// paths: the renderer bakes SGR codes into `LineEntry::text` for
@@ -389,5 +477,34 @@ mod tests {
         let s = "a\x1b]0;payload\x1b[2J\x07b";
         let out = strip_escapes(s, StripPolicy::STRICT);
         assert_eq!(out, "ab");
+    }
+
+    #[test]
+    fn non_sgr_strip_keeps_sgr_drops_the_rest() {
+        // SGR (color/bold/reset) is preserved verbatim so markdown styling
+        // still parses; everything else is removed.
+        let s = "\x1b[1mbold\x1b[0m plain \x1b[31mred\x1b[m";
+        assert_eq!(strip_non_sgr_escapes(s), s, "pure SGR is untouched");
+
+        // The leak that breaks mouse: a private-mode reset embedded in text.
+        assert_eq!(
+            strip_non_sgr_escapes("before\x1b[?1000lafter"),
+            "beforeafter"
+        );
+        // Alt-screen toggle, cursor move, RIS, OSC title — all dropped,
+        // surrounding text + SGR kept.
+        assert_eq!(
+            strip_non_sgr_escapes("\x1b[?1049h\x1b[Hx\x1bc\x1b]0;t\x07\x1b[32mok\x1b[0m"),
+            "x\x1b[32mok\x1b[0m"
+        );
+    }
+
+    #[test]
+    fn non_sgr_strip_borrows_when_no_escape() {
+        // No ESC → no allocation (Cow::Borrowed).
+        assert!(matches!(
+            strip_non_sgr_escapes("plain text"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 }

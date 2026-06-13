@@ -199,12 +199,20 @@ fn paint_line(buf: &mut Buffer, x: u16, y: u16, width: u16, entry: &LineEntry) {
     }
     let base_style = Style::default().fg(crossterm_to_ratatui(entry.color));
 
+    // Defense-in-depth: drop any non-SGR escape before it reaches a cell.
+    // SGR (color/bold) is kept so `into_text` can style markdown; a leaked
+    // control sequence (mouse/alt-screen/cursor/RIS) that slipped past
+    // content sanitization would otherwise be written raw to the terminal
+    // and corrupt global state. Borrowed (no alloc) for the common
+    // no-escape line.
+    let text = crate::ui::ansi::strip_non_sgr_escapes(&entry.text);
+
     // Try to parse SGR escapes. On parse error (malformed input)
     // fall back to plain set_stringn — better to show raw text
     // than to drop the line silently.
-    match entry.text.as_str().into_text() {
-        Ok(text) => {
-            if let Some(line) = text.lines.into_iter().next() {
+    match text.as_ref().into_text() {
+        Ok(parsed) => {
+            if let Some(line) = parsed.lines.into_iter().next() {
                 // Apply base style — Spans without their own fg
                 // inherit it; spans with fg keep theirs (patch is
                 // a merge, not an override).
@@ -214,7 +222,7 @@ fn paint_line(buf: &mut Buffer, x: u16, y: u16, width: u16, entry: &LineEntry) {
             }
         }
         Err(_) => {
-            buf.set_stringn(x, y, entry.text.as_str(), width as usize, base_style);
+            buf.set_stringn(x, y, text.as_ref(), width as usize, base_style);
         }
     }
 }

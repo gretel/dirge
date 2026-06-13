@@ -107,6 +107,44 @@ pub const CHAT_FRAME_ROWS: u16 = 2;
 /// gate always bound first — and the README's "≥100 cols" was wrong.
 const PANEL_AUTO_MIN_COLS: u16 = 152;
 
+/// Global terminal modes dirge owns and must keep asserted for its whole
+/// session: SGR mouse capture (`?1000`/`?1002`/`?1003`/`?1006`) so wheel +
+/// click reach the app, and bracketed paste (`?2004`). These are set once
+/// at startup ([`crate::ui::terminal::TerminalGuard::new`]); this is the
+/// exact same set, re-emitted periodically so a mid-session reset can't
+/// leave them off permanently. Both are idempotent with no visual effect
+/// when already enabled, so re-emitting on a throttle is safe. Notably this
+/// does NOT include the alternate screen (`?1049h`) — re-entering it can
+/// clear/flicker on some terminals — nor cursor visibility (managed per
+/// frame by `draw_bottom`).
+const TERMINAL_MODE_REASSERT: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h\x1b[?2004h";
+
+/// How often [`tui_redraw`](Renderer::tui_redraw) re-asserts the terminal
+/// modes. Long enough that the extra `/dev/tty` write is negligible, short
+/// enough that a leaked reset self-heals before it's annoying.
+const MODE_REASSERT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Decide whether the terminal modes are due for re-assertion, returning
+/// the bytes to emit (or `None` when the throttle hasn't elapsed). Pure so
+/// the throttle + payload are unit-testable without a live terminal: a
+/// `None` `last` (first paint) always re-asserts; otherwise it waits
+/// [`MODE_REASSERT_INTERVAL`]. `saturating_duration_since` guards against a
+/// non-monotonic clock.
+fn mode_reassert_payload(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> Option<&'static [u8]> {
+    let due = match last {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) >= MODE_REASSERT_INTERVAL,
+    };
+    if due {
+        Some(TERMINAL_MODE_REASSERT)
+    } else {
+        None
+    }
+}
+
 #[cfg(feature = "experimental-ui-terminal-tab")]
 fn format_terminal_title(state: crate::ui::avatar::AvatarState, tool_name: Option<&str>) -> String {
     use crate::ui::avatar::AvatarState;
@@ -299,6 +337,15 @@ pub struct Renderer {
     /// 8ms repaint throttle to prevent /dev/tty write contention between
     /// keystroke-driven repaints — the root cause of typing stutter.
     last_paint: Option<std::time::Instant>,
+    /// Timestamp of the last terminal-mode re-assertion (SGR mouse capture
+    /// + bracketed paste). Those modes are enabled once at startup, but a
+    /// child program run via the bash tool (a pager / TUI) can reset them
+    /// mid-session by emitting `?1000l`/`?2004l` on exit — and there's no
+    /// other path that turns them back on, so the loss is permanent (wheel
+    /// scroll falls through to the terminal, selection stops reaching the
+    /// app). `tui_redraw` re-emits them on a throttle so dirge self-heals
+    /// within one interval of any such leak. `None` until the first paint.
+    last_mode_reassert: Option<std::time::Instant>,
     buffer: Vec<LineEntry>,
     partial: CompactString,
     partial_color: Color,
@@ -456,6 +503,7 @@ impl Renderer {
             spinner_tick: false,
             needs_paint: false,
             last_paint: None,
+            last_mode_reassert: None,
             buffer: Vec::new(),
             partial: CompactString::new(""),
             partial_color: Color::White,
@@ -523,6 +571,27 @@ impl Renderer {
         use crate::ui::avatar;
         use crate::ui::tui::bottom::{AvatarSpec, BottomBody};
         use crate::ui::tui::scene::{Scene, render_frame};
+
+        // Self-heal the global terminal modes (SGR mouse capture + bracketed
+        // paste). They're enabled once at startup, but a child program run
+        // through the bash tool — a pager or TUI (`git log` → `less`, `fzf`,
+        // `vim`, …) — opens /dev/tty and on exit emits `?1000l`/`?2004l` to
+        // restore ITS state, silently turning dirge's off. With no other
+        // re-enable path the loss is permanent: wheel scroll falls through to
+        // the terminal (the whole UI scrolls) and click/drag selection stops
+        // reaching the app. Re-emitting on a throttle (writing to a fresh
+        // /dev/tty, the same sink the guard's setup uses) heals it within one
+        // interval. Done before the 8ms paint throttle below so it keeps
+        // firing even while paints are coalesced.
+        if let Some(bytes) =
+            mode_reassert_payload(self.last_mode_reassert, std::time::Instant::now())
+        {
+            if let Some(mut tty) = crate::ui::terminal::open_tty_for_write() {
+                let _ = tty.write_all(bytes);
+                let _ = tty.flush();
+            }
+            self.last_mode_reassert = Some(std::time::Instant::now());
+        }
 
         // Re-clamp the scroll offset to the CURRENT geometry every frame. The
         // scroll mutators clamp at mutation time, but a terminal RESIZE changes

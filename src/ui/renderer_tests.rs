@@ -983,3 +983,54 @@ fn footer_shows_both_directions_when_scrolled() {
         "scrolled footer should mention BOTH directions; got:\n{scrolled}"
     );
 }
+
+// ── terminal-mode self-healing (fix/mouse-capture-self-heal) ──────────
+
+/// The re-assert payload re-enables exactly the modes dirge owns and that a
+/// child program can clobber: SGR mouse capture (so wheel + click reach the
+/// app) and bracketed paste. This is what heals "the whole UI scrolls off"
+/// — a leaked `?1000l` is undone by the next due paint re-emitting `?1000h`.
+#[test]
+fn mode_reassert_payload_re_enables_mouse_and_paste() {
+    let now = std::time::Instant::now();
+    let bytes = super::mode_reassert_payload(None, now).expect("first paint always re-asserts");
+    let s = std::str::from_utf8(bytes).unwrap();
+    assert!(
+        s.contains("\x1b[?1000h"),
+        "must re-enable basic mouse tracking"
+    );
+    assert!(
+        s.contains("\x1b[?1006h"),
+        "must re-enable SGR mouse encoding"
+    );
+    assert!(s.contains("\x1b[?2004h"), "must re-enable bracketed paste");
+    // Must NOT re-enter the alternate screen (would risk a per-second
+    // clear/flicker) or toggle cursor visibility (managed per frame).
+    assert!(!s.contains("\x1b[?1049h"), "must not re-enter alt screen");
+    assert!(!s.contains("\x1b[?25"), "must not touch cursor visibility");
+}
+
+/// The throttle: re-assert on the first paint, then suppress until the
+/// interval elapses, then re-assert again. A leak that lands between paints
+/// is healed within one interval.
+#[test]
+fn mode_reassert_payload_is_throttled() {
+    let t0 = std::time::Instant::now();
+    assert!(
+        super::mode_reassert_payload(None, t0).is_some(),
+        "first paint (no prior assert) re-asserts"
+    );
+    assert!(
+        super::mode_reassert_payload(Some(t0), t0).is_none(),
+        "same instant → not due"
+    );
+    assert!(
+        super::mode_reassert_payload(Some(t0), t0 + std::time::Duration::from_millis(100))
+            .is_none(),
+        "100ms later → still throttled"
+    );
+    assert!(
+        super::mode_reassert_payload(Some(t0), t0 + super::MODE_REASSERT_INTERVAL).is_some(),
+        "after the interval → re-asserts (self-heal)"
+    );
+}
