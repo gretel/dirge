@@ -567,6 +567,9 @@ async fn main() -> anyhow::Result<()> {
     // the effective window at this so the live context stays in the model's
     // smart zone regardless of its advertised size.
     crate::agent::agent_loop::context_manager::init_context_target(cfg.context_target);
+    // Honor an explicit `context_window` config override in the loop's
+    // window math (it previously read only the built-in model table).
+    crate::agent::agent_loop::context_manager::init_context_window_override(cfg.context_window);
     // Incremental checkpoint is persisted only by the interactive
     // session-rotation path; the headless modes have no consumer for the
     // CheckpointRefresh event, so firing it there would just burn

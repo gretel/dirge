@@ -298,6 +298,26 @@ pub fn effective_ctx_max(model_window: u64) -> u64 {
     model_window.min(context_target())
 }
 
+/// Process-wide explicit context-window override from
+/// `Config::context_window`, installed at startup. When set it replaces the
+/// built-in model-table lookup for the loop's window (before the
+/// [`context_target`] cap), so a user can correct it or supply one for a
+/// model the table doesn't know. Previously the loop read the table
+/// directly and silently ignored this config; mirroring the other budget
+/// knobs as a process global lets the loop honor it without threading the
+/// full `Config` through. `None` → use the model table.
+static CONTEXT_WINDOW_OVERRIDE: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+
+/// Install the explicit context-window override. Idempotent.
+pub fn init_context_window_override(window: Option<u64>) {
+    let _ = CONTEXT_WINDOW_OVERRIDE.set(window);
+}
+
+/// The configured context-window override, if any.
+pub fn context_window_override() -> Option<u64> {
+    CONTEXT_WINDOW_OVERRIDE.get().copied().flatten()
+}
+
 /// Process-wide toggle for the incremental background checkpoint. Default
 /// ON (mirrors MiMo) — installed once at startup from
 /// `Config::incremental_checkpoint`. Only an explicit `Some(false)`

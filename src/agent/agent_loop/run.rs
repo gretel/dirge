@@ -888,19 +888,21 @@ pub async fn run_loop(
             // (prepareNextTurn), after the post-usage decision. Look it up
             // once and reuse at all three sites that need it: the turn-start
             // fold, the per-result snip cap, and the post-usage decision.
-            // The model's advertised window, then capped to the working
-            // budget: effective context degrades well before a large window
-            // is full, so dirge folds/forms memory to stay inside the
-            // budget (default 100k) rather than trusting the full window.
-            // Every downstream tier (fold / snip / turn-start / incremental
-            // checkpoint) reads this capped value.
-            let ctx_max = context_manager::effective_ctx_max(
+            // The model's advertised window — an explicit `context_window`
+            // config override wins over the built-in lookup table — then
+            // capped to the working budget: effective context degrades well
+            // before a large window is full, so dirge folds/forms memory to
+            // stay inside the budget (default 100k) rather than trusting the
+            // full window. Every downstream tier (fold / snip / turn-start /
+            // incremental checkpoint) reads this capped value.
+            let model_window = context_manager::context_window_override().unwrap_or_else(|| {
                 config
                     .model_name
                     .as_deref()
                     .and_then(crate::config::context_window_for_model)
-                    .unwrap_or(128_000),
-            );
+                    .unwrap_or(128_000)
+            });
+            let ctx_max = context_manager::effective_ctx_max(model_window);
 
             // Pi lines 175-179: turn_start (skipped on very first
             // iteration — the outer wrapper already emitted it).
