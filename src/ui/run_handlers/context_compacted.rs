@@ -192,6 +192,17 @@ pub(crate) async fn handle_context_compacted(
         &format!("  context compacted: {tokens_before} → {tokens_after} tokens (session {new_session_id})"),
         Color::DarkGrey,
     )?;
+    // Memory formation on compaction: a summary fold clears conversation
+    // context, so capture the session's learnings into the durable memory
+    // store before it's gone — the same background review/curate pass that
+    // runs at session end, reused here. It's self-throttled and
+    // single-runner (spawn_post_session's review slot + orchestrator
+    // guard), so the more frequent folds under a capped budget don't pile
+    // up. Skipped for a prune-only pass (empty summary = nothing folded).
+    if !summary.is_empty() {
+        let transcript = crate::agent::review::build_transcript(ctx.session);
+        crate::agent::post_session::spawn_post_session(agent.clone(), paths, transcript);
+    }
     Ok(())
 }
 

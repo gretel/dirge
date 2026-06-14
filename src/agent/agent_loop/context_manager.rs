@@ -247,6 +247,57 @@ pub fn init_fold_threshold(override_fraction: Option<f64>) {
     let _ = FOLD_THRESHOLD_OVERRIDE.set(override_fraction);
 }
 
+/// Default working-context budget in tokens. Effective context is a
+/// fraction of a model's advertised window — quality degrades well before
+/// the limit, with the "smart zone" running out around 100k regardless of
+/// the advertised size (RULER / Chroma context-rot research; see
+/// garrit.xyz/posts/2026-05-06-dont-trust-large-context-windows). So dirge
+/// caps the budget it actually works within, rather than trusting a large
+/// window, and folds/forms memory to stay inside it.
+pub const DEFAULT_CONTEXT_TARGET: u64 = 100_000;
+
+/// Floor for a configured target — below this the agent can't get useful
+/// work done between folds.
+const MIN_CONTEXT_TARGET: u64 = 16_000;
+
+/// Process-wide working-context budget, installed once at startup from
+/// `Config::context_target`. The compaction decision treats the effective
+/// window as `min(model_window, this)` so a 200k/1M model still folds
+/// within the budget instead of drifting into the degradation zone.
+static CONTEXT_TARGET: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+/// Resolve a configured target to the value to install: `None` →
+/// [`DEFAULT_CONTEXT_TARGET`]; a set value is floored at
+/// [`MIN_CONTEXT_TARGET`]. Pure, so the floor/default logic is testable
+/// without touching the process global.
+pub fn resolve_context_target(configured: Option<u64>) -> u64 {
+    configured
+        .map(|t| t.max(MIN_CONTEXT_TARGET))
+        .unwrap_or(DEFAULT_CONTEXT_TARGET)
+}
+
+/// Install the working-context budget process-wide. Idempotent (first call
+/// wins).
+pub fn init_context_target(target: Option<u64>) {
+    let _ = CONTEXT_TARGET.set(resolve_context_target(target));
+}
+
+/// The configured working-context budget (tokens). Default
+/// [`DEFAULT_CONTEXT_TARGET`].
+pub fn context_target() -> u64 {
+    *CONTEXT_TARGET.get().unwrap_or(&DEFAULT_CONTEXT_TARGET)
+}
+
+/// The effective context window for all compaction math: the smaller of
+/// the model's advertised window and the configured budget. Capping here
+/// means every existing tier (fold / aggressive / force / turn-start /
+/// incremental checkpoint) operates within the budget, so the live context
+/// stays in the model's smart zone no matter how large the window claims
+/// to be.
+pub fn effective_ctx_max(model_window: u64) -> u64 {
+    model_window.min(context_target())
+}
+
 /// Process-wide toggle for the incremental background checkpoint. Default
 /// ON (mirrors MiMo) — installed once at startup from
 /// `Config::incremental_checkpoint`. Only an explicit `Some(false)`
@@ -391,6 +442,38 @@ pub fn estimate_turn_start(estimate_tokens: u64, ctx_max: u64) -> TurnStartEstim
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ============================================================
+    // working-context budget
+    // ============================================================
+
+    #[test]
+    fn resolve_context_target_defaults_and_floors() {
+        assert_eq!(resolve_context_target(None), DEFAULT_CONTEXT_TARGET);
+        assert_eq!(resolve_context_target(Some(50_000)), 50_000);
+        // A tiny configured target is floored so the agent can still work.
+        assert_eq!(resolve_context_target(Some(1_000)), MIN_CONTEXT_TARGET);
+        // A target above any model window is kept; min(window, target)
+        // applies the real cap later.
+        assert_eq!(resolve_context_target(Some(250_000)), 250_000);
+    }
+
+    #[test]
+    fn capped_budget_folds_within_the_target() {
+        // With a 100k working budget — what `effective_ctx_max` yields for a
+        // big model — the normal fold fires at 0.75 * 100k = 75k, keeping
+        // the live context in the smart zone no matter how large the
+        // advertised window is.
+        let budget = DEFAULT_CONTEXT_TARGET;
+        assert_eq!(
+            decide_after_usage(Some(74_000), budget, false).kind,
+            PostUsageDecisionKind::None
+        );
+        assert_eq!(
+            decide_after_usage(Some(76_000), budget, false).kind,
+            PostUsageDecisionKind::Fold
+        );
+    }
 
     // ============================================================
     // incremental checkpoint schedule

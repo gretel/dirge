@@ -563,6 +563,10 @@ async fn main() -> anyhow::Result<()> {
     // timeouts install): the compaction decision + summarizer gate consult
     // it so an earlier checkpoint cadence applies from one place.
     crate::agent::agent_loop::context_manager::init_fold_threshold(cfg.compaction_fold_threshold);
+    // Working-context budget (default 100k): the compaction decision caps
+    // the effective window at this so the live context stays in the model's
+    // smart zone regardless of its advertised size.
+    crate::agent::agent_loop::context_manager::init_context_target(cfg.context_target);
     // Incremental checkpoint is persisted only by the interactive
     // session-rotation path; the headless modes have no consumer for the
     // CheckpointRefresh event, so firing it there would just burn
