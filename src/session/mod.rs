@@ -1,4 +1,5 @@
 pub mod compact;
+pub mod rehydrate;
 pub mod storage;
 
 use std::collections::HashMap;
