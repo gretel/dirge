@@ -22,7 +22,7 @@ use regex::Regex;
 // Used in migrate() to set user_version pragma. pub(crate) so tests
 // assert against the constant instead of a hardcoded number that
 // breaks on every migration.
-pub(crate) const SCHEMA_VERSION: u32 = 10;
+pub(crate) const SCHEMA_VERSION: u32 = 11;
 
 /// Thread-safe snapshot of the most recent `SessionDb::open()` failure.
 /// Port of Hermes's `_last_init_error` (hermes_state.py:66-67).
@@ -303,6 +303,10 @@ impl SessionDb {
 
         if current < 10 {
             self.run_migration_v10()?;
+        }
+
+        if current < 11 {
+            self.run_migration_v11()?;
         }
 
         self.conn
@@ -739,6 +743,98 @@ impl SessionDb {
                 ",
             )
             .map_err(|e| format!("Migration v10 failed: {e}"))?;
+        Ok(())
+    }
+
+    /// v11: spec-driven workflow tracker (OpenSpec-inspired, SQLite-backed).
+    /// Living specs (capabilities → requirements → scenarios) are the
+    /// current truth; a `spec_changes` row carries `spec_deltas` against
+    /// them plus a `spec_tasks` checklist with real status, folded into the
+    /// living specs at archive time. Replaces OpenSpec's markdown-folder
+    /// tree with queryable rows — no silent parse failures, real task
+    /// status, transactional archive.
+    fn run_migration_v11(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "
+                CREATE TABLE IF NOT EXISTS spec_capabilities (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name        TEXT NOT NULL UNIQUE,
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS spec_requirements (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    capability_id INTEGER NOT NULL
+                                  REFERENCES spec_capabilities(id) ON DELETE CASCADE,
+                    name          TEXT NOT NULL,
+                    text          TEXT NOT NULL,
+                    created_at    TEXT NOT NULL,
+                    updated_at    TEXT NOT NULL,
+                    UNIQUE(capability_id, name)
+                );
+
+                CREATE TABLE IF NOT EXISTS spec_scenarios (
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    requirement_id INTEGER NOT NULL
+                                   REFERENCES spec_requirements(id) ON DELETE CASCADE,
+                    name           TEXT NOT NULL,
+                    when_then      TEXT NOT NULL,
+                    created_at     TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS spec_changes (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    slug        TEXT NOT NULL UNIQUE,
+                    title       TEXT NOT NULL DEFAULT '',
+                    why         TEXT NOT NULL DEFAULT '',
+                    what        TEXT NOT NULL DEFAULT '',
+                    design      TEXT NOT NULL DEFAULT '',
+                    status      TEXT NOT NULL DEFAULT 'draft',
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL,
+                    archived_at TEXT
+                );
+
+                CREATE TABLE IF NOT EXISTS spec_deltas (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    change_id   INTEGER NOT NULL
+                                REFERENCES spec_changes(id) ON DELETE CASCADE,
+                    op          TEXT NOT NULL,
+                    capability  TEXT NOT NULL,
+                    requirement TEXT NOT NULL,
+                    text        TEXT NOT NULL DEFAULT '',
+                    scenarios   TEXT NOT NULL DEFAULT '',
+                    reason      TEXT NOT NULL DEFAULT '',
+                    migration   TEXT NOT NULL DEFAULT '',
+                    rename_to   TEXT NOT NULL DEFAULT '',
+                    created_at  TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS spec_tasks (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    change_id   INTEGER NOT NULL
+                                REFERENCES spec_changes(id) ON DELETE CASCADE,
+                    group_no    INTEGER NOT NULL DEFAULT 1,
+                    seq         INTEGER NOT NULL DEFAULT 1,
+                    text        TEXT NOT NULL,
+                    status      TEXT NOT NULL DEFAULT 'pending',
+                    created_at  TEXT NOT NULL,
+                    updated_at  TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_spec_deltas_change
+                    ON spec_deltas(change_id);
+                CREATE INDEX IF NOT EXISTS idx_spec_tasks_change
+                    ON spec_tasks(change_id, group_no, seq);
+                CREATE INDEX IF NOT EXISTS idx_spec_requirements_cap
+                    ON spec_requirements(capability_id);
+                CREATE INDEX IF NOT EXISTS idx_spec_scenarios_req
+                    ON spec_scenarios(requirement_id);
+                ",
+            )
+            .map_err(|e| format!("Migration v11 failed: {e}"))?;
         Ok(())
     }
 

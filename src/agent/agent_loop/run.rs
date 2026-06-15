@@ -1108,9 +1108,11 @@ pub async fn run_loop(
             // Model-facing only: pushed into the live context, not into
             // `new_messages` or persisted session history. The dirty flag is
             // consumed (swap-to-false), so this fires at most once per
-            // consolidation.
-            if context_manager::take_memories_dirty()
-                && let Some(provider) = &memory_provider
+            // consolidation. Check provider presence BEFORE consuming the
+            // flag: a loop with no memory provider (subagents, many tests)
+            // must not swallow the refresh meant for a memory-bearing loop.
+            if let Some(provider) = &memory_provider
+                && context_manager::take_memories_dirty()
             {
                 let block = provider.format_for_system_prompt();
                 if !block.trim().is_empty() {
