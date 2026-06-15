@@ -235,19 +235,27 @@ scenarios = array of {name, when_then} (when_then in WHEN/THEN form)."#
             }
             "archive" => {
                 let slug = req(&args.slug, "slug")?;
+                // Capture the change first: it must exist, must not already be
+                // archived (re-archiving would re-fold its deltas), and we use
+                // its why/design to form a memory after the fold.
+                let change = store
+                    .get_change(slug)
+                    .map_err(m)?
+                    .ok_or_else(|| ToolError::Msg(format!("no change '{slug}'")))?;
+                if change.status == "archived" {
+                    return Err(ToolError::Msg(format!("'{slug}' is already archived.")));
+                }
                 let (done, total) = store.task_progress(slug).map_err(m)?;
                 if total > 0 && done < total {
                     return Err(ToolError::Msg(format!(
                         "Cannot archive '{slug}': {done}/{total} tasks done. Finish or remove open tasks first."
                     )));
                 }
-                // Capture the change before folding so we can form a memory
-                // of its intent + decisions even though archive flips status.
-                let change = store.get_change(slug).map_err(m)?;
                 let report = store.archive_change(slug).map_err(m)?;
                 // Fold the change's why/design into durable project memory so
                 // the rationale outlives the change record (best-effort).
-                if let (Some(mem), Some(c)) = (&self.memory, &change) {
+                if let Some(mem) = &self.memory {
+                    let c = &change;
                     let mut content = format!("Shipped change '{}'.", c.slug);
                     if !c.why.trim().is_empty() {
                         content.push_str(&format!(" Why: {}", c.why.trim()));
@@ -472,5 +480,18 @@ mod tests {
         assert!(recorded[0].contains("ship-it"));
         assert!(recorded[0].contains("users need it"));
         assert!(recorded[0].contains("use a queue"));
+
+        // Re-archiving is refused (would otherwise re-fold the deltas).
+        let again = call(
+            &t,
+            serde_json::json!({"action": "archive", "slug": "ship-it"}),
+        )
+        .await;
+        assert!(again.is_err(), "second archive must be refused");
+        assert_eq!(
+            mem.0.lock().unwrap().len(),
+            1,
+            "refused re-archive forms no new memory"
+        );
     }
 }
