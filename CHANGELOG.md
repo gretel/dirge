@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.6.5] - 2026-06-15
+
+### Added
+- **Visible compaction progress.** A destructive fold now shows
+  `⟳ compacting context…` in the main pane while the summarizer runs,
+  instead of the session appearing frozen. The result line follows when
+  it finishes.
+- **Mid-session memory awareness.** The system-prompt memory block is
+  fixed at agent-build time, so memories written by background
+  consolidation weren't visible until restart. Consolidation now flags the
+  change and the loop re-injects the refreshed memory block at the next
+  turn boundary, so the running agent sees newly consolidated memories
+  without restarting.
+
+### Changed
+- **Faster compaction.** The background incremental checkpoint already
+  summarizes a context snapshot off the loop; the destructive fold now
+  reuses that precomputed summary (prune + splice, no inline LLM call)
+  when it's current and clears the fold target. This is the common path
+  under the 100k budget, where folds fire often.
+
+### Fixed
+- The inline compaction summarizer is now bounded by a timeout: a provider
+  that stalls without erroring falls back to prune-only instead of
+  freezing the session indefinitely. The background checkpoint summarizer
+  is bounded too so a hung call can't leak the task.
+
 ## [0.6.4] - 2026-06-14
 
 ### Added
