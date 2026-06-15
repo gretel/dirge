@@ -48,6 +48,10 @@ pub(crate) async fn cmd_sessions_switch(
                 }
             }
 
+            // Rebuild the TODOS / MODIFIED panels from the switched-to
+            // session's history; these globals don't carry across a switch.
+            crate::session::rehydrate::restore_panels(ctx.session);
+
             let model = ctx.client.completion_model(ctx.session.model.to_string());
             *ctx.agent = crate::provider::build_agent(
                 model,

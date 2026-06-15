@@ -137,6 +137,41 @@ pub(crate) async fn register_memory_tool(
     }
 }
 
+/// Register the `spec` tool when its store opens. Mirrors
+/// [`register_memory_tool`]: an open failure (fresh-state I/O, unreadable
+/// DB) degrades to a session without the spec tool, with a warning, rather
+/// than panicking agent construction.
+pub(crate) async fn register_spec_tool(
+    tools: &mut Vec<std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>>,
+    memory_store: Option<std::sync::Arc<dyn crate::extras::memory_provider::MemoryProvider>>,
+    permission: Option<PermCheck>,
+    ask_tx: Option<AskSender>,
+) {
+    use crate::agent::agent_loop::{RigToolAdapter, types::ToolExecutionMode};
+    let paths = std::env::current_dir()
+        .map(|c| crate::extras::dirge_paths::ProjectPaths::new(&c))
+        .unwrap_or_else(|_| {
+            crate::extras::dirge_paths::ProjectPaths::new(std::path::Path::new("."))
+        });
+    match crate::extras::spec_db::SpecStore::open(&paths) {
+        Ok(store) => {
+            let tool = tools::SpecTool::new(std::sync::Arc::new(store), permission, ask_tx)
+                .with_memory(memory_store);
+            let adapter = RigToolAdapter::new(Box::new(tool))
+                .await
+                .with_execution_mode(ToolExecutionMode::Sequential);
+            tools.push(std::sync::Arc::new(adapter));
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "dirge::spec",
+                error = %e,
+                "spec store unavailable — running this session without the spec tool",
+            );
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn build_loop_tools(
     cache: ToolCache,
@@ -400,6 +435,18 @@ pub async fn build_loop_tools(
         &mut tools,
         memory_store.clone(),
         global_store,
+        permission.clone(),
+        ask_tx.clone(),
+    )
+    .await;
+
+    // Spec-driven workflow tracker — mutates the spec_* tables (Sequential).
+    // Best-effort: a store open failure degrades to a session without the
+    // spec tool rather than failing agent construction. The memory store is
+    // forwarded so `archive` can fold the change's rationale into memory.
+    register_spec_tool(
+        &mut tools,
+        memory_store.clone(),
         permission.clone(),
         ask_tx.clone(),
     )

@@ -739,6 +739,13 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Rebuild the derived panel state (todo list, modified files) from the
+    // resumed session's tool-call history. These live in process-global
+    // statics that start empty, so without this a resumed session shows
+    // blank TODOS / MODIFIED panels even though the history records the work.
+    // No-op for a fresh session (no messages → nothing to replay).
+    session::rehydrate::restore_panels(&session);
+
     // Plugin loading must happen BEFORE `create_client` so plugin-
     // registered providers (via `harness/register-provider`) are
     // installed into `PLUGIN_PROVIDERS` before

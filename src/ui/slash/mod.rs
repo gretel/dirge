@@ -485,6 +485,7 @@ pub async fn handle_slash(
         "/wt-exit" => return cmd::worktree::cmd_wt_exit(&mut ctx, &parts).await,
         "/regen-prompts" => cmd::regen::cmd_regen_prompts(&mut ctx).await?,
         "/quit" => return cmd::quit::cmd_quit(&mut ctx).await,
+        "/spec" => cmd::spec::cmd_spec(&mut ctx, &parts).await?,
         "/tasks" => cmd::tasks::cmd_tasks(&mut ctx).await?,
         "/clear" => cmd::clear::cmd_clear(&mut ctx).await?,
         "/tree" => cmd::tree::cmd_tree(&mut ctx, &parts).await?,
@@ -624,6 +625,7 @@ pub fn slash_command_names() -> Vec<&'static str> {
         #[cfg(unix)]
         "/sandbox",
         "/sessions",
+        "/spec",
         "/tasks",
         "/toggle",
         "/tree",

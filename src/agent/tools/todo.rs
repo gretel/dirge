@@ -28,6 +28,12 @@ pub struct TodoWriteArgs {
 
 pub static TODO_LIST: std::sync::Mutex<Vec<TodoItem>> = std::sync::Mutex::new(Vec::new());
 
+/// Empty the todo list. Hooked into /clear so the TODOS panel resets along
+/// with the conversation, mirroring `modified::clear_modified`.
+pub fn clear() {
+    TODO_LIST.lock_ignore_poison().clear();
+}
+
 /// Number of todos still `pending` or `in_progress`. Used by the agent loop
 /// to nudge the model not to stop with unfinished planned work (ported from
 /// vix's end-of-turn TODO-completion nudge, session.go:1551).

@@ -22,3 +22,4 @@ pub mod memory_provider;
 pub mod session_db;
 pub mod session_search;
 pub mod skills;
+pub mod spec_db;

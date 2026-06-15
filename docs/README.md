@@ -11,6 +11,7 @@ For configuration keys and provider setup, see [config.md](config.md).
 | [permissions.md](permissions.md) | Authorization engine — the single decision point, operations/claims, policy precedence, sane defaults, config, security modes, `/why` |
 | [prompts.md](prompts.md) | Prompts system — built-in prompts, per-prompt `deny_tools` restrictions, custom prompts, context files |
 | [skills.md](skills.md) | Claude-compatible skills — discovery directories, `SKILL.md` format |
+| [spec-workflow.md](spec-workflow.md) | Spec-driven workflow — living specs, change deltas, task tracking, the `spec` tool + `/spec` command, SQLite storage |
 | [semantic.md](semantic.md) | Tree-sitter semantic code tools — symbols, definitions, callers/callees, per-language export detection |
 | [lsp.md](lsp.md) | LSP integration — inline diagnostics, built-in server set, workspace root resolution |
 | [tui.md](tui.md) | Terminal UI — key bindings, inline avatar, tool-output display, theme |
