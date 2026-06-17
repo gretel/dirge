@@ -6,6 +6,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Storm-breaker graceful failure.** When a run gives up because it's stuck
+  repeating the same tool call (the repeat-loop guard's terminal case), it now
+  appends a short first-person assistant message explaining that it stopped to
+  avoid spinning, instead of ending on an empty/abrupt turn. The message names
+  the tool(s) it looped on and is recorded in history, so the user gets a
+  coherent reply and the model carries its own failure account into the next
+  turn. The internal reflect-then-pivot nudge on the first trip is unchanged.
+- **`/rewind` now rolls back files, not just the conversation.** Every
+  write/edit/edit_lines/apply_patch (including delete and rename) snapshots the
+  touched file's pre-mutation content, keyed by the user prompt that triggered
+  it. Rewinding to a prompt restores the working tree to its state before that
+  prompt ran, in lockstep with the conversation truncation — so a long
+  autonomous run is safe to unwind. Content is deduplicated through a small
+  content-addressed pool so a file edited many times across turns doesn't store
+  many copies. In-memory and process-scoped (rewind works within a live
+  session, not across a restart); a created file is deleted on restore, a
+  deleted file is recreated. From the [howard chen
+  writeup](https://howardchen.substack.com/p/deepseek-v4-pro-at-5-the-cost-of)'s
+  rewind lever.
+- **Hash-anchored editing (`edit_lines` + `read(line_hashes=true)`).** A new
+  edit path aimed at cheaper models: `read` can prefix each line with a 3-char
+  content hash (`42 a3f: ...`), and `edit_lines` replaces a line *range* by
+  number — `start_line`, `end_line`, the `expected_hashes` for that range, and
+  `new_text` — without retyping the old block. The tool recomputes the hashes
+  from disk and rejects the edit (per-line diff) if any line drifted since the
+  read, so it never clobbers content that changed underneath it. Reuses the
+  existing read-before-edit gate, tree-sitter pre-write validation, and atomic
+  write. The win, per the [howard chen
+  writeup](https://howardchen.substack.com/p/deepseek-v4-pro-at-5-the-cost-of):
+  fewer retries and markedly lower output tokens on models like DeepSeek, since
+  the model emits line numbers + tiny hashes instead of reproducing the text it
+  wants to replace. The existing exact-string `edit` is unchanged.
+- **Prefix-cache hit accounting + `/cache` command.** Providers like DeepSeek
+  and Anthropic serve repeated request prefixes from a cache at a steep
+  discount (DeepSeek ~1/10 the input price), and dirge already holds the system
+  prompt + sorted tool defs at a stable prefix to keep that cache warm — but
+  there was no way to tell whether hits were actually landing. Real
+  provider-reported usage (`cached_input_tokens`, `cache_creation_input_tokens`)
+  now flows from the stream through to a cumulative per-session counter, and
+  `/cache` prints the session's cumulative prefix-cache hit ratio. This is the
+  instrument for the DeepSeek cost story in the [howard chen
+  writeup](https://howardchen.substack.com/p/deepseek-v4-pro-at-5-the-cost-of):
+  cache discipline is the headline lever for running cheaper models, and now
+  you can measure it.
+
 ## [0.7.2] - 2026-06-15
 
 ### Changed

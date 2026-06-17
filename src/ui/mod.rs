@@ -1905,6 +1905,7 @@ pub async fn run_interactive(
                                                 ui.last_user_prompt.clone_from(&msg);
                                                 let history = crate::agent::runner::convert_history(session);
                                                 session.add_message(MessageRole::User, &msg);
+                                                begin_snapshot_turn(session);
                                 renderer.set_avatar_state(avatar::AvatarState::Idle);
                                                 let runner = agent.clone().spawn_runner(
                                                     crate::agent::tools::background::prepend_pending_notifications(&msg, bg_store.as_ref()),
@@ -2338,6 +2339,7 @@ pub async fn run_interactive(
                                 runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
 
                                 session.add_message(MessageRole::User, &text);
+                                begin_snapshot_turn(session);
                                 renderer.set_avatar_state(avatar::AvatarState::Idle);
                             }
                         }
@@ -2456,6 +2458,21 @@ pub async fn run_interactive(
                             #[cfg(feature = "loop")]
                             loop_bits,
                         ).await?;
+                    }
+                    AgentEvent::Usage {
+                        input_tokens,
+                        cached_input_tokens,
+                        cache_creation_input_tokens,
+                        ..
+                    } => {
+                        // Fold real provider usage into the session's
+                        // cumulative cache stats so `/cache` reports a
+                        // live prefix-cache hit ratio.
+                        session.record_token_usage(
+                            input_tokens,
+                            cached_input_tokens,
+                            cache_creation_input_tokens,
+                        );
                     }
                     #[cfg(feature = "plugin")]
                     AgentEvent::CustomMessage { payload } => {
@@ -2686,6 +2703,7 @@ pub async fn run_interactive(
                         ui.plan_phase = None;
                         let kickoff = *kickoff;
                         session.add_message(MessageRole::User, &kickoff.impl_prompt);
+                        begin_snapshot_turn(session);
                         ui.last_user_prompt.clone_from(&kickoff.impl_prompt);
                         let history = crate::agent::runner::convert_history(session);
                         renderer.set_avatar_state(avatar::AvatarState::Idle);
@@ -3268,6 +3286,7 @@ pub async fn run_interactive(
                     let synth_prompt =
                         "Continue based on the background task results above.".to_string();
                     session.add_message(MessageRole::User, &synth_prompt);
+                    begin_snapshot_turn(session);
                     let history = crate::agent::runner::convert_history(session);
                     renderer.set_avatar_state(avatar::AvatarState::Idle);
                     let composed =
@@ -3644,12 +3663,28 @@ fn modified_visible_rows(rect: Option<ratatui::layout::Rect>) -> usize {
         .unwrap_or(0)
 }
 
+/// Open a file-snapshot turn keyed by the most recent user message,
+/// so `/rewind` can roll the working tree back to its pre-prompt
+/// state. Call this at every site that adds a `User` message and then
+/// spawns an agent run — the rewind picker lists user messages, so a
+/// run triggered by one must have a matching snapshot turn or
+/// rewinding to it would restore nothing and its edits would fold
+/// into the previous turn's bucket.
+fn begin_snapshot_turn(session: &crate::session::Session) {
+    if let Some(uid) = session.messages.last().map(|m| m.id.clone()) {
+        crate::agent::tools::snapshots::begin_turn(&uid);
+    }
+}
+
 /// Whether a slash command is safe to run while the agent is active.
 /// Read-only inspection commands don't need the agent idle.
 fn is_safe_during_agent(text: &str) -> bool {
     let head = text.split_whitespace().next().unwrap_or("");
     let args = text.split_whitespace().nth(1).map(|s| s.to_string());
-    let always_safe = matches!(head, "/quit" | "/help" | "/reasoning" | "/tasks" | "/mode");
+    let always_safe = matches!(
+        head,
+        "/quit" | "/help" | "/reasoning" | "/tasks" | "/mode" | "/cache"
+    );
     let safe_when_no_arg =
         matches!(head, "/sessions" | "/tree" | "/model" | "/prompt") && args.is_none();
     let safe_when_list = matches!(
