@@ -491,9 +491,7 @@ async fn build_agent_inner_emits_assembled_preamble() {
     // Real openai client/model — never called (no network until
     // first request). The builder only inspects type bounds and
     // builds the rig Agent wrapper around it.
-    let client = openai::Client::new("test-key")
-        .expect("openai client builds")
-        .completions_api();
+    let client = openai::Client::new("test-key").expect("openai client builds");
     let model = client.completion_model("gpt-4o");
 
     let (agent, _cache, _provider) =
@@ -608,9 +606,7 @@ async fn steering_fragment_tracks_active_model_not_cli() {
         agent_layer: None,
         model_before_agent: None,
     };
-    let client = openai::Client::new("test-key")
-        .expect("openai client builds")
-        .completions_api();
+    let client = openai::Client::new("test-key").expect("openai client builds");
 
     // Active model = a DeepSeek chat model → fragment present, even
     // though the openai client/model and the CLI default are not DeepSeek.

@@ -94,6 +94,7 @@ fn build_stream_fn() -> Option<crate::agent::agent_loop::StreamFn> {
     let stream_fn = match any_model {
         AnyModel::OpenRouter(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::OpenAI(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
+        AnyModel::ChatGptOpenAI(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Anthropic(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::Gemini(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),
         AnyModel::DeepSeek(m) => rig_stream_fn_from_model(m, vec![], chunk_timeout),

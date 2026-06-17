@@ -122,15 +122,14 @@ fn fallback_list_covers_canonical_alternatives() {
 /// model. The Client::new doesn't connect (no network until
 /// the first request), so this works in unit tests.
 ///
-/// Use `completions_api()` to get the chat-completion model
-/// (the variant `AnyAgentInner::OpenAI` holds); the default
-/// `completion_model` on a fresh `Client` returns the
-/// responses-api model, which is a different type.
+/// The OpenAI variant uses Rig's Chat Completions model; it is never
+/// called during these tests, so construction stays offline.
 fn build_openai_any_agent() -> AnyAgent {
     use rig::providers::openai;
-    let client = openai::Client::new("test-key")
-        .expect("openai Client::new should work")
-        .completions_api();
+    let client = openai::CompletionsClient::builder()
+        .api_key("test-key")
+        .build()
+        .expect("openai CompletionsClient::new should work");
     let model = client.completion_model("gpt-4o");
     let agent = rig::agent::AgentBuilder::new(model).build();
     AnyAgent::new(

@@ -1,5 +1,7 @@
+pub(crate) mod auth;
 mod build;
 pub mod client;
+pub(crate) mod codex_http;
 mod dispatch;
 mod resolve;
 mod run;
@@ -136,6 +138,9 @@ pub struct AnyAgent {
 pub(crate) enum AnyAgentInner {
     OpenRouter(Agent<openrouter::completion::CompletionModel>),
     OpenAI(Agent<openai::completion::CompletionModel>),
+    ChatGptOpenAI(
+        Agent<openai::responses_api::ResponsesCompletionModel<codex_http::CodexHttpClient>>,
+    ),
     Anthropic(Agent<anthropic::completion::CompletionModel>),
     Gemini(Agent<gemini::completion::CompletionModel>),
     DeepSeek(Agent<openai::completion::CompletionModel>),
@@ -361,6 +366,7 @@ impl AnyAgent {
         match &self.inner {
             AnyAgentInner::OpenRouter(_) => "openrouter",
             AnyAgentInner::OpenAI(_) => "openai",
+            AnyAgentInner::ChatGptOpenAI(_) => "openai",
             AnyAgentInner::Anthropic(_) => "anthropic",
             AnyAgentInner::Gemini(_) => "gemini",
             AnyAgentInner::DeepSeek(_) => "deepseek",

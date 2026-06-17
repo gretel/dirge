@@ -743,9 +743,10 @@ mod tests {
     fn agent_with_recording_provider() -> (AnyAgent, Arc<RecordingEndProvider>) {
         use rig::client::CompletionClient;
         use rig::providers::openai;
-        let client = openai::Client::new("test-key")
-            .expect("openai client")
-            .completions_api();
+        let client = openai::CompletionsClient::builder()
+            .api_key("test-key")
+            .build()
+            .expect("openai client");
         let model = client.completion_model("gpt-4o");
         let inner_agent = rig::agent::AgentBuilder::new(model).build();
         let provider = Arc::new(RecordingEndProvider::default());
@@ -849,7 +850,10 @@ mod tests {
 
         use rig::client::CompletionClient;
         use rig::providers::openai;
-        let client = openai::Client::new("test-key").unwrap().completions_api();
+        let client = openai::CompletionsClient::builder()
+            .api_key("test-key")
+            .build()
+            .unwrap();
         let model = client.completion_model("gpt-4o");
         let inner_agent = rig::agent::AgentBuilder::new(model).build();
         let provider = Arc::new(RecordingSwitchProvider::default());
@@ -879,7 +883,10 @@ mod tests {
     fn maybe_fire_session_switch_noop_without_provider() {
         use rig::client::CompletionClient;
         use rig::providers::openai;
-        let client = openai::Client::new("test-key").unwrap().completions_api();
+        let client = openai::CompletionsClient::builder()
+            .api_key("test-key")
+            .build()
+            .unwrap();
         let model = client.completion_model("gpt-4o");
         let inner_agent = rig::agent::AgentBuilder::new(model).build();
         let agent = AnyAgent::new(
@@ -899,7 +906,10 @@ mod tests {
         // Build an agent WITHOUT calling with_memory_provider.
         use rig::client::CompletionClient;
         use rig::providers::openai;
-        let client = openai::Client::new("test-key").unwrap().completions_api();
+        let client = openai::CompletionsClient::builder()
+            .api_key("test-key")
+            .build()
+            .unwrap();
         let model = client.completion_model("gpt-4o");
         let inner_agent = rig::agent::AgentBuilder::new(model).build();
         let agent = AnyAgent::new(

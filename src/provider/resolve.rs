@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use crate::config::{Config, ProviderEntry};
+use crate::config::{Config, ProviderAuth, ProviderEntry};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ProviderKind {
@@ -88,6 +88,7 @@ pub struct ProviderInfo {
     pub kind: ProviderKind,
     pub base_url: Option<String>,
     pub api_key_env: Option<String>,
+    pub auth: Option<ProviderAuth>,
     /// Literal API key resolved from `entry.api_key` (with `${VAR}`
     /// already expanded). When present, takes precedence over both
     /// `api_key_env` and the standard env-var fallback chain.
@@ -152,6 +153,7 @@ pub fn resolve_provider_info(
             kind,
             base_url: entry.base_url.clone(),
             api_key_env: entry.api_key_env.clone(),
+            auth: entry.auth,
             api_key_literal,
         });
     }
@@ -197,6 +199,7 @@ pub fn resolve_provider_info(
             kind,
             base_url: entry.base_url,
             api_key_env: entry.api_key_env,
+            auth: entry.auth,
             api_key_literal,
         });
     }
@@ -205,6 +208,7 @@ pub fn resolve_provider_info(
         kind,
         base_url: None,
         api_key_env: None,
+        auth: None,
         api_key_literal: None,
     })
 }

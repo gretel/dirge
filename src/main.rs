@@ -948,6 +948,7 @@ async fn main() -> anyhow::Result<()> {
                             provider_type: Some(ptype),
                             base_url: Some(base_url),
                             model: None,
+                            auth: None,
                             api_key_env,
                             // Plugin-registered providers don't expose
                             // a chunk-timeout knob via the
@@ -1014,7 +1015,12 @@ async fn main() -> anyhow::Result<()> {
         cli.api_key.clone()
     };
 
-    let client = provider::create_client(&provider, resolved_key.as_deref(), &cfg.providers_map())?;
+    let client = provider::create_client_with_auth(
+        &provider,
+        resolved_key.as_deref(),
+        &cfg.providers_map(),
+        cfg.auth,
+    )?;
 
     // dirge-ykeu Phase 4: pre-resolve user agent profiles into subagent
     // routes (model + system prompt) and install them process-globally so the

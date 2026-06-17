@@ -1153,6 +1153,7 @@ dependencies = [
  "anyhow",
  "async-stream",
  "base64",
+ "bytes",
  "chrono",
  "clap",
  "compact_str",

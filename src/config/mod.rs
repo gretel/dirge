@@ -21,12 +21,30 @@ use crate::extras::acp::config::AcpServerConfig;
 /// a built-in backend under a different name — e.g.
 /// `"ollama": { "provider_type": "openai", "base_url": "..." }`
 /// aliases the OpenAI-compatible backend under the alias `ollama`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuth {
+    #[serde(alias = "api-key")]
+    ApiKey,
+    #[serde(
+        alias = "chatgpt",
+        alias = "chat-gpt",
+        alias = "chatgpt_auth_tokens",
+        alias = "codex"
+    )]
+    ChatGpt,
+}
+
 #[derive(Debug, Default, Clone, Deserialize)]
 #[serde(default)]
 pub struct ProviderEntry {
     pub provider_type: Option<String>,
     pub base_url: Option<String>,
     pub model: Option<String>,
+    /// Authentication source for this provider. Default is API-key
+    /// auth. Set to `chatgpt` to reuse Codex ChatGPT-login tokens
+    /// (`CODEX_ACCESS_TOKEN` or `CODEX_HOME/auth.json`).
+    pub auth: Option<ProviderAuth>,
     /// Name of the env var holding the API key. Kept for backward
     /// compatibility — prefer `api_key` with `${VAR}` interpolation
     /// for clarity.
@@ -407,6 +425,9 @@ impl<'de> Deserialize<'de> for SandboxConfig {
 #[serde(default)]
 pub struct Config {
     pub provider: Option<String>,
+    /// Default authentication source for providers that do not set
+    /// `providers.<name>.auth`. `ApiKey` remains the implicit default.
+    pub auth: Option<ProviderAuth>,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
     pub no_tools: Option<bool>,
@@ -1166,6 +1187,33 @@ mod tests {
         let empty: Config = serde_json::from_str("{}").unwrap();
         assert!(empty.plugin_enabled("anything"));
         assert!(!empty.plugin_auto_start("anything"));
+    }
+
+    #[test]
+    fn provider_auth_mode_parses_chatgpt_aliases() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "auth": "chatgpt",
+                "providers": {
+                    "openai": { "auth": "chatgpt" },
+                    "codex": { "auth": "chatgpt_auth_tokens" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(cfg.auth, Some(ProviderAuth::ChatGpt));
+        let providers = cfg.providers.unwrap();
+        assert_eq!(providers["openai"].auth, Some(ProviderAuth::ChatGpt));
+        assert_eq!(providers["codex"].auth, Some(ProviderAuth::ChatGpt));
+
+        let cfg: Config =
+            serde_json::from_str(r#"{ "providers": { "openai": { "auth": "api-key" } } }"#)
+                .unwrap();
+        assert_eq!(
+            cfg.providers.unwrap()["openai"].auth,
+            Some(ProviderAuth::ApiKey)
+        );
     }
 
     #[test]

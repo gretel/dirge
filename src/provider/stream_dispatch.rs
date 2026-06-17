@@ -30,6 +30,9 @@ macro_rules! dispatch_stream_fn {
         match $value {
             $enum::OpenRouter($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
             $enum::OpenAI($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
+            $enum::ChatGptOpenAI($bind) => {
+                __stream_fn($model, $tools, $timeout, $provider, $filter)
+            }
             $enum::Anthropic($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
             $enum::Gemini($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),
             $enum::DeepSeek($bind) => __stream_fn($model, $tools, $timeout, $provider, $filter),

@@ -36,6 +36,15 @@ pub fn create_client(
     client::create_client(provider_name, api_key, providers)
 }
 
+pub fn create_client_with_auth(
+    provider_name: &str,
+    api_key: Option<&str>,
+    providers: &HashMap<String, ProviderEntry>,
+    default_auth: Option<crate::config::ProviderAuth>,
+) -> anyhow::Result<AnyClient> {
+    client::create_client_with_auth(provider_name, api_key, providers, default_auth)
+}
+
 // Arity matches `build_agent_inner` — explicit DI signature kept
 // grep-able, refactoring into a struct is tracked separately.
 #[allow(clippy::too_many_arguments)]
@@ -174,6 +183,7 @@ pub async fn build_agent(
     let mut agent = match model {
         AnyModel::OpenRouter(m) => build_inner!(m, OpenRouter),
         AnyModel::OpenAI(m) => build_inner!(m, OpenAI),
+        AnyModel::ChatGptOpenAI(m) => build_inner!(m, ChatGptOpenAI),
         AnyModel::Anthropic(m) => build_inner!(m, Anthropic),
         AnyModel::Gemini(m) => build_inner!(m, Gemini),
         AnyModel::DeepSeek(m) => build_inner!(m, DeepSeek),

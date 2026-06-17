@@ -99,6 +99,7 @@ pub(crate) async fn oneshot_with_model(
     match model {
         super::AnyModel::OpenRouter(m) => run_oneshot(m, label, preamble, prompt).await,
         super::AnyModel::OpenAI(m) => run_oneshot(m, label, preamble, prompt).await,
+        super::AnyModel::ChatGptOpenAI(m) => run_oneshot(m, label, preamble, prompt).await,
         super::AnyModel::Anthropic(m) => run_oneshot(m, label, preamble, prompt).await,
         super::AnyModel::Gemini(m) => run_oneshot(m, label, preamble, prompt).await,
         super::AnyModel::DeepSeek(m) => run_oneshot(m, label, preamble, prompt).await,

@@ -570,8 +570,9 @@ pub fn build_provider_additional_params(
     }
 
     // ----- headers (provider-agnostic) -----
-    if !opts.headers.is_empty()
-        && let Ok(v) = serde_json::to_value(&opts.headers)
+    let headers = merged_request_headers(provider_name, opts);
+    if !headers.is_empty()
+        && let Ok(v) = serde_json::to_value(&headers)
     {
         additional.insert("headers".to_string(), v);
     }
@@ -594,6 +595,24 @@ pub fn build_provider_additional_params(
     } else {
         Some(serde_json::Value::Object(additional))
     }
+}
+
+fn merged_request_headers(
+    _provider_name: Option<&str>,
+    opts: &super::stream::StreamOptions,
+) -> std::collections::HashMap<String, String> {
+    let mut headers = opts.headers.clone();
+    if let Some(key) = opts
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    {
+        headers
+            .entry("Authorization".to_string())
+            .or_insert_with(|| format!("Bearer {key}"));
+    }
+    headers
 }
 
 /// Map our `ThinkingLevel` enum to OpenAI Responses `reasoning.
@@ -1088,6 +1107,35 @@ mod tests {
             assert_eq!(v["headers"]["X-Tenant"], "acme", "provider {provider}");
             assert_eq!(v["metadata"]["user_id"], "u-42", "provider {provider}");
         }
+    }
+
+    #[test]
+    fn stream_options_api_key_adds_authorization_header() {
+        let mut opts = StreamOptions::from_signal(AbortSignal::new());
+        opts.api_key = Some("dynamic-token".to_string());
+
+        let v = build_provider_additional_params(Some("openai"), &opts).unwrap();
+        assert_eq!(v["headers"]["Authorization"], "Bearer dynamic-token");
+    }
+
+    #[test]
+    fn explicit_authorization_header_wins_over_stream_api_key() {
+        let mut opts = StreamOptions::from_signal(AbortSignal::new());
+        opts.api_key = Some("dynamic-token".to_string());
+        opts.headers.insert(
+            "Authorization".to_string(),
+            "Bearer explicit-token".to_string(),
+        );
+
+        let v = build_provider_additional_params(Some("openai"), &opts).unwrap();
+        assert_eq!(v["headers"]["Authorization"], "Bearer explicit-token");
+    }
+
+    #[test]
+    fn chatgpt_provider_auth_does_not_add_account_header_to_body() {
+        let opts = StreamOptions::from_signal(AbortSignal::new());
+
+        assert!(build_provider_additional_params(Some("openai-chatgpt-test"), &opts).is_none());
     }
 
     /// No reasoning, no headers, no metadata → None (caller
