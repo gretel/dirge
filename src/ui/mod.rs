@@ -2398,7 +2398,18 @@ pub async fn run_interactive(
                             // dirge #444: if the user expanded this live thinking
                             // with Ctrl+O, stream new deltas into the expanded
                             // block IN PLACE instead of leaving a frozen snapshot.
-                            if ui.live_thinking_expanded
+                            //
+                            // dirge-8p79: a full re-render of the whole buffer on
+                            // EVERY delta is O(n^2) over a burst. Coalesce like the
+                            // token coalescer (dirge-ufe0): skip while more reasoning
+                            // events are still queued and render once they've drained.
+                            // The trailing burst before a Token/ToolCall boundary is
+                            // flushed there (see `freeze_live_thinking`) so the frozen
+                            // block is never left stale.
+                            let caught_up =
+                                ui.agent_rx.as_ref().map_or(0, |rx| rx.len()) == 0;
+                            if caught_up
+                                && ui.live_thinking_expanded
                                 && let Some(anchor) = ui.expansion_anchor
                             {
                                 match restream_expanded_thinking(
@@ -2426,7 +2437,15 @@ pub async fn run_interactive(
                         // arriving when was_reasoning is already false (e.g.
                         // response tokens after a tool round-trip) must still
                         // drop the flag, otherwise it stays live.
-                        ui.live_thinking_expanded = false;
+                        // dirge-8p79: flush any deltas the coalescer skipped first,
+                        // so the block freezes complete (handle_token below renders
+                        // the response under it via end_reasoning).
+                        freeze_live_thinking(
+                            &mut renderer,
+                            &mut ui.expansion_anchor,
+                            &mut ui.live_thinking_expanded,
+                            &ui.reasoning_buf,
+                        )?;
                         // Caught-up check for the render coalescer, computed
                         // before ctx borrows the render state (dirge-ufe0).
                         let pending = ui.agent_rx.as_ref().map_or(0, |rx| rx.len());
@@ -2448,6 +2467,16 @@ pub async fn run_interactive(
                         )?;
                     }
                     AgentEvent::ToolCall { id, name, args } => {
+                        // dirge-8p79: a reasoning burst can go straight to a tool
+                        // call with no intervening Token. Flush any coalesced
+                        // deltas into the expanded block before it freezes, and
+                        // stop tracking (the tool chamber renders below it).
+                        freeze_live_thinking(
+                            &mut renderer,
+                            &mut ui.expansion_anchor,
+                            &mut ui.live_thinking_expanded,
+                            &ui.reasoning_buf,
+                        )?;
                         let mut ctx = make_run_ctx!();
                         run_handlers::handle_tool_call(
                             &mut ctx,
@@ -3648,16 +3677,40 @@ fn render_question_options(
 /// Append a thinking burst as a plain, color-reset block (no markdown
 /// stream → no style bleed) for the Ctrl+O expand toggle. Used for both the
 /// live in-flight buffer and a retained completed burst.
+/// Renders the `╭─ thinking ─` / `│` / `╰─` block for `text`. `text` must
+/// already be sanitized — every caller passes `reasoning_buf` / `last_thinking`,
+/// both filled via `sanitize_output` at push time (mod.rs / streaming.rs), so
+/// re-sanitizing per line here would be redundant work (dirge-8p79), compounded
+/// by the per-delta re-render in `restream_expanded_thinking`.
 fn render_thinking_block(renderer: &mut Renderer, text: &str) -> std::io::Result<()> {
     renderer.write_line("  ╭─ thinking ─", crate::ui::theme::thinking())?;
     for line in text.lines() {
-        renderer.write_line(
-            &format!("  │ {}", sanitize_output(line)),
-            crate::ui::theme::thinking(),
-        )?;
+        renderer.write_line(&format!("  │ {}", line), crate::ui::theme::thinking())?;
     }
     renderer.write_line("  ╰─", crate::ui::theme::thinking())?;
     renderer.write_line("", Color::White)?;
+    Ok(())
+}
+
+/// dirge-8p79: freeze the expanded live-thinking block at a burst boundary
+/// (first response Token / ToolCall). Because the per-delta restream is
+/// coalesced, the last few deltas of a burst may not have been painted yet;
+/// this flushes the full `reasoning_buf` into the block one final time so it
+/// freezes complete, then stops live tracking. No-op when nothing is being
+/// tracked. Borrows the three `UiState` fields individually so the caller can
+/// pass them alongside an immutable `reasoning_buf` borrow.
+fn freeze_live_thinking(
+    renderer: &mut Renderer,
+    expansion_anchor: &mut Option<(usize, usize, u64)>,
+    live_thinking_expanded: &mut bool,
+    reasoning_buf: &str,
+) -> std::io::Result<()> {
+    if *live_thinking_expanded {
+        if let Some(anchor) = *expansion_anchor {
+            *expansion_anchor = restream_expanded_thinking(renderer, anchor, reasoning_buf)?;
+        }
+        *live_thinking_expanded = false;
+    }
     Ok(())
 }
 
