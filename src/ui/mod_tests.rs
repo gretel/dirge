@@ -809,3 +809,50 @@ fn restream_bails_when_block_buried_below_tail() {
         "bailed restream must not stream new thinking: {now:?}"
     );
 }
+
+/// dirge-8p79: the per-delta restream is coalesced, so the last deltas of a
+/// burst can be unpainted when the burst ends. `freeze_live_thinking` flushes
+/// the full buffer one final time at the boundary so the frozen block is
+/// complete, and stops live tracking.
+#[test]
+fn freeze_live_thinking_flushes_coalesced_tail() {
+    let mut r = Renderer::new().expect("renderer");
+    let start = r.buffer_len();
+    // The block was last painted with only the first delta (coalescing skipped
+    // the rest as more events were still queued).
+    render_thinking_block(&mut r, "first thought").unwrap();
+    let mut anchor = Some((start, r.buffer_len(), r.eviction_generation()));
+    let mut expanded = true;
+
+    freeze_live_thinking(&mut r, &mut anchor, &mut expanded, "first thought\nsecond thought")
+        .unwrap();
+
+    let now: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    assert!(
+        now.iter().any(|l| l.contains("second thought")),
+        "coalesced tail flushed into the frozen block: {now:?}"
+    );
+    assert_eq!(
+        now.iter().filter(|l| l.contains("first thought")).count(),
+        1,
+        "block replaced, not duplicated: {now:?}"
+    );
+    assert!(!expanded, "live tracking stops after the block freezes");
+}
+
+/// `freeze_live_thinking` is a no-op when nothing is being live-tracked — it
+/// must not touch the buffer or re-render anything.
+#[test]
+fn freeze_live_thinking_noop_when_not_tracking() {
+    let mut r = Renderer::new().expect("renderer");
+    render_thinking_block(&mut r, "done thinking").unwrap();
+    let len_before = r.buffer_len();
+    let mut anchor = None;
+    let mut expanded = false;
+
+    freeze_live_thinking(&mut r, &mut anchor, &mut expanded, "done thinking\nmore").unwrap();
+
+    assert_eq!(r.buffer_len(), len_before, "buffer untouched when not tracking");
+    assert!(anchor.is_none());
+    assert!(!expanded);
+}
