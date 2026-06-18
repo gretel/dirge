@@ -824,8 +824,13 @@ fn freeze_live_thinking_flushes_coalesced_tail() {
     let mut anchor = Some((start, r.buffer_len(), r.eviction_generation()));
     let mut expanded = true;
 
-    freeze_live_thinking(&mut r, &mut anchor, &mut expanded, "first thought\nsecond thought")
-        .unwrap();
+    freeze_live_thinking(
+        &mut r,
+        &mut anchor,
+        &mut expanded,
+        "first thought\nsecond thought",
+    )
+    .unwrap();
 
     let now: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
     assert!(
@@ -852,7 +857,11 @@ fn freeze_live_thinking_noop_when_not_tracking() {
 
     freeze_live_thinking(&mut r, &mut anchor, &mut expanded, "done thinking\nmore").unwrap();
 
-    assert_eq!(r.buffer_len(), len_before, "buffer untouched when not tracking");
+    assert_eq!(
+        r.buffer_len(),
+        len_before,
+        "buffer untouched when not tracking"
+    );
     assert!(anchor.is_none());
     assert!(!expanded);
 }
