@@ -190,6 +190,7 @@ pub async fn build_agent(
         AnyModel::OpenAI(m) => build_inner!(m, OpenAI),
         AnyModel::ChatGptOpenAI(m) => build_inner!(m, ChatGptOpenAI),
         AnyModel::Anthropic(m) => build_inner!(m, Anthropic),
+        AnyModel::AnthropicOauth(m) => build_inner!(m, AnthropicOauth),
         AnyModel::Gemini(m) => build_inner!(m, Gemini),
         AnyModel::DeepSeek(m) => build_inner!(m, DeepSeek),
         AnyModel::Glm(m) => build_inner!(m, Glm),

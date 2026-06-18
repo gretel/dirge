@@ -15,6 +15,7 @@ use rig::providers::{anthropic, gemini, ollama, openai, openrouter};
 use crate::agent::prompt;
 use crate::session::SessionMessage;
 
+use super::anthropic_http::AnthropicHttpClient;
 use super::codex_http::CodexHttpClient;
 use super::summarize;
 
@@ -23,6 +24,7 @@ pub enum AnyClient {
     OpenAI(openai::CompletionsClient),
     ChatGptOpenAI(openai::Client<CodexHttpClient>),
     Anthropic(anthropic::Client),
+    AnthropicOauth(anthropic::Client<AnthropicHttpClient>),
     Gemini(gemini::Client),
     DeepSeek(openai::CompletionsClient),
     Glm(openai::CompletionsClient),
@@ -38,6 +40,7 @@ impl AnyClient {
             AnyClient::OpenAI(c) => AnyModel::OpenAI(c.completion_model(name)),
             AnyClient::ChatGptOpenAI(c) => AnyModel::ChatGptOpenAI(c.completion_model(name)),
             AnyClient::Anthropic(c) => AnyModel::Anthropic(c.completion_model(name)),
+            AnyClient::AnthropicOauth(c) => AnyModel::AnthropicOauth(c.completion_model(name)),
             AnyClient::Gemini(c) => AnyModel::Gemini(c.completion_model(name)),
             AnyClient::DeepSeek(c) => AnyModel::DeepSeek(c.completion_model(name)),
             AnyClient::Glm(c) => AnyModel::Glm(c.completion_model(name)),
@@ -133,6 +136,9 @@ pub enum AnyModel {
     OpenAI(openai::completion::CompletionModel),
     ChatGptOpenAI(openai::responses_api::ResponsesCompletionModel<CodexHttpClient>),
     Anthropic(anthropic::completion::CompletionModel),
+    AnthropicOauth(
+        anthropic::completion::CompletionModel<super::anthropic_http::AnthropicHttpClient>,
+    ),
     Gemini(gemini::completion::CompletionModel),
     DeepSeek(openai::completion::CompletionModel),
     Glm(openai::completion::CompletionModel),
@@ -186,6 +192,7 @@ impl AnyModel {
             AnyModel::OpenAI(m) => one_shot!(m),
             AnyModel::ChatGptOpenAI(m) => one_shot!(m),
             AnyModel::Anthropic(m) => one_shot!(m),
+            AnyModel::AnthropicOauth(m) => one_shot!(m),
             AnyModel::Gemini(m) => one_shot!(m),
             AnyModel::DeepSeek(m) => one_shot!(m),
             AnyModel::Glm(m) => one_shot!(m),
@@ -234,6 +241,7 @@ impl AnyModel {
             AnyModel::OpenAI(m) => m.model.clone(),
             AnyModel::ChatGptOpenAI(m) => m.model.clone(),
             AnyModel::Anthropic(m) => m.model.clone(),
+            AnyModel::AnthropicOauth(m) => m.model.clone(),
             AnyModel::Gemini(m) => m.model.clone(),
             AnyModel::DeepSeek(m) => m.model.clone(),
             AnyModel::Glm(m) => m.model.clone(),

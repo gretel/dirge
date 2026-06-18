@@ -399,6 +399,13 @@ async fn main() -> anyhow::Result<()> {
     // Handle subcommands that exit before the TUI starts.
     if let Some(ref command) = cli.command {
         match command {
+            cli::Command::Auth { action } => match action {
+                cli::AuthAction::Anthropic => {
+                    let path = provider::anthropic_oauth::login_and_persist().await?;
+                    println!("Anthropic OAuth credentials saved to {}", path.display());
+                    return Ok(());
+                }
+            },
             cli::Command::Sandbox { action } => match action {
                 cli::SandboxAction::Check => {
                     println!("=== Bwrap sandbox ===");

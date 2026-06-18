@@ -246,6 +246,11 @@ pub struct Cli {
 
 #[derive(clap::Subcommand, Debug)]
 pub enum Command {
+    /// Manage provider authentication
+    Auth {
+        #[command(subcommand)]
+        action: AuthAction,
+    },
     /// Check and set up sandbox dependencies
     Sandbox {
         #[command(subcommand)]
@@ -266,6 +271,12 @@ pub enum Command {
         #[arg(long = "sandbox")]
         sandbox: Option<String>,
     },
+}
+
+#[derive(clap::Subcommand, Debug)]
+pub enum AuthAction {
+    /// Start Anthropic Claude Code OAuth login and persist credentials
+    Anthropic,
 }
 
 #[derive(clap::Subcommand, Debug)]
