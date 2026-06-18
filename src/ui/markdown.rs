@@ -113,10 +113,25 @@ fn word_wrap(text: &str, max_width: usize) -> Vec<CompactString> {
     lines
 }
 
-fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>) {
+/// Shared line-flush: split `acc` on `\n`, trim a trailing `\r`, render empty
+/// lines as a bare blank and non-empty lines word-wrapped to the available
+/// width with `prefix` prepended to EVERY wrapped chunk (continuation rows keep
+/// the prefix). The wrap width subtracts the prefix's display width (clamped to
+/// >=1 so a `prefix` as wide as `max_width` can't drive word_wrap into a
+/// non-advancing loop). `flush_acc` delegates with an empty prefix; the
+/// blockquote bar delegates with `"│ "`.
+fn flush_prefixed(
+    acc: &str,
+    color: Color,
+    prefix: &str,
+    max_width: usize,
+    out: &mut Vec<LineEntry>,
+) {
     if acc.is_empty() {
         return;
     }
+    let prefix_w = iter_visible_chars(prefix).len();
+    let inner_w = max_width.saturating_sub(prefix_w).max(1);
     for line in acc.split('\n') {
         let trimmed = line.trim_end_matches('\r');
         if trimmed.is_empty() {
@@ -125,11 +140,20 @@ fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>
                 color,
             });
         } else {
-            for chunk in word_wrap(trimmed, max_width) {
-                out.push(LineEntry { text: chunk, color });
+            for chunk in word_wrap(trimmed, inner_w) {
+                let text = if prefix.is_empty() {
+                    chunk
+                } else {
+                    CompactString::from(format!("{}{}", prefix, chunk))
+                };
+                out.push(LineEntry { text, color });
             }
         }
     }
+}
+
+fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>) {
+    flush_prefixed(acc, color, "", max_width, out);
 }
 
 /// Render a blockquote paragraph's accumulated text with a `│ ` chamber bar on
@@ -142,27 +166,9 @@ fn flush_acc(acc: &str, color: Color, max_width: usize, out: &mut Vec<LineEntry>
 /// sat in `TagEnd::BlockQuote`, which fires AFTER the paragraph already flushed
 /// `acc`, so it was dead and blockquotes rendered as bar-less dim prose.
 fn flush_blockquote(acc: &str, max_width: usize, out: &mut Vec<LineEntry>) {
-    if acc.is_empty() {
-        return;
-    }
-    let dim = crate::ui::theme::dim();
-    let inner_w = max_width.saturating_sub(2);
-    for line in acc.split('\n') {
-        let trimmed = line.trim_end_matches('\r');
-        if trimmed.is_empty() {
-            out.push(LineEntry {
-                text: CompactString::new(""),
-                color: dim,
-            });
-        } else {
-            for chunk in word_wrap(trimmed, inner_w) {
-                out.push(LineEntry {
-                    text: CompactString::from(format!("│ {}", chunk)),
-                    color: dim,
-                });
-            }
-        }
-    }
+    // Delegates to `flush_prefixed` with the `│ ` chamber bar. The prefix-width
+    // clamp there guards against word_wrap looping when max_width < 2.
+    flush_prefixed(acc, crate::ui::theme::dim(), "│ ", max_width, out);
 }
 
 fn bullet_prefix(in_blockquote: bool) -> &'static str {
@@ -376,12 +382,16 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
         match event {
             Event::Start(tag) => match tag {
                 Tag::Paragraph => {
-                    // A blank `>` line between two quoted paragraphs: render a
-                    // bare blank between them so they read as separate blocks.
+                    // A blank `>` line between two quoted blocks: render a bare
+                    // blank between them so they read as separate blocks. Gate on
+                    // blockquote state (not a `│` prefix) — a quoted block may end
+                    // in a list item (`  ┊ ` prefix) or heading, and a non-quote
+                    // line that happens to start with `│` must not inject a blank.
+                    // Skip when the previous line is already blank.
                     if in_blockquote
                         && result
                             .last()
-                            .is_some_and(|e: &LineEntry| e.text.starts_with('│'))
+                            .is_some_and(|e: &LineEntry| !e.text.is_empty())
                     {
                         result.push(LineEntry {
                             text: CompactString::new(""),
@@ -495,13 +505,21 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
                         _ => "",
                     };
                     let line = format!("{}{}\x1b[0m", prefix, acc);
-                    flush_acc(&line, color, max_width, &mut result);
+                    if in_blockquote {
+                        // Quoted heading: carry the `│ ` bar so the whole quote
+                        // stays contained. The bold ANSI rides along inside the
+                        // text. Suppress the trailing blank — TagEnd::BlockQuote
+                        // closes the quote with its own blank.
+                        flush_blockquote(&line, max_width, &mut result);
+                    } else {
+                        flush_acc(&line, color, max_width, &mut result);
+                        result.push(LineEntry {
+                            text: CompactString::new(""),
+                            color: base_color,
+                        });
+                    }
                     acc.clear();
                     in_heading = false;
-                    result.push(LineEntry {
-                        text: CompactString::new(""),
-                        color: base_color,
-                    });
                 }
                 TagEnd::CodeBlock => {
                     // Route through the per-language regex highlighter.
@@ -509,18 +527,25 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
                     // span per line (same look as before this change).
                     let body = acc.trim_end_matches('\n').to_string();
                     let highlighted = highlight::highlight_code(&body, &code_block_lang);
+                    // Inside a quote, every code row carries the `│ ` bar (in
+                    // place of the 2-space gutter) so the block stays contained.
+                    let gutter = if in_blockquote { "│ " } else { "  " };
                     for spans in highlighted {
                         if spans.is_empty() {
                             result.push(LineEntry {
-                                text: CompactString::new(""),
+                                text: if in_blockquote {
+                                    CompactString::new("│ ")
+                                } else {
+                                    CompactString::new("")
+                                },
                                 color: crate::ui::theme::tool(),
                             });
                             continue;
                         }
                         // Assemble the row by concatenating ANSI-wrapped
-                        // spans. Pre-pad with a 2-space gutter so code
+                        // spans. Pre-pad with the gutter (or quote bar) so code
                         // blocks visually offset from prose.
-                        let mut row = String::from("  ");
+                        let mut row = String::from(gutter);
                         for s in &spans {
                             row.push_str(&ansi_fg(s.color));
                             row.push_str(&s.text);
@@ -537,10 +562,14 @@ pub fn markdown_to_styled(text: &str, max_width: usize, base_color: Color) -> Ve
                     acc.clear();
                     code_block_lang.clear();
                     in_code_block = false;
-                    result.push(LineEntry {
-                        text: CompactString::new(""),
-                        color: base_color,
-                    });
+                    // Outside a quote, close the block with a blank. Inside a
+                    // quote, TagEnd::BlockQuote supplies the closing blank.
+                    if !in_blockquote {
+                        result.push(LineEntry {
+                            text: CompactString::new(""),
+                            color: base_color,
+                        });
+                    }
                 }
                 TagEnd::BlockQuote(_) => {
                     // Paragraphs inside the quote already rendered with the bar
@@ -825,6 +854,83 @@ mod tests {
             t[p1 + 1..p2].iter().any(|x| x.is_empty()),
             "blank separator between quoted paragraphs: {t:?}",
         );
+    }
+
+    /// A heading inside a blockquote (`> # Title`) must carry the `│ ` bar so
+    /// the whole quote reads as one contained block — not a bar-less heading
+    /// followed by barred prose.
+    #[test]
+    fn quoted_heading_carries_bar() {
+        let input = "> # Heading\n> body text here";
+        let rendered = markdown_to_styled(input, 80, crate::ui::theme::agent());
+        let t = texts(&rendered);
+        // Every non-empty rendered line must start with the bar.
+        for line in t.iter().filter(|l| !l.is_empty()) {
+            assert!(
+                line.starts_with('│'),
+                "quoted line missing bar: {line:?} in {t:?}"
+            );
+        }
+        assert!(
+            t.iter().any(|l| l.contains("Heading")),
+            "heading text present: {t:?}"
+        );
+        assert!(
+            t.iter().any(|l| l.contains("body text here")),
+            "body text present: {t:?}"
+        );
+    }
+
+    /// A fenced code block inside a blockquote carries the `│ ` bar on every
+    /// code line so the quote stays visually contained.
+    #[test]
+    fn quoted_code_block_carries_bar() {
+        let input = "> ```\n> let x = 1;\n> let y = 2;\n> ```";
+        let rendered = markdown_to_styled(input, 80, crate::ui::theme::agent());
+        let t = texts(&rendered);
+        let code_lines: Vec<&String> = t
+            .iter()
+            .filter(|l| l.contains("let x") || l.contains("let y"))
+            .collect();
+        assert_eq!(code_lines.len(), 2, "both code lines present: {t:?}");
+        for line in &code_lines {
+            assert!(
+                line.starts_with('│'),
+                "quoted code line missing bar: {line:?}"
+            );
+        }
+    }
+
+    /// A quoted paragraph following a quoted LIST item must not run together —
+    /// the list bullet uses a `  ┊ ` prefix (not `│`), so the separator gate
+    /// must key on blockquote state, not the `│` prefix.
+    #[test]
+    fn quoted_list_then_paragraph_does_not_run_together() {
+        let input = "> - item one\n> - item two\n>\n> Following paragraph.";
+        let rendered = markdown_to_styled(input, 80, crate::ui::theme::agent());
+        let t = texts(&rendered);
+        let item_pos = t
+            .iter()
+            .position(|x| x.contains("item two"))
+            .expect("list item present");
+        let para_pos = t
+            .iter()
+            .position(|x| x.contains("Following paragraph."))
+            .expect("paragraph present");
+        assert!(
+            t[item_pos + 1..para_pos].iter().any(|x| x.is_empty()),
+            "blank separator between quoted list and quoted paragraph: {t:?}"
+        );
+    }
+
+    /// A blockquote rendered at width < 2 must terminate: the bar overhead
+    /// leaves inner_w=0 without the clamp, and word_wrap at 0 cannot advance.
+    #[test]
+    fn blockquote_width_below_two_does_not_loop() {
+        // inner_w would be 0 without the clamp; word_wrap at 0 can fail to
+        // advance. This must terminate and still render something.
+        let rendered = markdown_to_styled("> hi there", 1, crate::ui::theme::agent());
+        assert!(!rendered.is_empty(), "must render without hanging");
     }
 
     /// Each rendered row must occupy the same number of terminal

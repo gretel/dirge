@@ -776,3 +776,36 @@ fn restream_bails_on_eviction_generation_mismatch() {
         "stale-generation anchor must not re-render in place"
     );
 }
+
+/// dirge #448 finding 1: when content has been appended below the anchored
+/// block (the block is no longer at the buffer tail), restreaming must bail
+/// (return None) instead of truncating from `start` to the END of the buffer
+/// and silently destroying that appended content.
+#[test]
+fn restream_bails_when_block_buried_below_tail() {
+    let mut r = Renderer::new().expect("renderer");
+    r.write_line("<you> hi", Color::White).unwrap();
+
+    let start = r.buffer_len();
+    render_thinking_block(&mut r, "first thought").unwrap();
+    let anchor = (start, r.buffer_len(), r.eviction_generation());
+
+    // Something appends below the block — it's no longer at the tail.
+    r.write_line("response token", Color::White).unwrap();
+
+    let out = restream_expanded_thinking(&mut r, anchor, "first thought\nsecond thought").unwrap();
+    assert!(
+        out.is_none(),
+        "buried anchor (content below the block) must not re-render in place"
+    );
+
+    let now: Vec<String> = r.buffer_lines().iter().map(|s| s.to_string()).collect();
+    assert!(
+        now.iter().any(|l| l.contains("response token")),
+        "appended content below the block must survive a bailed restream: {now:?}"
+    );
+    assert!(
+        !now.iter().any(|l| l.contains("second thought")),
+        "bailed restream must not stream new thinking: {now:?}"
+    );
+}

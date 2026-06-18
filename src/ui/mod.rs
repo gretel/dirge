@@ -1701,6 +1701,13 @@ pub async fn run_interactive(
                                     &mut ui.tool_calls_this_run,
                                 );
                             }
+                            // dirge #448 finding 3: the expansion anchor's
+                            // indices point into the OLD chat's buffer (it isn't
+                            // part of ChatUiState), so a switch invalidates them.
+                            // Clear so a background agent's reasoning delta can't
+                            // restream against the now-active chat's buffer.
+                            ui.expansion_anchor = None;
+                            ui.live_thinking_expanded = false;
                             renderer.request_repaint();
                             continue;
                         }
@@ -2415,9 +2422,11 @@ pub async fn run_interactive(
                         // panel so an interleaved later reasoning delta can't
                         // re-render at the (now-buried) anchor and clobber the
                         // response. The block stays as collapsible history.
-                        if ui.was_reasoning {
-                            ui.live_thinking_expanded = false;
-                        }
+                        // dirge #448 finding 4: clear unconditionally — a Token
+                        // arriving when was_reasoning is already false (e.g.
+                        // response tokens after a tool round-trip) must still
+                        // drop the flag, otherwise it stays live.
+                        ui.live_thinking_expanded = false;
                         // Caught-up check for the render coalescer, computed
                         // before ctx borrows the render state (dirge-ufe0).
                         let pending = ui.agent_rx.as_ref().map_or(0, |rx| rx.len());
@@ -3654,27 +3663,37 @@ fn render_thinking_block(renderer: &mut Renderer, text: &str) -> std::io::Result
 
 /// dirge #444: re-render the expanded LIVE-thinking block in place with the
 /// latest `reasoning_buf`, so new reasoning deltas stream into the panel
-/// instead of leaving a frozen snapshot. `anchor` is `(start, _end,
+/// instead of leaving a frozen snapshot. `anchor` is `(start, end,
 /// eviction_gen)` from `expansion_anchor`. Returns the UPDATED anchor, or
 /// `None` when the block can't be re-rendered in place — front-eviction shifted
-/// indices (gen mismatch), or the start is past the buffer end — in which case
-/// the caller stops tracking and leaves the block as history (Ctrl+O re-expands
-/// a fresh snapshot). Assumes the block sits at the buffer tail, which holds
-/// during a pure thinking burst where nothing else appends.
+/// indices (gen mismatch), the start is past the buffer end, or the block is no
+/// longer at the buffer tail (`end != buffer_len`, i.e. content was appended
+/// below it) — in which case the caller stops tracking and leaves the block as
+/// history (Ctrl+O re-expands a fresh snapshot). The tail check is what makes a
+/// buried anchor a safe no-op rather than a destructive truncate.
 fn restream_expanded_thinking(
     renderer: &mut Renderer,
     anchor: (usize, usize, u64),
     reasoning_buf: &str,
 ) -> std::io::Result<Option<(usize, usize, u64)>> {
-    let (start, _end, anchor_gen) = anchor;
-    if renderer.eviction_generation() != anchor_gen || start > renderer.buffer_len() {
+    let (start, end, anchor_gen) = anchor;
+    // dirge #448 finding 1: `replace_from(start, [])` truncates from `start` to
+    // the END of the buffer, so re-rendering is only safe when the block still
+    // sits at the tail. If anything was appended below it (`end` no longer the
+    // buffer length), bail so that content isn't silently destroyed.
+    if renderer.eviction_generation() != anchor_gen
+        || start > renderer.buffer_len()
+        || end != renderer.buffer_len()
+    {
         return Ok(None);
     }
-    let gen_before = renderer.eviction_generation();
     renderer.replace_from(start, Vec::new());
     render_thinking_block(renderer, reasoning_buf)?;
-    Ok(if renderer.eviction_generation() == gen_before {
-        Some((start, renderer.buffer_len(), gen_before))
+    // The early return above already established `eviction_generation() ==
+    // anchor_gen`; if the render itself tripped front-eviction, the generation
+    // now differs and we stop tracking.
+    Ok(if renderer.eviction_generation() == anchor_gen {
+        Some((start, renderer.buffer_len(), anchor_gen))
     } else {
         None
     })
