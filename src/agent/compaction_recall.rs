@@ -279,13 +279,11 @@ mod tests {
             None,
         );
         assert!(
-            prompt.contains("stdlib conversion complete")
-                && prompt.contains("no tokio remains"),
+            prompt.contains("stdlib conversion complete") && prompt.contains("no tokio remains"),
             "completion signal (original task DONE) must reach the summarizer prompt"
         );
         assert!(
-            prompt.contains("integration test hangs")
-                && prompt.contains("debugging the race"),
+            prompt.contains("integration test hangs") && prompt.contains("debugging the race"),
             "follow-up signal (live work) must reach the summarizer prompt"
         );
     }
