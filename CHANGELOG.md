@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-06-18
+
+### Fixed
+- **Interactive prompts fail fast instead of hanging to the timeout.** A
+  `git clone` that prompted for a username blocked for the full 120s bash
+  timeout: git reads credentials from `/dev/tty`, not stdin, and in the Off
+  sandbox the child shared dirge's controlling terminal. The bash child now
+  runs in its own session (`setsid`) with no controlling terminal, so the
+  prompt errors out immediately; `GIT_TERMINAL_PROMPT=0` and friends cover the
+  non-tty askpass paths. (#460)
+
+### Changed
+- **The loop guard is cost-aware.** The repeat (storm) and failure-streak
+  guards were count-based, so a command that burned its whole timeout counted
+  the same as a millisecond error and neither escalated. Each result is now
+  classified once (ok/error/timeout) and fed to both: a timeout weighs double
+  toward the recovery-checkpoint nudge, and an identical retry of a timed-out
+  command is suppressed one attempt sooner. (#460)
+
 ## [0.8.0] - 2026-06-19
 
 ### Fixed
