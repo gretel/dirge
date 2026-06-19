@@ -80,6 +80,75 @@ cargo install dirge-agent --no-default-features \
 Prebuilt binaries for Linux (glibc + static musl), macOS (Intel + Apple
 Silicon), and Windows are attached to each [GitHub Release](https://github.com/dirge-code/dirge/releases).
 
+### Build with Nix
+
+The flake ships the crate default features (the release feature set):
+
+```bash
+nix build                 # builds packages.default / packages.dirge from this pinned ref
+nix run . -- --version    # runs the source-built binary
+nix develop               # opens a Rust dev shell with clang, cmake, and bindgen support
+nix build .#dirge-bin     # installs the recorded upstream release binary
+```
+
+`packages.default` / `packages.dirge` build from the flake input's pinned
+source (`self`). `packages.dirge-bin` downloads the latest release recorded in
+`nix/bin.nix`, so it can differ when you pin `main` or a feature branch.
+
+
+#### Automatic devshell activation with direnv
+This repository includes a `.envrc`. If you have `direnv` installed, this will activate the nix devshell automatically.
+N.B. .envrc is untrusted by default -- opt in by entering the command `direnv allow` at the repository root.
+
+
+#### Install via your own flake (home-manager)
+
+A minimal `flake.nix` that installs dirge through home-manager:
+
+```nix
+{
+  inputs = {
+    nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
+    home-manager.url = "github:nix-community/home-manager";
+    dirge.url = "github:dirge-code/dirge";
+  };
+
+  outputs = { nixpkgs, home-manager, dirge, ... }:
+    let
+      system = "x86_64-linux";
+      pkgs = import nixpkgs {
+        inherit system;
+        overlays = [ dirge.overlays.default ];
+      };
+    in {
+      homeConfigurations.me = home-manager.lib.homeManagerConfiguration {
+        inherit pkgs;
+        modules = [{
+          home.username = "me";
+          home.homeDirectory = "/home/me";
+          home.stateVersion = "24.11";
+          home.packages = [ pkgs.dirge ]; # or pkgs.dirge-bin for the prebuilt binary
+        }];
+      };
+    };
+}
+```
+
+Then `home-manager switch --flake .#me`.
+
+#### Maintaining the flake
+
+- `nix/bin.nix` (the prebuilt `dirge-bin`) is bumped automatically: on a release
+  tag the release workflow refreshes its version and hashes from the new assets
+  and opens a PR.
+- `nix flake check` runs in CI whenever the flake, `nix/`, or the Cargo
+  manifests change.
+- Run `nix flake update` to refresh the pinned `nixpkgs` in the committed
+  `flake.lock`.
+
+Consumers can also import `inputs.dirge.overlays.default` into an existing
+`nixpkgs` overlay list to expose `pkgs.dirge` and `pkgs.dirge-bin`.
+
 ### Optional: sandbox mode
 
 Install [bubblewrap](https://github.com/containers/bubblewrap) for `--sandbox`, which runs every bash command inside an isolated environment:
