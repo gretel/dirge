@@ -90,8 +90,7 @@ fn last_match<'r>(
     op: Operation,
     resource: &Resource,
 ) -> Option<&'r Rule> {
-    rules
-        .iter().rfind(|r| r.matches(req, op, resource))
+    rules.iter().rfind(|r| r.matches(req, op, resource))
 }
 
 /// Whether a resource is a filesystem path OUTSIDE the working directory

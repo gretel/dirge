@@ -116,7 +116,10 @@ mod tests {
     #[test]
     fn classify_maps_success_error_and_timeout() {
         assert_eq!(Outcome::classify(false, "all good"), Outcome::Ok);
-        assert_eq!(Outcome::classify(true, "old_string not found"), Outcome::Error);
+        assert_eq!(
+            Outcome::classify(true, "old_string not found"),
+            Outcome::Error
+        );
         assert_eq!(
             Outcome::classify(true, "Command timed out after 120s"),
             Outcome::Timeout

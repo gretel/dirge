@@ -1208,11 +1208,22 @@ mod tests {
             .as_std()
             .get_envs()
             .filter_map(|(k, v)| {
-                v.map(|v| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+                v.map(|v| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.to_string_lossy().into_owned(),
+                    )
+                })
             })
             .collect();
-        assert_eq!(found.get("GIT_TERMINAL_PROMPT").map(String::as_str), Some("0"));
-        assert_eq!(found.get("GCM_INTERACTIVE").map(String::as_str), Some("Never"));
+        assert_eq!(
+            found.get("GIT_TERMINAL_PROMPT").map(String::as_str),
+            Some("0")
+        );
+        assert_eq!(
+            found.get("GCM_INTERACTIVE").map(String::as_str),
+            Some("Never")
+        );
         assert_eq!(
             found.get("DEBIAN_FRONTEND").map(String::as_str),
             Some("noninteractive")
