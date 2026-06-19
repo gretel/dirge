@@ -197,45 +197,37 @@ pub async fn build_agent_inner<M: CompletionModel + 'static>(
     {
         preamble.push_str(&block);
     }
-    let skill_manager = crate::extras::skills::manager::SkillManager::new(&paths);
     let mut usage_store = crate::extras::skills::usage::UsageStore::load(&paths).ok();
 
-    // Inject available project skills into the preamble so the
-    // model knows what procedural knowledge exists for this project.
-    // Skills are listed with name + description; the model loads
-    // full content on demand via the `skill` tool.
+    // Inject available skills into the preamble so the model knows
+    // what procedural knowledge exists. dirge-rq65 follow-up: list
+    // from the SAME source as the loadable tool set
+    // (`skill::discover_skills`, which spans the global tiers
+    // ~/.claude|.opencode|.agents|.dirge/skills plus every project
+    // ancestor) rather than `SkillManager::list()`, which only reads
+    // the single project `.dirge/skills/`. Otherwise a global skill
+    // is loadable via the `skill` tool but never advertised in the
+    // preamble, so the model never knows to load it.
+    // Skills carry name + description; full content loads on demand.
     // Bumps view counters for each listed skill (best-effort).
-    match skill_manager.list() {
-        Ok(names) if !names.is_empty() => {
-            let mut skill_lines = Vec::new();
-            for name in &names {
-                if let Ok(content) = skill_manager.read_content(name)
-                    && let Some(spec) =
-                        crate::extras::skills::format::parse_skill_spec(&content, name)
-                {
-                    let desc = if spec.description.is_empty() {
-                        "(no description)".to_string()
-                    } else {
-                        spec.description.clone()
-                    };
-                    skill_lines.push(format!("  - **{name}**: {desc}"));
-                }
-            }
-            if !skill_lines.is_empty() {
-                preamble.push_str(PROJECT_SKILLS_PREAMBLE);
-                for line in &skill_lines {
-                    preamble.push_str(line);
-                    preamble.push('\n');
-                }
-                // Bump view counters for each skill listed in preamble (best-effort).
-                if let Some(ref mut u) = usage_store {
-                    for name in &names {
-                        u.record_view(name);
-                    }
-                }
+    let skills = crate::skill::discover_skills(
+        &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    );
+    if !skills.is_empty() {
+        preamble.push_str(PROJECT_SKILLS_PREAMBLE);
+        for skill in &skills {
+            let desc = if skill.description.is_empty() {
+                "(no description)"
+            } else {
+                skill.description.as_str()
+            };
+            preamble.push_str(&format!("  - **{}**: {}\n", skill.name, desc));
+        }
+        if let Some(ref mut u) = usage_store {
+            for skill in &skills {
+                u.record_view(&skill.name);
             }
         }
-        _ => {}
     }
 
     // Inject mode-specific reminders
