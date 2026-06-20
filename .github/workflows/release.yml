@@ -91,6 +91,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: main
+          # Full history so the post-build commit can rebase+push to main.
+          fetch-depth: 0
 
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v16
@@ -141,14 +143,28 @@ jobs:
           path.write_text(text)
           PY
 
-      - name: Open pull request
-        uses: peter-evans/create-pull-request@v6
-        with:
-          commit-message: Bump Nix dirge-bin to ${{ github.ref_name }}
-          title: Bump Nix dirge-bin to ${{ github.ref_name }}
-          body: Update nix/bin.nix for the ${{ github.ref_name }} release assets.
-          branch: automation/nix-dirge-bin-${{ github.ref_name }}
-          delete-branch: true
+      # Commit the bump straight to `main` instead of opening a PR. The
+      # PR route (peter-evans/create-pull-request) failed on every release
+      # with "GitHub Actions is not permitted to create or approve pull
+      # requests" — a repo Actions toggle that's off. `main` is unprotected
+      # and this job has `contents: write` (permissions: write-all), so a
+      # direct push works and needs no extra setting or PAT. A GITHUB_TOKEN
+      # push doesn't re-trigger workflows, so this can't loop.
+      - name: Commit nix/bin.nix bump
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- nix/bin.nix; then
+            echo "nix/bin.nix already current for ${GITHUB_REF_NAME} — nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add nix/bin.nix
+          git commit -m "Bump Nix dirge-bin to ${GITHUB_REF_NAME}"
+          # The release job can run minutes after the tag; rebase on any
+          # main movement so the push fast-forwards.
+          git pull --rebase origin main
+          git push origin HEAD:main
 
   # Bump the Homebrew tap (dirge-code/homebrew-dirge) to the just-released
   # version + checksums. Runs after every target has uploaded its assets, so
