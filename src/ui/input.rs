@@ -428,6 +428,13 @@ impl InputEditor {
         self.wrap_w = wrap_w;
     }
 
+    /// Install the input keymap built from config (dirge-xv9l). Replaces
+    /// the built-in defaults the editor starts with so user `keybindings`
+    /// targeting input-editor commands take effect.
+    pub fn set_keymap(&mut self, keymap: InputKeymap) {
+        self.keymap = keymap;
+    }
+
     /// Insert pasted text. If it spans `PASTE_COLLAPSE_LINES` or more lines,
     /// store it and insert a `[N lines pasted]` placeholder; otherwise insert
     /// raw. If the same content was already pasted and is still represented

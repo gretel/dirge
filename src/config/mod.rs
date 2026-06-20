@@ -124,11 +124,12 @@ pub enum ConfigRole {
     Approval,
 }
 
-/// One VSCode-style key binding: bind a key chord to a named command.
-/// `key` is a chord like `"ctrl-t"` / `"pageup"` / `"ctrl-shift-x"`;
-/// `command` is one of the rebindable global commands (see
-/// `ui::keymap::KeyAction`), or `"none"` to unbind the default on that
-/// chord. Parsed by `ui::keymap::Keymap::from_config`.
+/// One VSCode-style key binding: bind a key chord (or chord sequence like
+/// `"ctrl-x ctrl-s"`) to a named command. `key` is a chord like `"ctrl-t"`
+/// / `"pageup"` / `"ctrl-shift-x"`; `command` is one of the rebindable
+/// global commands (`ui::keymap::KeyAction`) or input-editor commands
+/// (`ui::keymap::InputAction`), or `"none"` to unbind the default on that
+/// chord. Parsed by `ui::keymap::Keymaps::from_config`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct KeybindingConfig {
     pub key: String,

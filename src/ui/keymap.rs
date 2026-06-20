@@ -21,6 +21,14 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::config::KeybindingConfig;
 
+/// A single key chord: a key plus its modifiers.
+pub type Chord = (KeyCode, KeyModifiers);
+/// A chord SEQUENCE — emacs-style multi-key bindings like `C-x C-s`
+/// (dirge-xv9l makes the keymaps sequence-native; the multi-key matching
+/// runtime lands in phase 4, dirge-fl57). Length 1 for an ordinary
+/// single-key binding, which is all the built-in defaults use.
+pub type ChordSeq = Vec<Chord>;
+
 /// A rebindable global command. Each maps to a stable `command` string
 /// used in the config and to a set of default chords.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,10 +141,12 @@ impl KeyAction {
 }
 
 /// Resolves key chords to [`KeyAction`]s: built-in defaults plus the
-/// user's per-chord overrides.
+/// user's per-chord overrides. Keyed on a [`ChordSeq`] so multi-key
+/// bindings can be stored; single-key resolution is the only runtime so
+/// far (phase 4 adds the pending-prefix matcher).
 #[derive(Debug, Clone, Default)]
 pub struct Keymap {
-    map: HashMap<(KeyCode, KeyModifiers), KeyAction>,
+    map: HashMap<ChordSeq, KeyAction>,
 }
 
 impl Keymap {
@@ -145,48 +155,67 @@ impl Keymap {
         let mut map = HashMap::new();
         for (action, _, chords) in KeyAction::ALL {
             for chord in *chords {
-                map.insert(*chord, *action);
+                map.insert(vec![*chord], *action);
             }
         }
         Self { map }
     }
 
-    /// Build the keymap from the optional `keybindings` config, layered
-    /// over the defaults. Returns the keymap plus any warnings (invalid
-    /// chord / unknown command) for the UI to surface. A command of
-    /// `none` / `unbind` removes the chord (so a user can disable a
-    /// default binding).
+    /// The action bound to `key` (as a single-key chord), if any. Matches
+    /// modifiers exactly.
+    pub fn resolve(&self, key: &KeyEvent) -> Option<KeyAction> {
+        self.map.get(&[(key.code, key.modifiers)][..]).copied()
+    }
+}
+
+/// Both keymaps built from one `keybindings` config (dirge-xv9l). The
+/// global "command" keys and the input-editor keys share a single config
+/// array; each `{ key, command }` routes to the right context by looking
+/// its command name up in [`KeyAction`] then [`InputAction`]. The two
+/// command namespaces are disjoint, so routing is unambiguous.
+#[derive(Debug, Clone, Default)]
+pub struct Keymaps {
+    pub global: Keymap,
+    pub input: InputKeymap,
+}
+
+impl Keymaps {
+    /// Layer the user's `keybindings` over the defaults, routing each entry
+    /// to the global or input keymap by command name. `none` / `unbind`
+    /// clears the chord from BOTH contexts (a chord can be a default in
+    /// each — e.g. Ctrl+N is `next_chat` globally and `history_next` in the
+    /// editor — so disabling it means disabling it everywhere). Returns the
+    /// keymaps plus warnings (bad chord / unknown command) to surface.
     pub fn from_config(bindings: Option<&[KeybindingConfig]>) -> (Self, Vec<String>) {
-        let mut km = Self::defaults();
+        let mut global = Keymap::defaults();
+        let mut input = InputKeymap::defaults();
         let mut warnings = Vec::new();
         for b in bindings.unwrap_or(&[]) {
-            let Some(chord) = parse_chord(&b.key) else {
+            let Some(seq) = parse_chord_sequence(&b.key) else {
                 warnings.push(format!("keybindings: unrecognized key {:?}", b.key));
                 continue;
             };
             let cmd = b.command.trim().to_ascii_lowercase().replace('-', "_");
             if matches!(cmd.as_str(), "none" | "noop" | "unbind" | "") {
-                km.map.remove(&chord);
+                global.map.remove(&seq);
+                input.map.remove(&seq);
                 continue;
             }
-            match KeyAction::from_command(&cmd) {
-                Some(action) => {
-                    km.map.insert(chord, action);
-                }
-                None => warnings.push(format!(
-                    "keybindings: unknown command {:?} for key {:?} (valid: {})",
+            if let Some(action) = KeyAction::from_command(&cmd) {
+                global.map.insert(seq, action);
+            } else if let Some(action) = InputAction::from_command(&cmd) {
+                input.map.insert(seq, action);
+            } else {
+                warnings.push(format!(
+                    "keybindings: unknown command {:?} for key {:?} (valid: {}, {})",
                     b.command,
                     b.key,
-                    KeyAction::command_list()
-                )),
+                    KeyAction::command_list(),
+                    InputAction::command_list()
+                ));
             }
         }
-        (km, warnings)
-    }
-
-    /// The action bound to `key`, if any. Matches modifiers exactly.
-    pub fn resolve(&self, key: &KeyEvent) -> Option<KeyAction> {
-        self.map.get(&(key.code, key.modifiers)).copied()
+        (Keymaps { global, input }, warnings)
     }
 }
 
@@ -362,9 +391,6 @@ impl InputAction {
 
     /// Resolve a config command name (case-insensitive, `-`/`_` agnostic)
     /// to an input action. `None` for unknown commands.
-    // Used by the config/plugin layering in phase 2 (dirge-xv9l); the
-    // default keymap reaches input actions via `ALL` directly until then.
-    #[allow(dead_code)]
     pub fn from_command(name: &str) -> Option<InputAction> {
         let norm = name.trim().to_ascii_lowercase().replace('-', "_");
         Self::ALL
@@ -374,7 +400,6 @@ impl InputAction {
     }
 
     /// Comma-separated list of every valid input command name.
-    #[allow(dead_code)] // phase 2 (dirge-xv9l) — see `from_command`.
     pub fn command_list() -> String {
         Self::ALL
             .iter()
@@ -385,11 +410,12 @@ impl InputAction {
 }
 
 /// Resolves key chords to [`InputAction`]s: built-in defaults reproduce
-/// the historical hardcoded text-editing keys. The config/plugin override
-/// layering arrives in later phases; for now this is defaults-only.
+/// the historical hardcoded text-editing keys, with user overrides layered
+/// on via [`Keymaps::from_config`]. Keyed on a [`ChordSeq`] like
+/// [`Keymap`].
 #[derive(Debug, Clone, Default)]
 pub struct InputKeymap {
-    map: HashMap<(KeyCode, KeyModifiers), InputAction>,
+    map: HashMap<ChordSeq, InputAction>,
 }
 
 impl InputKeymap {
@@ -398,24 +424,35 @@ impl InputKeymap {
         let mut map = HashMap::new();
         for (action, _, chords) in InputAction::ALL {
             for chord in *chords {
-                map.insert(*chord, *action);
+                map.insert(vec![*chord], *action);
             }
         }
         Self { map }
     }
 
-    /// The input action bound to `key`, if any. Matches modifiers exactly
-    /// (consistent with [`Keymap::resolve`]).
+    /// The input action bound to `key` (as a single-key chord), if any.
+    /// Matches modifiers exactly (consistent with [`Keymap::resolve`]).
     pub fn resolve(&self, key: &KeyEvent) -> Option<InputAction> {
-        self.map.get(&(key.code, key.modifiers)).copied()
+        self.map.get(&[(key.code, key.modifiers)][..]).copied()
     }
 
-    /// Bind a chord to an action, replacing any existing binding. Test-only
-    /// until the config/plugin layering lands (phase 2, dirge-xv9l).
+    /// Bind a single chord to an action, replacing any existing binding.
+    /// Test-only; production overrides flow through [`Keymaps::from_config`].
     #[cfg(test)]
-    pub fn insert(&mut self, chord: (KeyCode, KeyModifiers), action: InputAction) {
-        self.map.insert(chord, action);
+    pub fn insert(&mut self, chord: Chord, action: InputAction) {
+        self.map.insert(vec![chord], action);
     }
+}
+
+/// Parse a chord SEQUENCE: one or more chords separated by whitespace,
+/// e.g. `ctrl-x ctrl-s` (emacs-style, dirge-fl57) or a bare `ctrl-r`.
+/// Each chord is parsed by [`parse_chord`]; the whole spec fails if any
+/// chord does or the spec is empty. (The space *key* is written as the
+/// word `space`, so whitespace-splitting is unambiguous.)
+pub fn parse_chord_sequence(spec: &str) -> Option<ChordSeq> {
+    let chords: Option<ChordSeq> = spec.split_whitespace().map(parse_chord).collect();
+    let chords = chords?;
+    if chords.is_empty() { None } else { Some(chords) }
 }
 
 /// Parse a chord string like `ctrl-r`, `pageup`, `ctrl-shift-x`,
@@ -481,6 +518,12 @@ mod tests {
     }
     fn ev(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
         KeyEvent::new(code, mods)
+    }
+    /// Global-keymap half of `Keymaps::from_config`, for the global-binding
+    /// tests below.
+    fn global_from(bindings: &[KeybindingConfig]) -> (Keymap, Vec<String>) {
+        let (kms, warns) = Keymaps::from_config(Some(bindings));
+        (kms.global, warns)
     }
 
     #[test]
@@ -569,7 +612,7 @@ mod tests {
     #[test]
     fn override_rebinds_and_keeps_other_defaults() {
         // Rebind toggle-reasoning to Ctrl+T.
-        let (km, warns) = Keymap::from_config(Some(&[cfg("ctrl-t", "toggle_reasoning")]));
+        let (km, warns) = global_from(&[cfg("ctrl-t", "toggle_reasoning")]);
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(
             km.resolve(&ev(KeyCode::Char('t'), KeyModifiers::CONTROL)),
@@ -590,7 +633,7 @@ mod tests {
     #[test]
     fn override_on_an_occupied_chord_replaces_it() {
         // Binding Ctrl+R to next_chat takes Ctrl+R away from toggle.
-        let (km, warns) = Keymap::from_config(Some(&[cfg("ctrl-r", "next_chat")]));
+        let (km, warns) = global_from(&[cfg("ctrl-r", "next_chat")]);
         assert!(warns.is_empty(), "{warns:?}");
         assert_eq!(
             km.resolve(&ev(KeyCode::Char('r'), KeyModifiers::CONTROL)),
@@ -600,7 +643,7 @@ mod tests {
 
     #[test]
     fn unbind_removes_a_default() {
-        let (km, _) = Keymap::from_config(Some(&[cfg("ctrl-r", "none")]));
+        let (km, _) = global_from(&[cfg("ctrl-r", "none")]);
         assert_eq!(
             km.resolve(&ev(KeyCode::Char('r'), KeyModifiers::CONTROL)),
             None
@@ -609,10 +652,10 @@ mod tests {
 
     #[test]
     fn invalid_chord_and_unknown_command_warn() {
-        let (_, warns) = Keymap::from_config(Some(&[
+        let (_, warns) = global_from(&[
             cfg("kaboom", "toggle_reasoning"),
             cfg("ctrl-y", "do_a_barrel_roll"),
-        ]));
+        ]);
         assert_eq!(warns.len(), 2, "{warns:?}");
         assert!(warns[0].contains("unrecognized key"));
         assert!(warns[1].contains("unknown command"));
@@ -686,5 +729,114 @@ mod tests {
         for (_, name, _) in KeyAction::ALL {
             assert_eq!(InputAction::from_command(name), None, "collision on {name}");
         }
+    }
+
+    // --- unified config surface (dirge-xv9l) -----------------------
+
+    #[test]
+    fn config_rebinds_an_input_command() {
+        // A single `keybindings` array can now target input-editor commands.
+        let (kms, warns) = Keymaps::from_config(Some(&[cfg("ctrl-z", "kill_to_line_start")]));
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(
+            kms.input.resolve(&ev(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            Some(InputAction::KillToLineStart)
+        );
+        // The default Ctrl+U still maps too (adding doesn't drop the default).
+        assert_eq!(
+            kms.input.resolve(&ev(KeyCode::Char('u'), KeyModifiers::CONTROL)),
+            Some(InputAction::KillToLineStart)
+        );
+        // Global keymap untouched.
+        assert_eq!(
+            kms.global.resolve(&ev(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            Some(KeyAction::ToggleReasoning)
+        );
+    }
+
+    #[test]
+    fn config_routes_global_and_input_in_one_array() {
+        let (kms, warns) = Keymaps::from_config(Some(&[
+            cfg("ctrl-t", "toggle_reasoning"),  // global
+            cfg("alt-a", "cursor_line_start"),  // input
+        ]));
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(
+            kms.global.resolve(&ev(KeyCode::Char('t'), KeyModifiers::CONTROL)),
+            Some(KeyAction::ToggleReasoning)
+        );
+        assert_eq!(
+            kms.input.resolve(&ev(KeyCode::Char('a'), KeyModifiers::ALT)),
+            Some(InputAction::CursorLineStart)
+        );
+    }
+
+    #[test]
+    fn unbind_clears_both_contexts() {
+        // Ctrl+N is a default in BOTH maps (next_chat / history_next); `none`
+        // disables it everywhere.
+        let (kms, _) = Keymaps::from_config(Some(&[cfg("ctrl-n", "none")]));
+        assert_eq!(
+            kms.global.resolve(&ev(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            None
+        );
+        assert_eq!(
+            kms.input.resolve(&ev(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
+    fn unknown_command_warns_with_both_namespaces() {
+        let (_, warns) = Keymaps::from_config(Some(&[cfg("ctrl-y", "do_a_barrel_roll")]));
+        assert_eq!(warns.len(), 1, "{warns:?}");
+        assert!(warns[0].contains("unknown command"));
+        // The valid-command hint lists both global and input vocabularies.
+        assert!(warns[0].contains("toggle_reasoning"));
+        assert!(warns[0].contains("cursor_line_start"));
+    }
+
+    #[test]
+    fn parse_chord_sequence_forms() {
+        // Single chord → length 1.
+        assert_eq!(
+            parse_chord_sequence("ctrl-r"),
+            Some(vec![(KeyCode::Char('r'), KeyModifiers::CONTROL)])
+        );
+        // Multi-key emacs sequence → length 2.
+        assert_eq!(
+            parse_chord_sequence("ctrl-x ctrl-s"),
+            Some(vec![
+                (KeyCode::Char('x'), KeyModifiers::CONTROL),
+                (KeyCode::Char('s'), KeyModifiers::CONTROL),
+            ])
+        );
+        // The space KEY is the word `space`, so it isn't a separator.
+        assert_eq!(
+            parse_chord_sequence("ctrl-space"),
+            Some(vec![(KeyCode::Char(' '), KeyModifiers::CONTROL)])
+        );
+        // Empty / all-whitespace → None; a bad chord anywhere fails the whole.
+        assert_eq!(parse_chord_sequence("   "), None);
+        assert_eq!(parse_chord_sequence("ctrl-x boguskey"), None);
+    }
+
+    #[test]
+    fn config_stores_a_multi_key_sequence() {
+        // Sequence-native storage (the #234 runtime activates it in phase 4):
+        // a 2-chord binding lands in the map keyed on the full sequence, and
+        // does not disturb single-key resolution of its prefix.
+        let (kms, warns) = Keymaps::from_config(Some(&[cfg("ctrl-x ctrl-s", "toggle_reasoning")]));
+        assert!(warns.is_empty(), "{warns:?}");
+        let seq = vec![
+            (KeyCode::Char('x'), KeyModifiers::CONTROL),
+            (KeyCode::Char('s'), KeyModifiers::CONTROL),
+        ];
+        assert_eq!(kms.global.map.get(&seq), Some(&KeyAction::ToggleReasoning));
+        // Single Ctrl+X still resolves to its default (close_chat), unaffected.
+        assert_eq!(
+            kms.global.resolve(&ev(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            Some(KeyAction::CloseChat)
+        );
     }
 }

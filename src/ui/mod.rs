@@ -78,7 +78,7 @@ use crate::ui::chat_state::{ChatUiState, load_chat_ui_state, save_chat_ui_state}
 use crate::ui::colors::{c_agent, c_error, c_perm, c_tool};
 use crate::ui::events::{render_session, sanitize_output};
 use crate::ui::input::InputEditor;
-use crate::ui::keymap::{KeyAction, Keymap};
+use crate::ui::keymap::{KeyAction, Keymaps};
 use crate::ui::panel_render::{build_left_panel_info, build_panel_data};
 use crate::ui::renderer::{LineEntry, Renderer};
 use crate::ui::search_rewind::{
@@ -206,12 +206,15 @@ pub async fn run_interactive(
     // and a ring of the most recent tool actions for the [ACTIVITY]
     // ticker. Both feed `build_left_panel_info` each loop tick.
     let gitstat = crate::ui::gitstatus::spawn_poller(std::time::Duration::from_secs(3));
-    // Configurable global key bindings (VSCode-style): defaults layered
-    // with the user's `keybindings` config. Surface any parse warnings.
-    let (keymap, keymap_warnings) = Keymap::from_config(cfg.keybindings.as_deref());
+    // Configurable key bindings (VSCode-style): defaults layered with the
+    // user's `keybindings` config, covering BOTH the global command keys
+    // and the input-editor keys (dirge-xv9l). Surface any parse warnings.
+    let (keymaps, keymap_warnings) = Keymaps::from_config(cfg.keybindings.as_deref());
     for w in &keymap_warnings {
         eprintln!("warning: {w}");
     }
+    let keymap = keymaps.global;
+    input.set_keymap(keymaps.input);
     const TOOL_ACTIVITY_CAP: usize = 8;
     // Seed the editor's history from the session so Up/Down arrow
     // navigation and Ctrl+F search work across restarts.
