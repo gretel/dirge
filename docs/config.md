@@ -640,6 +640,7 @@ routes to the right one by its command name.
 | `close_chat` | `ctrl-x` | Close the active chat window |
 | `kill_subagent` | `ctrl-k` | Kill the focused subagent |
 | `drop_queue` | `alt-x` | Drop queued interjections (without cancelling the run) |
+| `cycle_prompt` | `shift-tab` | Cycle the active prompt layer to the next available prompt |
 
 ### Input-editor commands
 

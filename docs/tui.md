@@ -48,6 +48,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Esc-Esc (idle) | Open rewind picker (truncate history) |
 | Ctrl+O | Expand collapsed tool result |
 | Ctrl+R | Toggle reasoning visibility |
+| Shift+Tab | Cycle the active prompt layer to the next prompt (silent; status badge updates) |
 | PgUp/PgDn | Scroll chat history |
 | Ctrl+Home/End | Jump chat to top/bottom |
 | `! cmd` | Run shell command (visible, injected into chat) |
