@@ -89,6 +89,15 @@
             (= btn "left") (= btn "right") (= btn "middle"))
     btn))
 
+(defn- validate-app-name [app]
+  "Return app if it's a safe process/app name, nil otherwise. `focus`
+   splices this into `pgrep -i <app>` and the vision `--find-app <app>`
+   argument via /bin/sh -c, so anything outside [A-Za-z0-9._-] (spaces,
+   `;`, `|`, `$`, backticks, quotes…) could break out into the shell.
+   Reject those rather than escape — app names don't need them."
+  (when (and app (not (empty? app)) (peg/match '(* (some (set "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-")) -1) app))
+    app))
+
 # ── Vision ────────────────────────────────────────────────────────────
 # Pluggable vision architecture — one function, three backends.
 # Swap by changing the body of analyze-image; nothing else moves.
@@ -277,21 +286,23 @@
     (sh "sleep" "0.3")))
 
 (defn- focus-window [app]
-  (if (not= 0 (os/execute ["/bin/sh" "-c" (string "pgrep -i " app " >/dev/null 2>&1")]))
-    (string "app not running: " app)
-    (do
-      (var result nil)
-      (for i 0 12
-        (cycle-windows 1)
-        (sh "sleep" "0.5")
-        (let [path (take-screenshot)]
-          (when path
-            (let [script (string workspace-path "/plugins/computer_use_vision.py")
-                  answer (sh-capture (string "python3 " script " --path " path " --find-app " app " 2>/dev/null"))]
-              (when (and answer (string/find "yes" answer))
-                (set result (string "focused " app " after " (+ i 1) " cycles"))
-                (break))))))
-      (or result (string "could not confirm " app " after 12 cycles")))))
+  (if (not (validate-app-name app))
+    (string "INVALID APP NAME — blocked: " app)
+    (if (not= 0 (os/execute ["/bin/sh" "-c" (string "pgrep -i " app " >/dev/null 2>&1")]))
+      (string "app not running: " app)
+      (do
+        (var result nil)
+        (for i 0 12
+          (cycle-windows 1)
+          (sh "sleep" "0.5")
+          (let [path (take-screenshot)]
+            (when path
+              (let [script (string workspace-path "/plugins/computer_use_vision.py")
+                    answer (sh-capture (string "python3 " script " --path " path " --find-app " app " 2>/dev/null"))]
+                (when (and answer (string/find "yes" answer))
+                  (set result (string "focused " app " after " (+ i 1) " cycles"))
+                  (break))))))
+        (or result (string "could not confirm " app " after 12 cycles"))))))
 
 (defn- navigate-to-url [url]
   # Full pipeline: open URL, focus browser, find button, click it.
