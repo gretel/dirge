@@ -106,7 +106,11 @@ impl FailureTracker {
                 inner.last_emitted_at = 0;
                 return;
             }
-            Outcome::Error => {
+            // dirge-c7sd: Denied is split from Error at classification but
+            // not yet acted on here — it still extends the streak like an
+            // ordinary error so this change is behaviour-neutral. dirge-iwwq
+            // changes how Denied is weighted / surfaced in the checkpoint.
+            Outcome::Error | Outcome::Denied => {
                 inner.consecutive += 1;
                 inner.escalation += 1;
             }

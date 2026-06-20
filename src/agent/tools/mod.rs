@@ -157,6 +157,32 @@ pub enum ToolError {
     Msg(String),
 }
 
+/// Stable leading marker on every rule/user/non-interactive permission
+/// refusal produced by [`enforce`] / [`enforce_request`] / the human-ask
+/// path. The failure tracker ([`Outcome::Denied`]) and the critic
+/// transcript labeler key off this prefix to tell a *policy* refusal —
+/// which the model cannot fix by retrying — apart from a mechanical
+/// failure it can. dirge-c7sd: denials carry no typed identity by the
+/// time they reach those consumers (they arrive as a result string +
+/// `is_error` bool), so the message prefix IS the signal. Keep this and
+/// [`AUTO_DENIAL_PREFIX`] in sync with [`is_permission_denial`].
+pub const DENIAL_PREFIX: &str = "Permission denied";
+/// Leading marker on an `approval_provider` (LLM evaluator) auto-denial.
+/// Separate from [`DENIAL_PREFIX`] because the wording differs; both are
+/// recognized by [`is_permission_denial`].
+pub const AUTO_DENIAL_PREFIX: &str = "Auto-approval denied by approval_provider";
+
+/// True when a tool-result error text is a permission/approval denial: a
+/// policy refusal the model cannot resolve by retrying or rephrasing,
+/// only the user can (via `/allow` or a prompt). Single source of truth
+/// shared by the failure tracker and the critic so neither mistakes a
+/// guardrail for a mechanical failure to "try a different approach"
+/// around. Keyed on the stable prefixes the `enforce` layer emits.
+pub fn is_permission_denial(text: &str) -> bool {
+    let t = text.trim_start();
+    t.starts_with(DENIAL_PREFIX) || t.starts_with(AUTO_DENIAL_PREFIX)
+}
+
 impl From<io::Error> for ToolError {
     fn from(e: io::Error) -> Self {
         ToolError::Msg(e.to_string())
@@ -392,7 +418,7 @@ async fn handle_ask_inner(
                 .add_session_allowlist(tool.to_string(), &pattern);
             Ok(())
         }
-        _ => Err(ToolError::Msg("Permission denied by user".to_string())),
+        _ => Err(ToolError::Msg(format!("{DENIAL_PREFIX} by user"))),
     }
 }
 
@@ -436,9 +462,7 @@ async fn try_auto_approve(
         }
         Ok(ApprovalDecision::Deny(reason)) => {
             tracing::info!(target: "dirge::permission", tool, command, %reason, "auto-approval: DENY");
-            Some(Err(ToolError::Msg(format!(
-                "Auto-approval denied by approval_provider: {reason}"
-            ))))
+            Some(Err(ToolError::Msg(format!("{AUTO_DENIAL_PREFIX}: {reason}"))))
         }
         Err(e) => {
             tracing::warn!(target: "dirge::permission", error = %e, "approval_provider call failed; falling back to human prompt");
@@ -542,7 +566,7 @@ pub async fn enforce(
     use crate::permission::engine::types::Effect;
     match effect {
         Effect::Allow => Ok(resolved),
-        Effect::Deny => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
+        Effect::Deny => Err(ToolError::Msg(format!("{DENIAL_PREFIX}: {reason}"))),
         Effect::Ask => {
             // dirge-0g6i: optional LLM auto-approval before the human prompt.
             if let Some(outcome) = try_auto_approve(perm, tool, raw_scope, Vec::new()).await {
@@ -552,9 +576,9 @@ pub async fn enforce(
                 return Ok(resolved);
             }
             let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
+                return Err(ToolError::Msg(format!(
+                    "{DENIAL_PREFIX} (non-interactive mode)"
+                )));
             };
             handle_ask_inner(tx, perm, tool, raw_scope).await?;
             // Approved → clear the loop-guard counter so a repeated call
@@ -594,7 +618,7 @@ pub async fn enforce_request(
     };
     match effect {
         Effect::Allow => Ok(()),
-        Effect::Deny => Err(ToolError::Msg(format!("Permission denied: {reason}"))),
+        Effect::Deny => Err(ToolError::Msg(format!("{DENIAL_PREFIX}: {reason}"))),
         Effect::Ask => {
             // dirge-0g6i: optional LLM auto-approval. The evaluator sees a
             // per-claim danger summary (operation + in/out-of-project) so
@@ -608,9 +632,9 @@ pub async fn enforce_request(
                 return Ok(());
             }
             let Some(tx) = ask_tx else {
-                return Err(ToolError::Msg(
-                    "Permission denied (non-interactive mode)".to_string(),
-                ));
+                return Err(ToolError::Msg(format!(
+                    "{DENIAL_PREFIX} (non-interactive mode)"
+                )));
             };
             handle_ask_inner(tx, perm, &req.tool, &req.display_input).await?;
             // Approved → clear the loop-guard counter (see `enforce`).
@@ -697,6 +721,26 @@ mod tests {
         Action, OpSpec, PermissionConfig, RuleConfig, SecurityMode, checker::PermissionChecker,
     };
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn is_permission_denial_recognizes_every_enforce_denial_form() {
+        // Lock the contract: each message the enforce layer can emit on a
+        // refusal must be recognized, and ordinary tool errors must not be.
+        assert!(is_permission_denial("Permission denied: writes outside project"));
+        assert!(is_permission_denial("Permission denied by user"));
+        assert!(is_permission_denial("Permission denied (non-interactive mode)"));
+        assert!(is_permission_denial(
+            "Auto-approval denied by approval_provider: file is outside the project directory"
+        ));
+        // Leading whitespace (excerpt trimming) still matches.
+        assert!(is_permission_denial("  Permission denied: x"));
+        // Non-denials.
+        assert!(!is_permission_denial("old_string not found in file"));
+        assert!(!is_permission_denial("Command timed out after 120s"));
+        assert!(!is_permission_denial(
+            "error: the user lacks permission denied elsewhere in sentence"
+        ));
+    }
 
     /// Test helper: build a single op-based rule (tool-agnostic).
     fn rule(op: OpSpec, pattern: &str, effect: Action) -> RuleConfig {
