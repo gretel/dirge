@@ -1190,9 +1190,28 @@ impl InputEditor {
         if self.search_mode {
             return self.handle_key_inner(key);
         }
-        if matches!(self.keymap.resolve_lenient(&key), Some(InputAction::Undo)) {
+        let action = self.keymap.resolve_lenient(&key);
+        if matches!(action, Some(InputAction::Undo)) {
             self.undo();
             return None;
+        }
+        // History recall, wrap-aware line motion at a buffer edge, and
+        // entering reverse-i-search all REPLACE the buffer without being
+        // a user edit. Keep them off the undo stack so Ctrl+Z reverts
+        // real edits, not navigation, and end the current typing run.
+        if matches!(
+            action,
+            Some(
+                InputAction::HistoryPrev
+                    | InputAction::HistoryNext
+                    | InputAction::LineUp
+                    | InputAction::LineDown
+                    | InputAction::ReverseSearch
+            )
+        ) {
+            let submitted = self.handle_key_inner(key);
+            self.last_edit_kind = None;
+            return submitted;
         }
         // A plain non-whitespace character coalesces into the current
         // typing run; everything else (whitespace, paste, kill, motion)

@@ -1454,17 +1454,22 @@ impl Renderer {
             // append it with no separator. A predecessor that ends
             // without whitespace is a real line break (paragraph break,
             // blank line, or hard newline) and keeps its newline.
-            let start_content: String = match row_clean(start.0) {
+            let start_chars = row_clean(start.0);
+            let start_content: String = match &start_chars {
                 Some(chars) => {
                     let lo = start.1.min(chars.len());
                     chars[lo..].iter().collect()
                 }
                 None => String::new(),
             };
-            let mut prev_ended_ws = start_content
-                .chars()
-                .next_back()
-                .is_some_and(char::is_whitespace);
+            // Base the wrap-continuation test on the FULL row's last
+            // visible char, not just the selected suffix, so a selection
+            // that begins at the very end of a wrapped row still joins
+            // (the suffix would be empty and lose the trailing space).
+            let mut prev_ended_ws = start_chars
+                .as_ref()
+                .and_then(|chars| chars.last())
+                .is_some_and(|c| c.is_whitespace());
             result.push_str(&start_content);
 
             for i in (start.0 + 1)..end.0 {

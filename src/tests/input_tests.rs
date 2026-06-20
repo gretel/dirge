@@ -1432,6 +1432,24 @@ fn submit_clears_undo_history() {
 }
 
 #[test]
+fn history_navigation_is_not_undoable() {
+    // Recalling history (Up) and restoring the draft (Down) replace the
+    // buffer but aren't edits — Ctrl+Z must revert the actual typing,
+    // not the navigation.
+    let mut editor = InputEditor::new();
+    type_str(&mut editor, "old");
+    editor.handle_key(press(KeyCode::Enter));
+    type_str(&mut editor, "draft");
+    editor.handle_key(press(KeyCode::Up)); // recalls "old"
+    assert_eq!(editor.buffer.as_str(), "old");
+    editor.handle_key(press(KeyCode::Down)); // back to draft
+    assert_eq!(editor.buffer.as_str(), "draft");
+    // One undo removes the typed word, not the navigation.
+    editor.handle_key(ctrl(KeyCode::Char('z')));
+    assert_eq!(editor.buffer.as_str(), "");
+}
+
+#[test]
 fn undo_then_type_starts_fresh_group() {
     let mut editor = InputEditor::new();
     type_str(&mut editor, "foo");
