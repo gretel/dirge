@@ -2928,7 +2928,20 @@ pub async fn run_interactive(
                         );
                     }
                     AgentEvent::UserMessage { content } => {
-                        run_handlers::notices::handle_user_message(&mut renderer, &content)?;
+                        // Finalize any in-flight assistant response and drop the
+                        // stream anchor first — a critic/verifier/todo nudge
+                        // re-enters here without a Done/ToolCall to reset it, so
+                        // otherwise the next turn's replace_from overwrites the
+                        // nudge and it vanishes on screen (dirge-m10x).
+                        run_handlers::notices::handle_user_message_after_response(
+                            &mut renderer,
+                            &content,
+                            &mut ui.response_buf,
+                            &mut ui.response_start_line,
+                            &mut ui.reasoning_buf,
+                            &mut ui.reasoning_start_line,
+                            &mut ui.agent_line_started,
+                        )?;
                         // session.add_message handled at input time.
                     }
                     AgentEvent::EscalationActivated { provider, reason } => {
