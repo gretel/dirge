@@ -664,6 +664,7 @@ routes to the right one by its command name.
 | `reverse_search` | `ctrl-f` | Reverse-i-search over history |
 | `line_up` | `up` | Up one line (then history) |
 | `line_down` | `down` | Down one line (then history) |
+| `undo` | `ctrl-z` | Undo the last edit |
 
 Some chords serve both contexts (e.g. `ctrl-k` is `kill_subagent` *and*
 `kill_to_line_end`, `ctrl-n` is `next_chat` *and* `history_next`). The

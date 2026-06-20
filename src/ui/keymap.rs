@@ -432,6 +432,8 @@ pub enum InputAction {
     LineUp,
     /// Down: wrap-aware line motion, then history at the bottom row.
     LineDown,
+    /// Undo the last edit to the input buffer (dirge-7yea).
+    Undo,
 }
 
 impl Command for InputAction {
@@ -545,6 +547,11 @@ impl Command for InputAction {
             InputAction::LineDown,
             "line_down",
             &[(KeyCode::Down, KeyModifiers::NONE)],
+        ),
+        (
+            InputAction::Undo,
+            "undo",
+            &[(KeyCode::Char('z'), KeyModifiers::CONTROL)],
         ),
     ];
 }

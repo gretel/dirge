@@ -588,6 +588,81 @@ fn selected_text_strips_ansi_escapes() {
     assert_eq!(r.selected_text(), Some("red world".to_string()));
 }
 
+/// dirge-el8o: prose the renderer soft-wrapped across several display
+/// rows must copy back as ONE line. `word_wrap` keeps the breaking
+/// space on the prior row (chunks look like `["the quick ", "brown
+/// fox ", "jumps"]`), so a continuation row — one whose predecessor
+/// ends in whitespace — joins with no separator instead of a newline.
+#[test]
+fn selected_text_joins_soft_wrapped_rows() {
+    let mut r = fresh_with_text(&["the quick ", "brown fox ", "jumps"]);
+    r.selection_active = true;
+    r.selection_start = Some((0, 0));
+    r.selection_end = Some((2, 5));
+    assert_eq!(
+        r.selected_text(),
+        Some("the quick brown fox jumps".to_string())
+    );
+}
+
+/// A real line break — a row that does NOT end in whitespace — keeps
+/// its newline. Paragraph structure (and the blank line between
+/// paragraphs) survives the copy.
+#[test]
+fn selected_text_keeps_hard_newlines_and_blanks() {
+    let mut r = fresh_with_text(&["para one ", "wraps here", "", "next para"]);
+    r.selection_active = true;
+    r.selection_start = Some((0, 0));
+    r.selection_end = Some((3, 9));
+    assert_eq!(
+        r.selected_text(),
+        Some("para one wraps here\n\nnext para".to_string())
+    );
+}
+
+/// End-to-end: a paragraph wrapped by the REAL markdown path
+/// (`markdown_to_styled` → `word_wrap`) copies back as the original
+/// prose. Guards the join against changes to how wrapping splits.
+#[test]
+fn selected_text_joins_real_wrapped_markdown() {
+    let prose = "the quick brown fox jumps over the lazy dog again and again";
+    let mut styled = crate::ui::markdown::markdown_to_styled(prose, 20, Color::White);
+    // Drop any trailing blank row the renderer may append after the
+    // paragraph so the selection ends on real content.
+    while styled
+        .last()
+        .is_some_and(|e| crate::ui::ansi::strip_ansi(&e.text).trim().is_empty())
+    {
+        styled.pop();
+    }
+    assert!(styled.len() > 1, "prose should wrap to multiple rows");
+    let last = styled.len() - 1;
+    let last_len = crate::ui::ansi::strip_ansi(&styled[last].text)
+        .chars()
+        .count();
+    let mut r = Renderer::new().unwrap();
+    r.buffer.clear();
+    for e in styled {
+        r.buffer.push(e);
+    }
+    r.selection_active = true;
+    r.selection_start = Some((0, 0));
+    r.selection_end = Some((last, last_len));
+    assert_eq!(r.selected_text(), Some(prose.to_string()));
+}
+
+/// The join decision is made per-boundary: a partial first row still
+/// counts as ending in whitespace, and the head of the final row is
+/// appended without a leading newline when its predecessor wrapped.
+#[test]
+fn selected_text_join_respects_partial_rows() {
+    let mut r = fresh_with_text(&["xxthe quick ", "brown foxyy"]);
+    r.selection_active = true;
+    r.selection_start = Some((0, 2)); // skip "xx"
+    r.selection_end = Some((1, 9)); // up to "brown fox"
+    assert_eq!(r.selected_text(), Some("the quick brown fox".to_string()));
+}
+
 /// `buffer_pos_at` clamps char_col to the line's length so dragging
 /// past the right edge anchors at end-of-line rather than
 /// silently extending past visible content.

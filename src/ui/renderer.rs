@@ -1447,18 +1447,41 @@ impl Renderer {
                 }
             }
         } else {
-            if let Some(chars) = row_clean(start.0) {
-                let lo = start.1.min(chars.len());
-                result.extend(&chars[lo..]);
-            }
-            for i in (start.0 + 1)..end.0 {
-                result.push('\n');
-                if let Some(chars) = row_clean(i) {
-                    let s: String = chars.into_iter().collect();
-                    result.push_str(&s);
+            // Join rows the renderer soft-wrapped back into one line so
+            // prose copies as a single line (dirge-el8o). `word_wrap`
+            // keeps the breaking space on the PRIOR row, so a row whose
+            // predecessor ends in whitespace is a wrap continuation —
+            // append it with no separator. A predecessor that ends
+            // without whitespace is a real line break (paragraph break,
+            // blank line, or hard newline) and keeps its newline.
+            let start_content: String = match row_clean(start.0) {
+                Some(chars) => {
+                    let lo = start.1.min(chars.len());
+                    chars[lo..].iter().collect()
                 }
+                None => String::new(),
+            };
+            let mut prev_ended_ws = start_content
+                .chars()
+                .next_back()
+                .is_some_and(char::is_whitespace);
+            result.push_str(&start_content);
+
+            for i in (start.0 + 1)..end.0 {
+                let content: String = match row_clean(i) {
+                    Some(chars) => chars.into_iter().collect(),
+                    None => String::new(),
+                };
+                if !prev_ended_ws {
+                    result.push('\n');
+                }
+                prev_ended_ws = content.chars().next_back().is_some_and(char::is_whitespace);
+                result.push_str(&content);
             }
-            result.push('\n');
+
+            if !prev_ended_ws {
+                result.push('\n');
+            }
             if let Some(chars) = row_clean(end.0) {
                 let hi = end.1.min(chars.len());
                 result.extend(&chars[..hi]);

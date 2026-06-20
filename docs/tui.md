@@ -26,6 +26,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Meta+D | Delete word after cursor |
 | Ctrl+Y | Yank (paste) last kill |
 | Meta+Y | Yank-pop (cycle kill ring after yank) |
+| Ctrl+Z | Undo the last edit (typing is grouped by word; paste/kill undo as one step) |
 | Ctrl+N / Down | History next (multi-line: next logical line, history at boundary) |
 | Ctrl+P / Up | History previous (multi-line: previous logical line, history at boundary) |
 | Ctrl+F | Reverse-i-search through history (bash-style): type to narrow, Ctrl+F to cycle, Enter to accept, Esc to cancel |

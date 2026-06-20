@@ -26,6 +26,35 @@ struct YankState {
     len: usize,
 }
 
+/// Max undo snapshots retained. Old entries drop off the front once
+/// exceeded — a long editing session can't grow this unboundedly.
+const UNDO_MAX: usize = 200;
+
+/// Classifies the edit that produced a buffer change so consecutive
+/// runs of typing collapse into one undo step while discrete edits
+/// (paste, delete, kill) each get their own (dirge-7yea).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EditKind {
+    /// Inserting a non-whitespace character — coalesces with a prior
+    /// `Insert` so a typed word is undone in one step.
+    Insert,
+    /// Inserting a whitespace character — joins the current word's undo
+    /// step but closes it, so the next word starts fresh. Undo then
+    /// removes a whole word (plus its trailing space) at a time.
+    InsertBoundary,
+    /// Anything else that mutated the buffer (paste, backspace, kill,
+    /// yank, newline, …) — always its own undo step.
+    Other,
+}
+
+/// A restorable snapshot of the editable state, captured BEFORE an
+/// edit. Cursor is restored to where it sat before the edit.
+struct UndoSnapshot {
+    buffer: CompactString,
+    cursor: usize,
+    pastes: Vec<Option<CompactString>>,
+}
+
 fn prev_char_boundary(s: &str, idx: usize) -> usize {
     let mut i = idx.saturating_sub(1);
     while i > 0 && !s.is_char_boundary(i) {
@@ -261,6 +290,13 @@ pub struct InputEditor {
     /// defaults reproduce the historical text-editing keys; config/plugin
     /// overrides layer on in later phases (dirge-8fkp).
     keymap: InputKeymap,
+    /// Undo history: snapshots captured before each edit, newest last
+    /// (dirge-7yea). Ctrl+Z pops and restores.
+    undo_stack: Vec<UndoSnapshot>,
+    /// Kind of the most recent recorded edit, for coalescing typing
+    /// runs. `None` after a non-edit key, an undo, or a submit so the
+    /// next edit always starts a fresh undo group.
+    last_edit_kind: Option<EditKind>,
 }
 
 /// Find the marker block `\x01<digits>\x01` containing or starting at
@@ -419,6 +455,8 @@ impl InputEditor {
             search_match_idx: None,
             search_draft: None,
             keymap: InputKeymap::defaults(),
+            undo_stack: Vec::new(),
+            last_edit_kind: None,
         }
     }
 
@@ -458,9 +496,71 @@ impl InputEditor {
         self.yank_state = None;
         self.history_pos = None;
         self.history_draft = None;
+        // /fork rewrites the editor wholesale — the prior buffer's
+        // undo history no longer applies to this new draft.
+        self.clear_undo();
+    }
+
+    /// Snapshot the editable state before an edit. `kind == Insert`
+    /// coalesces with a preceding `Insert` so a typed word collapses
+    /// into a single undo step; every other kind starts a new step.
+    fn record_undo(
+        &mut self,
+        buffer: CompactString,
+        cursor: usize,
+        pastes: Vec<Option<CompactString>>,
+        kind: EditKind,
+    ) {
+        let coalesce = matches!(kind, EditKind::Insert | EditKind::InsertBoundary)
+            && self.last_edit_kind == Some(EditKind::Insert)
+            && !self.undo_stack.is_empty();
+        if !coalesce {
+            self.undo_stack.push(UndoSnapshot {
+                buffer,
+                cursor,
+                pastes,
+            });
+            if self.undo_stack.len() > UNDO_MAX {
+                self.undo_stack.remove(0);
+            }
+        }
+        // A whitespace insert (or any non-Insert edit) closes the
+        // current run so the next character starts a fresh undo group.
+        self.last_edit_kind = match kind {
+            EditKind::Insert => Some(EditKind::Insert),
+            EditKind::InsertBoundary | EditKind::Other => None,
+        };
+    }
+
+    /// Restore the most recent pre-edit snapshot. No-op when nothing
+    /// has been edited since the last submit / fork.
+    fn undo(&mut self) {
+        if let Some(snap) = self.undo_stack.pop() {
+            self.buffer = snap.buffer;
+            self.cursor = snap.cursor.min(self.buffer.len());
+            self.pastes = snap.pastes;
+            self.last_edit_kind = None;
+            self.history_pos = None;
+            self.reset_kill_accumulation();
+        }
+    }
+
+    fn clear_undo(&mut self) {
+        self.undo_stack.clear();
+        self.last_edit_kind = None;
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        let pre_buffer = self.buffer.clone();
+        let pre_cursor = self.cursor;
+        let pre_pastes = self.pastes.clone();
+        self.handle_paste_inner(text);
+        if self.buffer != pre_buffer || self.pastes != pre_pastes {
+            self.record_undo(pre_buffer, pre_cursor, pre_pastes, EditKind::Other);
+        }
+    }
+
+    fn handle_paste_inner(&mut self, text: &str) {
         // The file picker (`@query`) maintains its own filter state. A paste
         // landing here would write marker bytes into the buffer that the
         // picker doesn't know about, leaving a stale/corrupt query. Easiest
@@ -1072,10 +1172,67 @@ impl InputEditor {
                 self.history_down();
                 None
             }
+            // Normally intercepted by `handle_key` before dispatch (so it
+            // doesn't record itself as an edit); handled here too for
+            // exhaustiveness and any direct-dispatch path.
+            InputAction::Undo => {
+                self.undo();
+                None
+            }
         }
     }
 
+    /// Public entry: dispatches the key, then maintains undo history
+    /// around the edit (dirge-7yea). Undo (Ctrl+Z) is handled here so
+    /// it can't record itself; reverse-i-search is excluded entirely
+    /// (its buffer mirrors a transient history match, not an edit).
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<CompactString> {
+        if self.search_mode {
+            return self.handle_key_inner(key);
+        }
+        if matches!(self.keymap.resolve_lenient(&key), Some(InputAction::Undo)) {
+            self.undo();
+            return None;
+        }
+        // A plain non-whitespace character coalesces into the current
+        // typing run; everything else (whitespace, paste, kill, motion)
+        // is its own undo step.
+        let kind = match key.code {
+            KeyCode::Char(c)
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if c.is_whitespace() {
+                    EditKind::InsertBoundary
+                } else {
+                    EditKind::Insert
+                }
+            }
+            _ => EditKind::Other,
+        };
+        let pre_buffer = self.buffer.clone();
+        let pre_cursor = self.cursor;
+        let pre_pastes = self.pastes.clone();
+        let submitted = self.handle_key_inner(key);
+        if self.search_mode {
+            // The key just entered reverse-i-search; the buffer now
+            // mirrors a history match, so leave the undo stack alone.
+            return submitted;
+        }
+        if submitted.is_some() {
+            // A submission resets the editor — prior edits aren't undoable.
+            self.clear_undo();
+        } else if self.buffer != pre_buffer || self.pastes != pre_pastes {
+            self.record_undo(pre_buffer, pre_cursor, pre_pastes, kind);
+        } else {
+            // A non-editing key ends the current typing run so the next
+            // character starts a fresh undo group.
+            self.last_edit_kind = None;
+        }
+        submitted
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) -> Option<CompactString> {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let has_shift = key.modifiers.contains(KeyModifiers::SHIFT);
