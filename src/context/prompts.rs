@@ -269,6 +269,22 @@ fn copy_embedded(dest: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pick the next prompt name in a cycle. `sorted` is the caller-sorted list of
+/// available prompt names; `current` is the active prompt name, or `None` for
+/// the base layer. Wraps past the end; an unknown or missing `current` starts
+/// from the head. Returns `None` only when there are no prompts to cycle.
+pub fn next_prompt<'a>(current: Option<&str>, sorted: &'a [String]) -> Option<&'a str> {
+    if sorted.is_empty() {
+        return None;
+    }
+    let len = sorted.len();
+    let i = current
+        .and_then(|c| sorted.iter().position(|n| n.as_str() == c))
+        .map(|found| (found + 1) % len)
+        .unwrap_or(0);
+    Some(sorted[i].as_str())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -396,5 +412,30 @@ body
 ";
         let p = parse_frontmatter(raw);
         assert_eq!(p.deny_tools, vec!["edit", "write", "bash"]);
+    }
+
+    #[test]
+    fn next_prompt_starts_at_head_from_base() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(next_prompt(None, &names), Some("a"));
+    }
+
+    #[test]
+    fn next_prompt_advances_then_wraps() {
+        let names = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(next_prompt(Some("a"), &names), Some("b"));
+        assert_eq!(next_prompt(Some("b"), &names), Some("c"));
+        assert_eq!(next_prompt(Some("c"), &names), Some("a"));
+    }
+
+    #[test]
+    fn next_prompt_unknown_current_starts_at_head() {
+        let names = vec!["a".to_string(), "b".to_string()];
+        assert_eq!(next_prompt(Some("zzz"), &names), Some("a"));
+    }
+
+    #[test]
+    fn next_prompt_empty_is_none() {
+        assert_eq!(next_prompt(None, &[]), None);
     }
 }

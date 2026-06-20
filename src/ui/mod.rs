@@ -1769,6 +1769,69 @@ pub async fn run_interactive(
                             continue;
                         }
 
+                        // Shift+Tab cycles the active prompt layer to the next
+                        // available prompt. Silent: updates the status-bar
+                        // badge without writing to the chat log (unlike the
+                        // `/prompt <name>` slash command, which announces the
+                        // switch). Mirrors that command's layer swap + agent
+                        // rebuild so the new prompt takes effect on the next
+                        // turn.
+                        if action == Some(KeyAction::CyclePrompt) {
+                            let names = {
+                                let mut v: Vec<String> =
+                                    context.prompts.keys().cloned().collect();
+                                v.sort();
+                                v
+                            };
+                            let Some(name) = crate::context::prompts::next_prompt(
+                                context.current_prompt_name.as_deref(),
+                                &names,
+                            ) else {
+                                continue;
+                            };
+                            // No-op when cycling lands on the active prompt
+                            // (e.g. only one prompt configured): skip the wasted
+                            // agent rebuild.
+                            if context.current_prompt_name.as_deref() == Some(name) {
+                                continue;
+                            }
+                            let p = context
+                                .prompts
+                                .get(name)
+                                .expect("name drawn from prompts.keys()");
+                            let body = p.body.clone();
+                            let deny = p.deny_tools.clone();
+                            context.set_prompt_layer(Some(name.to_string()), Some(body), deny);
+                            crate::permission::apply_prompt_deny(
+                                &permission,
+                                &context.current_prompt_deny_tools,
+                            );
+                            session.current_prompt_name = Some(name.to_string());
+                            let model = client.completion_model(session.model.to_string());
+                            agent = crate::provider::build_agent(
+                                model,
+                                cli,
+                                cfg,
+                                context,
+                                permission.clone(),
+                                ask_tx.clone(),
+                                question_tx.clone(),
+                                plan_tx.clone(),
+                                bg_store.clone(),
+                                #[cfg(feature = "lsp")]
+                                lsp_manager.clone(),
+                                sandbox.clone(),
+                                #[cfg(feature = "mcp")]
+                                mcp_manager.as_ref(),
+                                #[cfg(feature = "semantic")]
+                                semantic_manager,
+                                Some(session.id.to_string()),
+                            )
+                            .await;
+                            renderer.request_repaint();
+                            continue;
+                        }
+
                         let ctrl_p = action == Some(KeyAction::PrevChat);
                         let ctrl_x = action == Some(KeyAction::CloseChat);
                         if matches!(

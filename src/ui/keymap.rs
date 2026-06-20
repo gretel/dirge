@@ -78,6 +78,9 @@ pub enum KeyAction {
     /// running agent (dirge-e59d). Distinct from Ctrl+C, which cancels the
     /// run AND clears the queue.
     DropQueue,
+    /// Cycle the active prompt layer to the next available prompt. Silent —
+    /// updates the status-bar badge without writing to the chat log.
+    CyclePrompt,
 }
 
 impl Command for KeyAction {
@@ -142,6 +145,14 @@ impl Command for KeyAction {
             "drop_queue",
             &[(KeyCode::Char('x'), KeyModifiers::ALT)],
         ),
+        (
+            // Shift+Tab arrives from the terminal as the BackTab sequence;
+            // see `normalize_chord`. Tab itself stays intrinsic to the
+            // input editor (completion), so this is a distinct key.
+            KeyAction::CyclePrompt,
+            "cycle_prompt",
+            &[(KeyCode::Tab, KeyModifiers::SHIFT)],
+        ),
     ];
 }
 
@@ -164,6 +175,19 @@ impl<A: Command> Default for Bindings<A> {
     }
 }
 
+/// Canonicalize a raw key chord for lookup. Shift+Tab is delivered by the
+/// terminal as the BackTab sequence (crossterm `KeyCode::BackTab`), with or
+/// without SHIFT depending on the terminal, while config bindings spell it
+/// `"shift-tab"` / `"backtab"` → `(Tab, SHIFT)`. Fold the keystroke onto that
+/// chord so a binding matches regardless of how it is reported.
+fn normalize_chord(code: KeyCode, modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    if code == KeyCode::BackTab {
+        (KeyCode::Tab, KeyModifiers::SHIFT)
+    } else {
+        (code, modifiers)
+    }
+}
+
 impl<A: Command> Bindings<A> {
     /// The built-in keymap (no config applied).
     pub fn defaults() -> Self {
@@ -179,7 +203,8 @@ impl<A: Command> Bindings<A> {
     /// The action bound to `key` (as a single-key chord), matching modifiers
     /// exactly. Used by the global keymap.
     pub fn resolve(&self, key: &KeyEvent) -> Option<A> {
-        self.map.get(&[(key.code, key.modifiers)][..]).copied()
+        let chord = normalize_chord(key.code, key.modifiers);
+        self.map.get(&[chord][..]).copied()
     }
 
     /// Like [`resolve`], but on a miss retries with Shift dropped. The input
@@ -590,6 +615,12 @@ pub fn parse_chord(spec: &str) -> Option<(KeyCode, KeyModifiers)> {
         "enter" | "return" => KeyCode::Enter,
         "esc" | "escape" => KeyCode::Esc,
         "tab" => KeyCode::Tab,
+        // "backtab" is how terminals deliver Shift+Tab; canonicalize it to
+        // the same chord as "shift-tab" (Tab + SHIFT).
+        "backtab" => {
+            modifiers |= KeyModifiers::SHIFT;
+            KeyCode::Tab
+        }
         "backspace" | "bs" => KeyCode::Backspace,
         "delete" | "del" => KeyCode::Delete,
         "insert" | "ins" => KeyCode::Insert,
@@ -747,6 +778,62 @@ mod tests {
         assert_eq!(
             parse_chord("option-f"),
             Some((KeyCode::Char('f'), KeyModifiers::ALT))
+        );
+    }
+
+    #[test]
+    fn shift_tab_and_backtab_parse_to_tab_shift() {
+        // Terminals deliver Shift+Tab as the BackTab sequence; both spellings
+        // canonicalize to the same chord so a config binding matches either.
+        assert_eq!(
+            parse_chord("shift-tab"),
+            Some((KeyCode::Tab, KeyModifiers::SHIFT))
+        );
+        assert_eq!(
+            parse_chord("backtab"),
+            Some((KeyCode::Tab, KeyModifiers::SHIFT))
+        );
+    }
+
+    #[test]
+    fn backtab_keyevent_resolves_a_shift_tab_binding() {
+        // A real Shift+Tab keystroke arrives as KeyCode::BackTab (with or
+        // without SHIFT, depending on the terminal); a "shift-tab" config
+        // binding must match it.
+        let (km, warns) = global_from(&[cfg("shift-tab", "toggle_reasoning")]);
+        assert!(warns.is_empty(), "{warns:?}");
+        assert_eq!(
+            km.resolve(&ev(KeyCode::BackTab, KeyModifiers::NONE)),
+            Some(KeyAction::ToggleReasoning)
+        );
+        assert_eq!(
+            km.resolve(&ev(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(KeyAction::ToggleReasoning)
+        );
+    }
+
+    #[test]
+    fn cycle_prompt_command_resolves() {
+        assert_eq!(
+            KeyAction::from_command("cycle_prompt"),
+            Some(KeyAction::CyclePrompt)
+        );
+        assert_eq!(
+            KeyAction::from_command("cycle-prompt"),
+            Some(KeyAction::CyclePrompt)
+        );
+    }
+
+    #[test]
+    fn cycle_prompt_is_the_default_shift_tab_binding() {
+        let km = Keymap::defaults();
+        assert_eq!(
+            km.resolve(&ev(KeyCode::BackTab, KeyModifiers::NONE)),
+            Some(KeyAction::CyclePrompt)
+        );
+        assert_eq!(
+            km.resolve(&ev(KeyCode::Tab, KeyModifiers::SHIFT)),
+            Some(KeyAction::CyclePrompt)
         );
     }
 
