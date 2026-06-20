@@ -227,9 +227,15 @@ async fn poll_finalization_follow_up(
         *critic_done = true;
         if let Some(critic) = &config.critic_fn {
             let transcript = build_critic_transcript(new_messages);
+            // dirge-6q3w: hand the critic the run's compile/lint/test signal
+            // (read-only, doesn't spend the cheap verifier's one-shot nudge)
+            // so it can be pickier about unverified code changes. `None` when
+            // no verifier gate is configured → critic behaves as before.
+            let verification = config.verifier.as_ref().map(|v| v.status());
             // dirge-bedj: judge within the agent's own system prompt so the
             // critic never demands a forbidden action.
-            let msgs = super::critic::run_critic(critic, system_prompt, &transcript).await;
+            let msgs =
+                super::critic::run_critic(critic, system_prompt, &transcript, verification).await;
             if !msgs.is_empty() {
                 return (msgs, FollowUpSource::Critic);
             }
@@ -247,7 +253,13 @@ async fn poll_finalization_follow_up(
         && let Some(judge) = &config.critic_fn
     {
         let transcript = build_critic_transcript(new_messages);
-        let msgs = super::goal::run_goal_gate(judge, goal, system_prompt, &transcript).await;
+        // dirge-6q3w: same read-only verification signal as the critic, but
+        // the goal judge treats it as a SOFT advisory (see
+        // `goal_verification_note`) so a non-testable task can't trap the
+        // bounded goal loop.
+        let verification = config.verifier.as_ref().map(|v| v.status());
+        let msgs =
+            super::goal::run_goal_gate(judge, goal, system_prompt, &transcript, verification).await;
         if !msgs.is_empty() {
             *goal_reacts += 1;
             return (msgs, FollowUpSource::Goal);
