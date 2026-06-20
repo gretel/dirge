@@ -1164,24 +1164,27 @@ async fn main() -> anyhow::Result<()> {
     // SandboxExecRequest through this channel to the tokio runtime.
     // The drainer builds the safe command, SSHs into the microVM,
     // and returns the result.
-    let (sandbox_exec_tx, mut sandbox_exec_rx) =
-        tokio::sync::mpsc::unbounded_channel::<plugin::worker::SandboxExecRequest>();
-    plugin::worker::install_sandbox_exec_tx(sandbox_exec_tx);
-    let sandbox_for_exec = sandbox.clone();
-    tokio::spawn(async move {
-        use plugin::worker::{SandboxExecOutput, build_safe_command};
-        while let Some(req) = sandbox_exec_rx.recv().await {
-            let command = build_safe_command(&req.action);
-            let result = match sandbox_for_exec.exec(&command, 30).await {
-                Ok(output) => Ok(SandboxExecOutput {
-                    exit_code: output.exit_code,
-                    merged: output.merged,
-                }),
-                Err(e) => Err(format!("{e}")),
-            };
-            let _ = req.reply.send(result);
-        }
-    });
+    #[cfg(feature = "plugin")]
+    {
+        let (sandbox_exec_tx, mut sandbox_exec_rx) =
+            tokio::sync::mpsc::unbounded_channel::<plugin::worker::SandboxExecRequest>();
+        plugin::worker::install_sandbox_exec_tx(sandbox_exec_tx);
+        let sandbox_for_exec = sandbox.clone();
+        tokio::spawn(async move {
+            use plugin::worker::{SandboxExecOutput, build_safe_command};
+            while let Some(req) = sandbox_exec_rx.recv().await {
+                let command = build_safe_command(&req.action);
+                let result = match sandbox_for_exec.exec(&command, 30).await {
+                    Ok(output) => Ok(SandboxExecOutput {
+                        exit_code: output.exit_code,
+                        merged: output.merged,
+                    }),
+                    Err(e) => Err(format!("{e}")),
+                };
+                let _ = req.reply.send(result);
+            }
+        });
+    }
     let Channels {
         permission,
         ask_tx,
