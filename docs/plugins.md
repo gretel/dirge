@@ -225,7 +225,7 @@ or more chords separated by whitespace for a sequence. Modifiers: `ctrl`,
 user can still override. `register-shortcut` handlers dispatch after the
 built-in global commands but before the text input.
 
-Reserved keys neither form can override: Ctrl+C, Ctrl+D, Esc (the panic
+Reserved keys neither form can override: Ctrl+C, Esc (the panic
 gesture), and the search / rewind picker keys. Modifier matching is exact —
 `ctrl-x` and `ctrl-shift-x` are distinct bindings. Bad specs are dropped
 with a `tracing::warn`.

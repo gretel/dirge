@@ -22,6 +22,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Ctrl+K | Kill to end of line |
 | Ctrl+U | Kill to start of line |
 | Ctrl+W | Kill word before cursor |
+| Ctrl+D | Delete the character at the cursor (forward; no-op at end of line) |
 | Meta+Backspace | Delete word before cursor |
 | Meta+D | Delete word after cursor |
 | Ctrl+Y | Yank (paste) last kill |
@@ -39,7 +40,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 
 | Key | Action |
 |-----|--------|
-| Ctrl+C / Ctrl+D / Esc | Interrupt running agent (also clears queued interjections) |
+| Ctrl+C / Esc | Interrupt running agent (also clears queued interjections) |
 | Type while running | Queues your message; runs after the current turn finishes. The runner also stops at the next tool-result boundary so the message is picked up quickly instead of waiting for the whole multi-turn run. Status line shows `q:N` for pending count. |
 | Alt+X | Drop all queued interjections (without cancelling the running agent) |
 | Ctrl+K | Kill subagent on focused chat tab |
