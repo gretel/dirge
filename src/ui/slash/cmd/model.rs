@@ -1,15 +1,60 @@
 //! /model, /reasoning handlers.
 
+use std::collections::HashMap;
+
 #[allow(unused_imports)]
 use crate::sync_util::LockExt;
 use compact_str::CompactString;
 
-use crate::ui::slash::{SlashCtx, c_agent, c_error};
+use crate::config::ProviderEntry;
+use crate::ui::slash::{SlashCtx, c_agent, c_error, c_result};
+
+/// Build the sorted list of models the config pins, one per provider that
+/// sets a `model`. Each row is `(model, provider-alias, is_active)`, sorted
+/// by model then alias for stable output. `current` is the active session
+/// model, used to flag the selected row. (issue #492 — `/model` listed only
+/// the current model with nothing to switch to.)
+fn configured_models(
+    providers: &HashMap<String, ProviderEntry>,
+    current: &str,
+) -> Vec<(String, String, bool)> {
+    let mut rows: Vec<(String, String, bool)> = providers
+        .iter()
+        .filter_map(|(alias, entry)| {
+            entry
+                .model
+                .as_ref()
+                .map(|m| (m.clone(), alias.clone(), m == current))
+        })
+        .collect();
+    rows.sort();
+    rows
+}
 
 pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
     if parts.len() < 2 {
         ctx.renderer
             .write_line(&format!("current model: {}", ctx.session.model), c_agent())?;
+
+        // List the models pinned across the configured providers so there's
+        // something to switch to, marking the active one (issue #492).
+        let providers = ctx.cfg.providers_map();
+        let rows = configured_models(&providers, ctx.session.model.as_str());
+        if rows.is_empty() {
+            ctx.renderer.write_line(
+                "no models pinned in `providers` config — /model <id> switches to any model your provider supports",
+                c_result(),
+            )?;
+        } else {
+            ctx.renderer.write_line("configured models:", c_agent())?;
+            for (model, alias, is_active) in &rows {
+                let marker = if *is_active { "* " } else { "  " };
+                ctx.renderer
+                    .write_line(&format!("{marker}{model}  ·  {alias}"), c_result())?;
+            }
+            ctx.renderer
+                .write_line("usage: /model <id> to switch", c_agent())?;
+        }
     } else {
         let new_model = CompactString::new(parts[1].trim());
         let model = ctx.client.completion_model(new_model.to_string());
@@ -68,4 +113,60 @@ pub(crate) async fn cmd_reasoning(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> 
         c_agent(),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(model: Option<&str>) -> ProviderEntry {
+        ProviderEntry {
+            model: model.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lists_pinned_models_sorted_and_flags_active() {
+        let providers = HashMap::from([
+            (
+                "openrouter".to_string(),
+                entry(Some("deepseek/deepseek-v4")),
+            ),
+            ("anthropic".to_string(), entry(Some("claude-opus-4"))),
+            // No model pinned → excluded from the list.
+            ("local-vllm".to_string(), entry(None)),
+        ]);
+        let rows = configured_models(&providers, "claude-opus-4");
+        assert_eq!(
+            rows,
+            vec![
+                ("claude-opus-4".to_string(), "anthropic".to_string(), true),
+                (
+                    "deepseek/deepseek-v4".to_string(),
+                    "openrouter".to_string(),
+                    false,
+                ),
+            ],
+            "sorted by model; the active one is flagged; model-less providers dropped",
+        );
+    }
+
+    #[test]
+    fn empty_when_no_providers_pin_a_model() {
+        let providers = HashMap::from([("local-vllm".to_string(), entry(None))]);
+        assert!(configured_models(&providers, "anything").is_empty());
+        assert!(configured_models(&HashMap::new(), "anything").is_empty());
+    }
+
+    #[test]
+    fn same_model_under_two_aliases_flags_both() {
+        let providers = HashMap::from([
+            ("a".to_string(), entry(Some("m"))),
+            ("b".to_string(), entry(Some("m"))),
+        ]);
+        let rows = configured_models(&providers, "m");
+        assert!(rows.iter().all(|(_, _, active)| *active));
+        assert_eq!(rows.len(), 2);
+    }
 }
