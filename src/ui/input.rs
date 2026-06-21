@@ -998,6 +998,13 @@ impl InputEditor {
                 self.reset_kill_accumulation();
                 None
             }
+            InputAction::DeleteCharForward => {
+                if let Some((start, end)) = delete_range(&self.buffer, self.cursor) {
+                    self.remove_range(start, end);
+                }
+                self.reset_kill_accumulation();
+                None
+            }
             InputAction::KillToLineEnd => {
                 if self.cursor < self.buffer.len() {
                     let killed: CompactString = self.buffer[self.cursor..].into();

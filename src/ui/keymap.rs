@@ -432,6 +432,8 @@ pub enum InputAction {
     /// Delete the character before the cursor (Ctrl+H synonym for
     /// Backspace; the Backspace key itself stays intrinsic).
     DeleteCharBack,
+    /// Delete the character at the cursor (forward delete, Ctrl+D).
+    DeleteCharForward,
     /// Kill (cut to the kill-ring) from the cursor to end of line.
     KillToLineEnd,
     /// Kill from the start of the line to the cursor.
@@ -512,6 +514,11 @@ impl Command for InputAction {
             InputAction::DeleteCharBack,
             "delete_char_back",
             &[(KeyCode::Char('h'), KeyModifiers::CONTROL)],
+        ),
+        (
+            InputAction::DeleteCharForward,
+            "delete_char_forward",
+            &[(KeyCode::Char('d'), KeyModifiers::CONTROL)],
         ),
         (
             InputAction::KillToLineEnd,
@@ -938,6 +945,10 @@ mod tests {
                 InputAction::WordRight,
             ),
             ((KeyCode::Right, KeyModifiers::ALT), InputAction::WordRight),
+            (
+                (KeyCode::Char('d'), KeyModifiers::CONTROL),
+                InputAction::DeleteCharForward,
+            ),
             (
                 (KeyCode::Char('k'), KeyModifiers::CONTROL),
                 InputAction::KillToLineEnd,

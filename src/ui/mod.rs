@@ -1438,7 +1438,7 @@ pub async fn run_interactive(
                         // Resolve the key to a rebindable global command
                         // (config-overridable), or use the action a completed
                         // chord sequence produced. `None` for everything else
-                        // (typing, input-editor keys, the Ctrl+C/D/Esc cancel
+                        // (typing, input-editor keys, Ctrl+C cancel
                         // gesture), which flows through unchanged.
                         let action = seq_action.or_else(|| keymap.resolve(&key));
                         // A completed chord sequence consumes its terminal key:
@@ -1450,10 +1450,7 @@ pub async fn run_interactive(
                         let is_ctrl_c = !from_sequence
                             && key.code == KeyCode::Char('c')
                             && key.modifiers.contains(KeyModifiers::CONTROL);
-                        let is_ctrl_d = !from_sequence
-                            && key.code == KeyCode::Char('d')
-                            && key.modifiers.contains(KeyModifiers::CONTROL);
-                        if is_ctrl_c || is_ctrl_d {
+                        if is_ctrl_c {
                             if ui.rewind_picker.active {
                                 ui.rewind_picker.deactivate();
                                 renderer.set_rewind_overlay(None);
@@ -1543,7 +1540,7 @@ pub async fn run_interactive(
                                 )?;
                                 renderer.request_repaint();
                             } else if !input.expanded().is_empty() {
-                                // Idle Ctrl+C/D with a typed draft: clear the
+                                // Idle Ctrl+C with a typed draft: clear the
                                 // line instead of quitting, so an accidental
                                 // Ctrl+C doesn't end the session and discard the
                                 // draft (readline/bash behavior). Only an EMPTY
@@ -1551,7 +1548,7 @@ pub async fn run_interactive(
                                 input.set_text("");
                                 renderer.request_repaint();
                             } else {
-                                // dirge-bx4g: clean exit via Ctrl+C / Ctrl+D
+                                // dirge-bx4g: clean exit via Ctrl+C
                                 // while idle — fire on_session_end so plugin
                                 // providers see the session boundary.
                                 crate::agent::review::maybe_fire_session_end(
