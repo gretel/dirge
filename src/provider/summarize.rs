@@ -96,6 +96,9 @@ pub(crate) async fn oneshot_with_model(
     if prompt.len() > ONESHOT_PROMPT_BUDGET_BYTES {
         prompt = head_tail_truncate(&prompt, ONESHOT_PROMPT_BUDGET_BYTES);
     }
+    // dirge-wire: opt-in dump so a mystery side-LLM call (which prompt, which
+    // purpose) is visible. No-op unless DIRGE_DUMP_REQUESTS is set.
+    crate::provider::wire::dump_oneshot(label, preamble, &prompt);
     match model {
         super::AnyModel::OpenRouter(m) => run_oneshot(m, label, preamble, prompt).await,
         super::AnyModel::OpenAI(m) => run_oneshot(m, label, preamble, prompt).await,

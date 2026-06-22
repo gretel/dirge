@@ -233,13 +233,6 @@ where
             history_len,
         );
 
-        if !system_prompt.is_empty() {
-            builder = builder.preamble(system_prompt);
-        }
-        builder = builder.messages(history);
-        if !outgoing_tools.is_empty() {
-            builder = builder.tools(outgoing_tools);
-        }
         // Build additional_params using a per-provider mapper
         // (phase 4.6 follow-up). Each provider has its own
         // shape for reasoning configuration — Anthropic wants
@@ -247,8 +240,32 @@ where
         // OpenAI Responses wants `reasoning: { effort }`, etc.
         // The mapper produces the right shape; rig's
         // additional_params is opaque so it forwards whatever
-        // we give it.
+        // we give it. Computed before the builder moves `system_prompt` /
+        // `outgoing_tools` so the wire dump below can read them.
         let additional = build_provider_additional_params(provider, &opts);
+        // dirge-wire: opt-in dump of the outgoing agent request (turn /
+        // escalation / subagent / forked review), so secondary calls are
+        // visible alongside the one-shot side-LLM dumps. No-op unless
+        // DIRGE_DUMP_REQUESTS is set. `additional` carrying reasoning params is
+        // the per-provider signal that thinking is enabled for this request.
+        if crate::provider::wire::enabled() {
+            let tool_names: Vec<String> = outgoing_tools.iter().map(|t| t.name.clone()).collect();
+            crate::provider::wire::dump_turn(
+                provider,
+                &system_prompt,
+                history_len,
+                &tool_names,
+                additional.is_some(),
+            );
+        }
+
+        if !system_prompt.is_empty() {
+            builder = builder.preamble(system_prompt);
+        }
+        builder = builder.messages(history);
+        if !outgoing_tools.is_empty() {
+            builder = builder.tools(outgoing_tools);
+        }
         if let Some(v) = additional {
             builder = builder.additional_params(v);
         }

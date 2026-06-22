@@ -11,6 +11,7 @@ mod run;
 mod spawn;
 mod stream_dispatch;
 pub mod summarize;
+pub mod wire;
 
 pub use build::*;
 pub use dispatch::*;
