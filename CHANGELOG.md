@@ -6,6 +6,25 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-06-22
+
+### Added
+- **Hot-load plugins mid-session with `/plugins load`.** `/plugins load <path>`
+  loads a single `.janet` file or plugin directory; `/plugins load all` loads
+  every `.janet` from `.dirge/plugins/` and `~/.config/dirge/plugins/` (cwd wins
+  on same-name). Previously `/plugins` only listed already-loaded plugins. Works
+  in release builds. (#505, thanks @allen-munsch)
+- **See which prompt goes to which provider, and why.** New opt-in request dump
+  behind `DIRGE_DUMP_REQUESTS`: `=1` logs one summary line per outgoing provider
+  request (purpose label, provider, tool count/names, reasoning flag, byte
+  sizes); `=full` also dumps the system / one-shot prompt body. Emitted at INFO
+  on the `dirge::wire` target, so it lands in `dirge.log` (`-v` / `RUST_LOG` /
+  `DIRGE_LOG`) or via `RUST_LOG=dirge::wire=info`. Instrumented at both
+  request-build choke points — the side-LLM one-shot path (summarizer / critic /
+  approval evaluator) and the agent stream factory (turns / escalation /
+  subagents / forked review) — so a mystery secondary completion is now
+  attributable. Off by default. (#507, dirge-iis0)
+
 ## [0.11.0] - 2026-06-22
 
 ### Added
