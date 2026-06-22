@@ -86,6 +86,7 @@ pub(crate) async fn cmd_list(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
 async fn cmd_load(ctx: &mut SlashCtx<'_>, args: &[&str]) -> anyhow::Result<()> {
     #[cfg(not(feature = "plugin"))]
     {
+        let _ = args;
         ctx.renderer.write_line(
             "plugins are disabled in this build (enable the 'plugin' feature)",
             c_error(),
@@ -118,9 +119,8 @@ async fn cmd_load(ctx: &mut SlashCtx<'_>, args: &[&str]) -> anyhow::Result<()> {
         } else {
             load_one(ctx, &pm_arc, target).await?;
         }
+        Ok(())
     }
-
-    Ok(())
 }
 
 #[cfg(feature = "plugin")]
