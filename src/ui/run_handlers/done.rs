@@ -593,17 +593,17 @@ pub(crate) async fn handle_done(
                             );
                         }
                         for rel in &relations {
-                            let source_id: Result<i64, _> = db.conn.query_row(
-                                "SELECT id FROM entities WHERE session_id = ?1 AND kind = ?2 AND name = ?3 ORDER BY id DESC LIMIT 1",
-                                rusqlite::params![&sid, rel.source_kind, rel.source_name],
-                                |row| row.get(0),
+                            let source_id = entity_db::resolve_entity(
+                                &db.conn,
+                                &rel.source_kind,
+                                &rel.source_name,
                             );
-                            let target_id: Result<i64, _> = db.conn.query_row(
-                                "SELECT id FROM entities WHERE session_id = ?1 AND kind = ?2 AND name = ?3 ORDER BY id DESC LIMIT 1",
-                                rusqlite::params![&sid, rel.target_kind, rel.target_name],
-                                |row| row.get(0),
+                            let target_id = entity_db::resolve_entity(
+                                &db.conn,
+                                &rel.target_kind,
+                                &rel.target_name,
                             );
-                            if let (Ok(src_eid), Ok(tgt_eid)) = (source_id, target_id) {
+                            if let (Ok(Some(src_eid)), Ok(Some(tgt_eid))) = (source_id, target_id) {
                                 let _ = entity_db::insert_relation(
                                     &db.conn,
                                     src_eid,
@@ -612,6 +612,24 @@ pub(crate) async fn handle_done(
                                     &sid,
                                 );
                             }
+                        }
+                    }
+                }
+            }
+
+            // Build graph context for next turn's system prompt.
+            if let Some(pm) = plugin_manager {
+                if let Ok(db) = crate::extras::session_db::SessionDb::open(&paths.session_db_path())
+                {
+                    let sid = format!("dirge-{}", crate::text::short_id(ctx.session.id.as_str()));
+                    if let Ok(context) =
+                        crate::extras::entity_compress::build_graph_context(&db.conn, &sid)
+                    {
+                        if !context.is_empty() {
+                            let mut mgr = pm.lock_ignore_poison();
+                            let escaped = crate::plugin::escape_janet_string(&context);
+                            let _ =
+                                mgr.eval(&format!("(harness/append-system-prompt {})", escaped));
                         }
                     }
                 }

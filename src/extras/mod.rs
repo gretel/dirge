@@ -14,7 +14,11 @@ pub mod mcp_server;
 pub mod acp;
 
 #[cfg(feature = "experimental-graph-search")]
+pub mod entity_compress;
+#[cfg(feature = "experimental-graph-search")]
 pub mod entity_db;
+#[cfg(feature = "experimental-graph-search")]
+pub mod entity_router;
 #[cfg(feature = "experimental-graph-search")]
 pub mod entity_search;
 

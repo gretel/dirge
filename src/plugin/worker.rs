@@ -138,6 +138,14 @@ const HARNESS_INIT: &str = r#"
 # Compressors call these from `on-tool-end` to persist structured facts.
 # The host drains `harness-recorded-entities` and `harness-recorded-relations`
 # after dispatch and writes them to the SQLite entity/relation tables.
+
+# Wire-format escape — used by every tab-separated harness blob.
+(defn- harness/-escape [s]
+  (->> s
+       (string/replace-all "\\" "\\\\")
+       (string/replace-all "\t" "\\t")
+       (string/replace-all "\n" "\\n")))
+
 (defn harness/record-entity [kind name &opt extra]
   (when (and (string? kind) (string? name))
     (let [escaped-name (harness/-escape name)
@@ -157,6 +165,60 @@ const HARNESS_INIT: &str = r#"
                 (harness/-escape target-kind) "\t"
                 (harness/-escape target-name) "\t"
                 (harness/-escape rel-type) "\n"))))
+
+# Entity bundle compression (N3). Takes a multi-line bundle text
+# (e.g. /graph traverse output) and compresses it: groups by
+# terminal kind, deduplicates per entity (shortest path kept),
+# produces a compact summary.
+(defn harness/compress-bundle [bundle-text &opt query]
+  (default query "")
+  (unless (string? bundle-text) (break "expected string"))
+  (def lines (filter |(not (empty? $)) (string/split "\n" bundle-text)))
+  (if (empty? lines) (break ""))
+  # Extract entity kind from terminal [...] in each line.
+  (defn terminal-kind [line]
+    (def parts (string/split "[" line))
+    (if (> (length parts) 1)
+      (let [last (last parts)]
+        (first (string/split "]" last)))
+      "unknown"))
+  # Extract entity name (last segment before terminal [kind]).
+  (defn terminal-name [line]
+    (def rev (reverse (string/split "[" line)))
+    (if (> (length rev) 2)
+      (let [before-bracket (get rev 1)]
+        (string/trim (last (string/split "→" before-bracket))))
+      (let [first-part (last (string/split "→" line))]
+        (string/trim (first (string/split "[" first-part))))))
+  # Per entity (name+kind), keep the shortest line.
+  (def deduped @{})
+  (each line lines
+    (def kind (terminal-kind line))
+    (def name (terminal-name line))
+    (def key (string kind ":" name))
+    (let [existing (get deduped key)]
+      (when (or (nil? existing) (< (length line) (length existing)))
+        (put deduped key line))))
+  # Group by kind.
+  (def by-kind @{})
+  (each [key line] (pairs deduped)
+    (def kind (terminal-kind line))
+    (let [lst (get by-kind kind)]
+      (if (nil? lst)
+        (put by-kind kind @[line])
+        (array/push lst line))))
+  # Build output.
+  (def buf @[""])
+  (def kind-counts @[])
+  (each kind (sort (keys by-kind))
+    (let [ents (get by-kind kind)]
+      (array/push kind-counts (string (length ents) " " kind))))
+  (array/push buf (string (length (keys deduped)) " entities: " (string/join kind-counts ", ")))
+  (each kind (sort (keys by-kind))
+    (array/push buf (string "  [" kind "]"))
+    (each line (get by-kind kind)
+      (array/push buf (string "    " line))))
+  (string/join buf "\n"))
 
 # Run-boundary slots. Plugins call `harness/set-next-model` from
 # inside `prepare-next-run` to swap the active model before the
@@ -213,15 +275,6 @@ const HARNESS_INIT: &str = r#"
   (when (string? content)
     (set harness-followup-messages
          (string harness-followup-messages content "\n"))))
-
-# Wire-format escape — used by every tab-separated harness blob.
-# Defined before any caller so the cond-arity helpers below
-# (harness/add-custom-message, harness/register-*) can reference it.
-(defn- harness/-escape [s]
-  (->> s
-       (string/replace-all "\\" "\\\\")
-       (string/replace-all "\t" "\\t")
-       (string/replace-all "\n" "\\n")))
 
 # Custom (UI-only) message queue. Plugins call this to push a
 # notification the user SEES in the chat but the model does NOT

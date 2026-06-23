@@ -28,7 +28,7 @@ use regex::Regex;
 // caps at v13 so the user_version pragma never outruns the tables that
 // actually exist.
 #[cfg(feature = "experimental-graph-search")]
-pub(crate) const SCHEMA_VERSION: u32 = 14;
+pub(crate) const SCHEMA_VERSION: u32 = 15;
 #[cfg(not(feature = "experimental-graph-search"))]
 pub(crate) const SCHEMA_VERSION: u32 = 13;
 
@@ -328,6 +328,11 @@ impl SessionDb {
         #[cfg(feature = "experimental-graph-search")]
         if current < 14 {
             self.run_migration_v14()?;
+        }
+
+        #[cfg(feature = "experimental-graph-search")]
+        if current < 15 {
+            self.run_migration_v15()?;
         }
 
         self.conn
@@ -962,6 +967,20 @@ impl SessionDb {
                 ",
             )
             .map_err(|e| format!("Migration v14 failed: {e}"))?;
+
+        Ok(())
+    }
+
+    /// v15: add schema_version column to entities for PRISM memory schema
+    /// (#393). Defaults to 'generic' — PRISM-typed relations (HAS_FACET,
+    /// DERIVED_FROM, etc.) only apply when schema_version is 'prism'.
+    #[cfg(feature = "experimental-graph-search")]
+    fn run_migration_v15(&self) -> Result<(), String> {
+        self.conn
+            .execute_batch(
+                "ALTER TABLE entities ADD COLUMN schema_version TEXT NOT NULL DEFAULT 'generic';",
+            )
+            .map_err(|e| format!("Migration v15 failed: {e}"))?;
 
         Ok(())
     }

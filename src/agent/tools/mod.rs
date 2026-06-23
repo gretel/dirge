@@ -39,6 +39,9 @@ mod webfetch;
 mod websearch;
 pub(crate) mod write;
 
+#[cfg(feature = "experimental-graph-search")]
+mod graph;
+
 pub use apply_patch::ApplyPatchTool;
 pub use bash::BashTool;
 pub use bg_shell::{BashOutputTool, KillShellTool};
@@ -51,6 +54,8 @@ pub use edit_lines::EditLinesTool;
 pub use edit_minified::EditMinifiedTool;
 pub use find_files::FindFilesTool;
 pub use glob::GlobTool;
+#[cfg(feature = "experimental-graph-search")]
+pub use graph::GraphTool;
 pub use grep::GrepTool;
 pub use list_dir::ListDirTool;
 #[cfg(feature = "lsp")]
@@ -124,6 +129,7 @@ pub const BUILTIN_TOOL_NAMES: &[&str] = &[
     "repo_overview",
     "spec",
     "session_search",
+    "search_graph",
     "list_symbols",
     "get_symbol_body",
     "find_definition",

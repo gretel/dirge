@@ -25,6 +25,8 @@ use crate::semantic::SemanticManager;
 
 use crate::skill::{self, Skill};
 
+#[cfg(feature = "experimental-graph-search")]
+use super::build_graph_tool;
 use super::build_session_search_tool;
 
 /// Built-in tool names take precedence over externally-sourced tools: an MCP
@@ -495,6 +497,21 @@ pub async fn build_loop_tools(
     tools.push(
         wrap(
             build_session_search_tool(
+                session_db_path.clone(),
+                session_id.clone(),
+                permission.clone(),
+                ask_tx.clone(),
+            ),
+            None,
+        )
+        .await,
+    );
+
+    // Entity/relation graph search — read-only; feature-gated.
+    #[cfg(feature = "experimental-graph-search")]
+    tools.push(
+        wrap(
+            build_graph_tool(
                 session_db_path,
                 session_id.clone(),
                 permission.clone(),
