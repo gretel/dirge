@@ -677,11 +677,13 @@ const HARNESS_COMPUTER_USE_INIT: &str = r#"
     (set harness/computer-use-deny-tools s)))
 
 (defn harness/check-computer-action [action]
-  "Query the PDP for a desktop action. Returns :allow, :deny, or :ask.
-   Respects deny_tools: [computer] and deny_tools: [computer:<action>]."
-  (if (in (harness/computer-use-deny-tools) "computer")
+  "Query the PDP for a desktop action. Returns \"deny\" or \"ask\".
+   Respects deny_tools: [computer] and deny_tools: [computer:<action>].
+   `harness/computer-use-deny-tools` is a var holding a table — reference it
+   directly; wrapping it in parens calls the table (arity error)."
+  (if (in harness/computer-use-deny-tools "computer")
     "deny"
-    (if (in (harness/computer-use-deny-tools) (string "computer:" action))
+    (if (in harness/computer-use-deny-tools (string "computer:" action))
       "deny"
       "ask")))
 "#;

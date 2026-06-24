@@ -226,17 +226,23 @@
           (sh "cosmic-screenshot" "--interactive=false" "--notify=false" "--modal=false" "--save-dir" "/tmp")
           (sh-capture "ls -t /tmp/Screenshot_*.png 2>/dev/null | head -1"))
 
+        # The template's X's must be TRAILING — BSD/macOS mktemp leaves a
+        # post-suffix `XXXXXX` literal (predictable + collision-prone). mktemp a
+        # secure base, drop the empty placeholder, then write `<base>.png` (the
+        # random base keeps the .png path unguessable too).
         "scrot"
-        (if-let [path (mktemp-path "/tmp/dirge-screenshot-XXXXXX.png")]
-          (do
+        (if-let [base (mktemp-path "/tmp/dirge-screenshot-XXXXXX")]
+          (let [path (string base ".png")]
+            (os/execute ["/bin/rm" "-f" base])
             (sh "scrot" path)
             (os/execute ["chmod" "600" path])
             (if (= (sh "test" "-f" path) 0) path nil))
           nil)
 
         "screencapture"
-        (if-let [path (mktemp-path "/tmp/dirge-screenshot-XXXXXX.png")]
-          (do
+        (if-let [base (mktemp-path "/tmp/dirge-screenshot-XXXXXX")]
+          (let [path (string base ".png")]
+            (os/execute ["/bin/rm" "-f" base])
             (sh "screencapture" path)
             (os/execute ["chmod" "600" path])
             (if (= (sh "test" "-f" path) 0) path nil))
