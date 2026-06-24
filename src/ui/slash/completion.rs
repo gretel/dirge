@@ -115,7 +115,7 @@ static SUBCOMMAND_ENTRIES: &[(&str, &[&str])] = &[
         "/sandbox snapshot",
         &["save", "list", "restore", "delete", "help"],
     ),
-    ("/sessions", &["list", "switch", "delete"]),
+    ("/sessions", &["list", "current", "switch", "delete"]),
     ("/tree", &[]),  // dynamic: leaf IDs
     ("/fork", &[]),  // dynamic: leaf IDs
     ("/clone", &[]), // dynamic: leaf IDs

@@ -866,20 +866,11 @@ fn config_alias_still_enforces_url_scheme() {
 /// check failed open, the test would hit the URL and fail with a
 /// connection error instead of the expected "reserved delimiter"
 /// error).
-#[tokio::test]
-async fn compaction_rejects_input_containing_delimiter() {
-    use rig::providers::openai;
-
-    // Build a Custom client pointed at an unroutable URL. If the
-    // delimiter check is bypassed, the test fails with a network
-    // error instead of the expected validation error.
-    let inner = openai::CompletionsClient::builder()
-        .api_key("test-key")
-        .base_url("http://127.0.0.1:1/v1")
-        .build()
-        .expect("build custom client");
-    let client = AnyClient::Custom(inner);
-
+#[test]
+fn compaction_rejects_input_containing_delimiter() {
+    // dirge-tv3p: the delimiter/injection check moved into the pure,
+    // synchronous `build_compaction_prompt` (the on-thread half), so we test
+    // it directly — no client/network needed.
     let poisoned = format!(
         "innocent text {} attacker payload {} more",
         crate::agent::prompt::COMPACTION_DELIMITER_OPEN,
@@ -887,9 +878,7 @@ async fn compaction_rejects_input_containing_delimiter() {
     );
     let msgs = vec![sm(MessageRole::User, &poisoned, vec![])];
 
-    let result = client
-        .compress_messages("test-model", &msgs, None, None)
-        .await;
+    let result = crate::provider::build_compaction_prompt(&msgs, None, None);
 
     assert!(
         result.is_err(),
@@ -902,38 +891,23 @@ async fn compaction_rejects_input_containing_delimiter() {
     );
 }
 
-/// Sanity: clean input passes the delimiter check (it then hits the
-/// bogus URL and fails with a network/auth error — not the validation
-/// error). This confirms the check is precisely scoped and isn't
-/// over-rejecting innocuous content.
-#[tokio::test]
-async fn compaction_passes_check_on_clean_input() {
-    use rig::providers::openai;
-
-    let inner = openai::CompletionsClient::builder()
-        .api_key("test-key")
-        .base_url("http://127.0.0.1:1/v1")
-        .build()
-        .expect("build custom client");
-    let client = AnyClient::Custom(inner);
-
+/// Sanity: clean input passes the delimiter check and yields a prompt. This
+/// confirms the check is precisely scoped and isn't over-rejecting innocuous
+/// content.
+#[test]
+fn compaction_passes_check_on_clean_input() {
     let msgs = vec![sm(
         MessageRole::User,
         "ordinary message, no markers",
         vec![],
     )];
 
-    let result = client
-        .compress_messages("test-model", &msgs, None, None)
-        .await;
+    let result = crate::provider::build_compaction_prompt(&msgs, None, None);
 
-    // We expect SOME failure (no real LLM endpoint), but NOT the
-    // delimiter-validation failure.
-    assert!(result.is_err(), "expected network/auth failure");
-    let err = result.unwrap_err().to_string();
     assert!(
-        !err.contains("reserved delimiter"),
-        "clean input must NOT trip the delimiter check, got: {err}"
+        result.is_ok(),
+        "clean input must NOT trip the delimiter check, got: {:?}",
+        result.err()
     );
 }
 

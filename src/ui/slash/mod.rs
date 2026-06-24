@@ -159,40 +159,45 @@ pub fn undo_last(session: &mut Session) -> UndoOutcome {
 /// ContextLength error and loops.
 pub enum CompressOutcome {
     Compacted,
-    NoOp { reason: &'static str },
+    NoOp,
 }
 
+/// dirge-tv3p: the inputs a spawned compaction task + its install need —
+/// produced by [`prepare_compaction`] on the UI thread.
+pub(crate) struct CompactionRequest {
+    /// The summarizer model, resolved on-thread. Cloneable, sent to the task.
+    pub model: crate::provider::AnyModel,
+    /// The fully-built compaction prompt (serialize + assemble done on-thread).
+    pub prompt: String,
+    /// Message prefix length to drop on install (`session.messages[..cut_idx]`).
+    pub cut_idx: usize,
+    /// Token cost of the dropped prefix — for the net-savings check on install.
+    pub tokens_before: u64,
+}
+
+/// Outcome of the cheap on-thread compaction decision.
+pub(crate) enum CompactionDecision {
+    /// Nothing to do — the reason was already rendered.
+    NoOp,
+    /// Run the summarizer (off-thread) then [`install_compaction`]. Boxed —
+    /// `CompactionRequest` (model + prompt) is much larger than `NoOp`.
+    Ready(Box<CompactionRequest>),
+}
+
+/// dirge-tv3p: the SYNCHRONOUS, on-UI-thread half of compaction — decide
+/// whether/what to compact and build the summarizer prompt. Cheap (token math +
+/// conversation serialization), so it stays on the loop; the slow LLM call it
+/// sets up runs off-thread. Renders any "nothing to do" message itself.
 #[allow(clippy::too_many_arguments)]
-pub async fn handle_compress(
+pub(crate) fn prepare_compaction(
     instructions: Option<&str>,
-    // `true` for an explicit user `/compact` — force the pass regardless of the
-    // current context fraction. Auto-compaction passes `false` so it stays
-    // gated by the "context within limits" check [dirge-fgtj].
     forced: bool,
-    agent: &mut AnyAgent,
+    agent: &AnyAgent,
     client: &AnyClient,
     renderer: &mut Renderer,
-    session: &mut Session,
-    cli: &Cli,
+    session: &Session,
     cfg: &Config,
-    context: &mut ContextFiles,
-    permission: &Option<PermCheck>,
-    ask_tx: &Option<AskSender>,
-    // Audit followup (companion to C8 LSP fix): question_tx +
-    // plan_tx were previously passed as None when this function
-    // rebuilt the agent post-compact. Tools that depend on either
-    // (the `question` tool, plan-mode switch hooks) silently
-    // broke after every auto-compact + manual /compress. Thread
-    // the channels through.
-    question_tx: &Option<crate::agent::tools::question::QuestionSender>,
-    plan_tx: &Option<crate::agent::tools::plan::PlanSwitchSender>,
-    _user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
-    bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
-    sandbox: &Sandbox,
-    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
-    #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
-    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
-) -> anyhow::Result<CompressOutcome> {
+) -> anyhow::Result<CompactionDecision> {
     renderer.write_line("compressing...", c_agent())?;
     renderer.write_line("", Color::White)?;
 
@@ -205,9 +210,7 @@ pub async fn handle_compress(
     // compress, summary-larger-than-savings) still apply to both [dirge-fgtj].
     if !forced && session.total_estimated_tokens <= max_tokens {
         renderer.write_line("context within limits, no compression needed", c_agent())?;
-        return Ok(CompressOutcome::NoOp {
-            reason: "context within limits",
-        });
+        return Ok(CompactionDecision::NoOp);
     }
 
     let mut accumulated = 0u64;
@@ -231,9 +234,7 @@ pub async fn handle_compress(
 
     if cut_idx == 0 {
         renderer.write_line("nothing to compress (entire context is recent)", c_agent())?;
-        return Ok(CompressOutcome::NoOp {
-            reason: "entire context is within keep_recent_tokens — lower it to compress further",
-        });
+        return Ok(CompactionDecision::NoOp);
     }
 
     let messages_to_summarize = &session.messages[..cut_idx];
@@ -259,20 +260,51 @@ pub async fn handle_compress(
         _ => None,
     };
 
-    let summary = client
-        .compress_messages(
-            &session.model,
-            messages_to_summarize,
-            previous_summary,
-            augmented_instructions.as_deref(),
-        )
-        .await?;
-
+    let prompt = crate::provider::build_compaction_prompt(
+        messages_to_summarize,
+        previous_summary,
+        augmented_instructions.as_deref(),
+    )?;
     let tokens_before: u64 = messages_to_summarize
         .iter()
         .map(|m| m.estimated_tokens)
         .sum();
+    let model = client.completion_model(session.model.to_string());
 
+    Ok(CompactionDecision::Ready(Box::new(CompactionRequest {
+        model,
+        prompt,
+        cut_idx,
+        tokens_before,
+    })))
+}
+
+/// dirge-tv3p: the on-UI-thread INSTALL half — given the summary from the
+/// (off-thread) summarizer, rotate the session and rebuild the agent. Cheap
+/// relative to the LLM call. Refuses to install a summary larger than the
+/// messages it replaces (audit M9).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn install_compaction(
+    summary: String,
+    cut_idx: usize,
+    tokens_before: u64,
+    agent: &mut AnyAgent,
+    client: &AnyClient,
+    renderer: &mut Renderer,
+    session: &mut Session,
+    cli: &Cli,
+    cfg: &Config,
+    context: &mut ContextFiles,
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    question_tx: &Option<crate::agent::tools::question::QuestionSender>,
+    plan_tx: &Option<crate::agent::tools::plan::PlanSwitchSender>,
+    bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
+    sandbox: &Sandbox,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+    #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
+    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
+) -> anyhow::Result<CompressOutcome> {
     // F13: estimate the summary's own token cost so we can
     // report TRUE net savings instead of just "tokens replaced".
     // A pathological summary longer than the messages it
@@ -306,9 +338,7 @@ pub async fn handle_compress(
             ),
             c_error(),
         )?;
-        return Ok(CompressOutcome::NoOp {
-            reason: "summary would be larger than the messages it replaces",
-        });
+        return Ok(CompressOutcome::NoOp);
     }
 
     // `compress_reporting` returns the count of non-active-path

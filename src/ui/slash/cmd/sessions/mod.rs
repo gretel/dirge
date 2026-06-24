@@ -5,13 +5,16 @@ pub(crate) mod list;
 pub(crate) mod switch;
 
 use crate::session::Session;
-use crate::ui::slash::{SlashCtx, c_agent};
+use crate::ui::slash::{SlashCtx, c_agent, c_result};
 
 /// Parsed `/sessions` request. Split from the handler so the verb routing
 /// is unit-testable without a live `SlashCtx`.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum SessionAction<'a> {
     List,
+    /// Show the live session's FULL id (+ resume hint). The footer only has
+    /// room for a compact glance id (`text::session_glance_id`).
+    Current,
     Switch(&'a str),
     Delete(&'a str),
     /// A verb that needs an id but didn't get one; carries the usage hint.
@@ -25,6 +28,7 @@ pub(crate) fn parse_sessions_command<'a>(parts: &[&'a str]) -> SessionAction<'a>
     let arg = parts.get(2).map(|s| s.trim()).filter(|s| !s.is_empty());
     match verb {
         None | Some("list") => SessionAction::List,
+        Some("current") | Some("id") => SessionAction::Current,
         Some("delete") => match arg {
             Some(id) => SessionAction::Delete(id),
             None => SessionAction::Usage("delete <id>"),
@@ -118,10 +122,31 @@ mod distinct_id_len_tests {
 pub(crate) async fn cmd_sessions(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
     match parse_sessions_command(parts) {
         SessionAction::List => list::cmd_sessions_list(ctx).await,
+        SessionAction::Current => current(ctx),
         SessionAction::Switch(id) => switch::cmd_sessions_switch(ctx, id).await,
         SessionAction::Delete(id) => delete::cmd_sessions_delete(ctx, id).await,
         SessionAction::Usage(what) => usage(ctx, what),
     }
+}
+
+/// `/sessions current` — print the live session's FULL id with a copy-pasteable
+/// resume command. The status footer only shows a compact glance id, so this is
+/// the way to read the whole thing (e.g. to relaunch with `--session`).
+fn current(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()> {
+    let id = ctx.session.id.to_string();
+    ctx.renderer
+        .write_line(&format!("session: {id}"), c_agent())?;
+    ctx.renderer.write_line(
+        &format!(
+            "  {} · {} msgs",
+            ctx.session.model,
+            ctx.session.messages.len()
+        ),
+        c_result(),
+    )?;
+    ctx.renderer
+        .write_line(&format!("  resume: dirge --session {id}"), c_result())?;
+    Ok(())
 }
 
 fn usage(ctx: &mut SlashCtx<'_>, what: &str) -> anyhow::Result<()> {
@@ -202,6 +227,12 @@ mod tests {
     fn bare_and_explicit_list() {
         assert_eq!(route("/sessions"), SessionAction::List);
         assert_eq!(route("/sessions list"), SessionAction::List);
+    }
+
+    #[test]
+    fn current_verb_routes_to_current() {
+        assert_eq!(route("/sessions current"), SessionAction::Current);
+        assert_eq!(route("/sessions id"), SessionAction::Current);
     }
 
     #[test]

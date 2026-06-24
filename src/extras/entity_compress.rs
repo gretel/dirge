@@ -36,7 +36,7 @@ pub fn compress_bundle(
 
     // Group by terminal kind extracted from path suffix "name[kind]".
     let mut by_kind: HashMap<String, Vec<String>> = HashMap::new();
-    for (_id, (path, _depth)) in &best {
+    for (path, _depth) in best.values() {
         let kind = extract_terminal_kind(path);
         by_kind.entry(kind).or_default().push(path.clone());
     }
@@ -148,6 +148,7 @@ pub fn compress_bundle_stale(
 ///
 /// Takes entity rows as (id, session_id, kind, name, extra, created_at)
 /// and produces a compact bundle.
+#[allow(clippy::type_complexity)]
 pub fn compress_search_results(
     _conn: &Connection,
     rows: &[(i64, String, String, String, Option<String>, String)],

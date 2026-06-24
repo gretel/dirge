@@ -195,6 +195,25 @@ pub(crate) struct UiState {
     pub(crate) plan_phase: Option<crate::agent::plan::runtime::PlanPhaseHandle>,
     /// Reviewer-loop state between implement turns.
     pub(crate) active_plan: Option<crate::agent::plan::runtime::ActivePlan>,
+    /// In-flight non-blocking compaction (summarizer LLM on a spawned task);
+    /// the `compaction_phase` select! arm installs the result. dirge-tv3p.
+    pub(crate) compaction_phase: Option<crate::ui::compaction::CompactionPhaseHandle>,
+    /// In-flight non-blocking `/plan` reviewer (the write-disabled reviewer runs
+    /// code on a spawned task); the `review_phase` arm applies the verdict.
+    /// dirge-4koy.
+    pub(crate) review_phase: Option<crate::agent::plan::runtime::ReviewPhaseHandle>,
+    /// In-flight non-blocking `/btw` side query (one-shot LLM on a spawned task);
+    /// the `btw_phase` arm renders the answer. dirge-nret.
+    pub(crate) btw_phase: Option<crate::ui::btw::BtwPhaseHandle>,
+    /// In-flight non-blocking `!cmd` shell command (on a spawned task); the
+    /// `shell_phase` arm renders the output and, for a visible command, feeds it
+    /// to the agent. dirge-x9a3.
+    pub(crate) shell_phase: Option<crate::ui::shell_phase::ShellPhaseHandle>,
+    /// In-flight non-blocking `/wt-merge` (git merge on a blocking thread); the
+    /// `wt_merge_phase` arm runs the post-merge continuation. dirge-iagk.
+    /// Unconditional so the select! arm can be (select! rejects `#[cfg]` arms);
+    /// stays `None` in non-worktree builds.
+    pub(crate) wt_merge_phase: Option<crate::ui::wt_merge_phase::WtMergePhaseHandle>,
 
     // ── Chats / subagents ────────────────────────────────────────────
     /// Per-chat-tab UI state (response/reasoning/chamber buffers).
@@ -393,6 +412,11 @@ impl UiState {
 
             loop_label: None,
             plan_phase: None,
+            compaction_phase: None,
+            review_phase: None,
+            btw_phase: None,
+            shell_phase: None,
+            wt_merge_phase: None,
             active_plan: None,
 
             chat_ui_states: vec![ChatUiState::empty()],

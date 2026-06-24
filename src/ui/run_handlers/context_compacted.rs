@@ -201,11 +201,11 @@ pub(crate) async fn handle_context_compacted(
     // up. Skipped for a prune-only pass (empty summary = nothing folded).
     if !summary.is_empty() {
         // dirge-a62g: same deterministic ground-truth preamble as the
-        // session-end path so a compaction fold's review gets it too.
+        // session-end path so a compaction fold's review gets it too. dirge-6rtt:
+        // build the digest on-thread, defer its git subprocess to the task.
         let base = crate::agent::review::build_transcript(ctx.session);
-        let transcript =
-            crate::agent::session_digest::review_transcript(ctx.session, Some(&paths.root), base);
-        crate::agent::post_session::spawn_post_session(agent.clone(), paths, transcript);
+        let digest = crate::agent::session_digest::SessionDigest::from_session(ctx.session);
+        crate::agent::post_session::spawn_post_session(agent.clone(), paths, digest, base);
     }
     Ok(())
 }

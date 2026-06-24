@@ -1167,3 +1167,19 @@ async fn coarse_external_redirect_is_gated() {
         other => panic!("expected a Path resource, got {other:?}"),
     }
 }
+
+/// The base description must NOT include a CONTRACT hint — that is
+/// appended by `with_contract_hint`.  Duplicating would waste context
+/// budget and introduce drift between the two copies.
+#[tokio::test]
+async fn bash_description_has_exactly_one_contract_line() {
+    use crate::sandbox::{Sandbox, SandboxMode};
+    let tool = BashTool::new(None, None, Sandbox::new(SandboxMode::Off));
+    let def = tool.definition("".to_string()).await;
+    let count = def.description.matches("CONTRACT:").count();
+    assert_eq!(
+        count, 1,
+        "bash description must have exactly one CONTRACT: line, got {count}:\n{}",
+        def.description
+    );
+}

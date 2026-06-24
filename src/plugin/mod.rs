@@ -291,6 +291,19 @@ impl PluginManager {
         let _ = self.worker.eval("(set harness-plugin-config nil)");
     }
 
+    /// Push the active prompt's `deny_tools` list into the computer-use
+    /// Janet environment so `harness/check-computer-action` can gate
+    /// desktop actions against the permission PDP.
+    #[cfg(feature = "experimental-ui-computer-use")]
+    pub fn set_deny_tools_for_computer_use(&mut self, deny: &[String]) {
+        let items: Vec<String> = deny.iter().map(|t| format!("\"{t}\"")).collect();
+        let expr = format!(
+            "(harness/set-computer-use-deny-tools [{}])",
+            items.join(" ")
+        );
+        let _ = self.worker.eval(&expr);
+    }
+
     pub fn dispatch(&mut self, hook: &str, context_janet: &str) -> Result<Vec<String>, String> {
         let names = match self.hooks.get(hook) {
             Some(names) => names.clone(),
@@ -471,7 +484,7 @@ impl PluginManager {
                     Some(EntityRecord {
                         kind: unescape_harness_field(parts[0]),
                         name: unescape_harness_field(parts[1]),
-                        extra: if parts.get(2).map_or(true, |s| s.is_empty()) {
+                        extra: if parts.get(2).is_none_or(|s| s.is_empty()) {
                             None
                         } else {
                             Some(unescape_harness_field(parts[2]))

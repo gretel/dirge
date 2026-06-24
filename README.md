@@ -303,6 +303,109 @@ referenced by alias from role-assignment keys (`provider`, `review_provider`,
 role can run on a different model. See [docs/config.md](docs/config.md) for the schema,
 provider aliases, role-assignment table, permission rules, and MCP setup.
 
+## Example config
+
+dirge reads `$XDG_CONFIG_HOME/dirge/config.json` (i.e. `~/.config/dirge/config.json`);
+a `.dirge/config.json` in the repo root overrides it per-project. Everything is
+optional — with no config at all, dirge auto-detects a provider from your
+environment. Here's a fuller real-world config that runs each role on a
+different model, pre-allows a few MCP tool namespaces, and wires up MCP servers,
+LSP servers, and a plugin:
+
+```json
+{
+  "max_agent_turns": 1000,
+  "phased_workflow_enabled": true,
+
+  "provider": "glm",
+  "critic_provider": "deepseek",
+  "summarization_provider": "deepseek-flash",
+  "approval_provider": "deepseek-flash",
+
+  "providers": {
+    "deepseek": { "model": "deepseek-v4-pro" },
+    "deepseek-flash": {
+      "provider_type": "deepseek",
+      "model": "deepseek-v4-flash",
+      "api_key": "${DEEPSEEK_API_KEY}"
+    },
+    "glm": {
+      "provider_type": "glm",
+      "base_url": "https://open.bigmodel.cn/api/coding/paas/v4/chat/completions",
+      "api_key": "${ZHIPU_API_KEY}",
+      "model": "glm-5.2",
+      "options": { "temperature": 0.2 }
+    },
+    "ollama": {
+      "provider_type": "openai",
+      "base_url": "http://127.0.0.1:11434/v1"
+    }
+  },
+
+  "permission": {
+    "rules": [
+      { "op": "mcp", "match": "mcp_tool:chiasmus:*", "effect": "allow" },
+      { "op": "mcp", "match": "mcp_tool:lattice:*",  "effect": "allow" }
+    ]
+  },
+
+  "mcp_servers": {
+    "lattice":  { "command": "lattice-mcp", "args": [] },
+    "chiasmus": { "command": "npx", "args": ["-y", "chiasmus"] }
+  },
+
+  "lsp": {
+    "clojure-lsp": {
+      "command": ["clojure-lsp"],
+      "extend_extensions": ["janet"]
+    },
+    "typescript": { "command": ["typescript-language-server", "--stdio"] }
+  },
+
+  "plugins": {
+    "backpressured": { "auto_start": false }
+  }
+}
+```
+
+> JSON has no comments — copy the block above and delete what you don't need.
+
+**Role routing.** The top-level `provider` is the main agent; `critic_provider`,
+`summarization_provider`, `approval_provider` (and `review_provider`,
+`escalation_provider`, `subagent_provider`) point each side-job at its own model.
+Above, the main loop runs on GLM, the compaction summarizer and the auto-approval
+evaluator on a cheap/fast DeepSeek, and the completion critic on the larger
+DeepSeek. `review_provider`/`summarization_provider`/`subagent_provider` fall
+back to `provider` when unset; `critic_provider`/`approval_provider` are off
+entirely unless you name one. Each value is an **alias** into `providers`.
+
+**Provider aliases.** Each `providers` entry is keyed by an alias you choose.
+`provider_type` is the actual backend (`openai`, `anthropic`, `gemini`,
+`deepseek`, `glm`, `ollama`, `openrouter`, or omit it to default to a custom
+OpenAI-compatible endpoint) — and it **defaults to the alias** when omitted, which
+is why `"deepseek": { "model": "…" }` needs no `provider_type` but the second
+DeepSeek route must spell it out as a distinct alias (`deepseek-flash`). Point an
+alias at any OpenAI-compatible server with `base_url` (here a local Ollama and
+GLM's coding endpoint). `options` carries provider tuning — `temperature` is
+applied to the request.
+
+**Secrets.** `api_key` supports `${VAR}` interpolation expanded from the
+environment at use time, so the key itself never lives in the file. Omit it to
+fall back to the provider's standard env var (e.g. `DEEPSEEK_API_KEY`,
+`OPENAI_API_KEY`). (Note: it's `base_url` and `${VAR}` — not `url` or
+`${'VAR'}`.)
+
+**Permission rules.** Pre-decide tool authorizations so the agent doesn't prompt.
+Each rule is `{ op, match, effect }`; the `mcp` op matches `mcp_tool:<server>:<tool>`
+globs and `effect: "allow"` greenlights them. See
+[docs/permissions.md](docs/permissions.md) for the full rule grammar and modes.
+
+**MCP servers / LSP / plugins.** `mcp_servers` launches each tool server by
+`command` + `args` (stdio). `lsp` registers language servers (`command` is argv;
+`extend_extensions` maps extra file extensions onto an existing server — here
+`.janet` files go to `clojure-lsp`). `plugins` carries per-plugin settings such
+as `auto_start`.
+
 ## Documentation
 
 | Document | Topic |

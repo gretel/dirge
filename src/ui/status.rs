@@ -174,7 +174,13 @@ impl StatusLine {
             None => String::new(),
         };
 
-        let session_badge = format!(" session:{}", crate::text::short_id(session.id.as_str()));
+        // dirge: a *distinct* glance id — `short_id`'s fixed 8 chars rendered
+        // every `compacted-<uuid>` session as "compacte". Full id via
+        // `/sessions current`.
+        let session_badge = format!(
+            " session:{}",
+            crate::text::session_glance_id(session.id.as_str())
+        );
 
         format!(
             "{}{} | {}{} | {}/{} ({}) | {}msgs | {}{}{}{}{}{}{}{}",

@@ -34,19 +34,34 @@
   "Run command with argv vector. Uses os/execute directly — no shell interpolation."
   (os/execute args))
 
+(defn- mktemp-path [template]
+  "Run mktemp with template, return created path or nil. The file is
+   created with 0600 permissions by mktemp itself."
+  (let [marker (string "/tmp/dirge-mktemp-" (os/time) "-" (math/random))]
+    (when (= 0 (os/execute ["/bin/sh" "-c" (string "mktemp " template " > " marker " 2>/dev/null")]))
+      (try
+        (let [f (file/open marker :r)
+              path (string/trim (file/read f :all))]
+          (file/close f)
+          (os/execute ["/bin/rm" "-f" marker])
+          (when (and path (not (empty? path))) path))
+        ([_] nil)))))
+
 (defn- sh-capture [cmd-str]
   "Run shell command, capture stdout as trimmed string or nil.
-   Uses /bin/sh -c for output redirection (os/execute returns exit code only).
-   Temp files use os/time — low risk on single-user desktop machines."
-  (let [tmp (string "/tmp/dirge-sh-" (os/time))]
-    (os/execute ["/bin/sh" "-c" (string cmd-str " > " tmp " 2>/dev/null")] :x)
-    (try
-      (let [f (file/open tmp :r)
-            data (file/read f :all)]
-        (file/close f)
-        (os/execute ["/bin/rm" "-f" tmp])
-        (when data (string/trim data)))
-      ([_] nil))))
+   Uses /bin/sh -c for output redirection (os/execute returns exit code
+   only). Temp file via mktemp — not guessable os/time."
+  (if-let [tmp (mktemp-path "/tmp/dirge-sh-XXXXXX")]
+    (do
+      (os/execute ["/bin/sh" "-c" (string cmd-str " > " tmp " 2>/dev/null")] :x)
+      (try
+        (let [f (file/open tmp :r)
+              data (file/read f :all)]
+          (file/close f)
+          (os/execute ["/bin/rm" "-f" tmp])
+          (when data (string/trim data)))
+        ([_] nil)))
+    nil))
 
 (defn- command-exists? [cmd]
   (= 0 (os/execute ["/bin/sh" "-c" (string "command -v " cmd " >/dev/null 2>&1")])))
@@ -63,11 +78,30 @@
     "Insert" true "Menu" true "Num_Lock" true
     "super" true "alt" true "ctrl" true "shift" true})
 
+(def valid-single-char
+  # Single-character key names for ydotool/xdotool keys that don't
+  # appear in `valid-keys`. Restrict to alphanumeric + safe punctuation.
+  # Shell metacharacters (`;`, `|`, `$`, `` ` ``, `\`, quotes etc.)
+  # are NEVER valid — rejecting them closes a shell-injection path
+  # when the chord is interpolated into `ydotool key <chord>`.
+  @{"a" true "b" true "c" true "d" true "e" true "f" true "g" true
+    "h" true "i" true "j" true "k" true "l" true "m" true "n" true
+    "o" true "p" true "q" true "r" true "s" true "t" true "u" true
+    "v" true "w" true "x" true "y" true "z" true
+    "A" true "B" true "C" true "D" true "E" true "F" true "G" true
+    "H" true "I" true "J" true "K" true "L" true "M" true "N" true
+    "O" true "P" true "Q" true "R" true "S" true "T" true "U" true
+    "V" true "W" true "X" true "Y" true "Z" true
+    "0" true "1" true "2" true "3" true "4" true "5" true "6" true
+    "7" true "8" true "9" true
+    "." true "," true "/" true "-" true "=" true "[" true "]" true})
+
 (defn- validate-key [k]
   "Return k if it's a valid key name, nil otherwise."
   (if (valid-keys k) k
     (let [len (length k)]
-      (if (= len 1) k  # single character like "a", "1", "."
+      (if (= len 1)
+        (valid-single-char k)
         (if (string/has-prefix? "KP_" k) k)))))
 
 (defn- validate-keychord [chord]
@@ -192,15 +226,27 @@
           (sh "cosmic-screenshot" "--interactive=false" "--notify=false" "--modal=false" "--save-dir" "/tmp")
           (sh-capture "ls -t /tmp/Screenshot_*.png 2>/dev/null | head -1"))
 
+        # The template's X's must be TRAILING — BSD/macOS mktemp leaves a
+        # post-suffix `XXXXXX` literal (predictable + collision-prone). mktemp a
+        # secure base, drop the empty placeholder, then write `<base>.png` (the
+        # random base keeps the .png path unguessable too).
         "scrot"
-        (let [path (string "/tmp/dirge-screenshot-" (os/time) ".png")]
-          (sh "scrot" path)
-          (if (= (sh "test" "-f" path) 0) path nil))
+        (if-let [base (mktemp-path "/tmp/dirge-screenshot-XXXXXX")]
+          (let [path (string base ".png")]
+            (os/execute ["/bin/rm" "-f" base])
+            (sh "scrot" path)
+            (os/execute ["chmod" "600" path])
+            (if (= (sh "test" "-f" path) 0) path nil))
+          nil)
 
         "screencapture"
-        (let [path (string "/tmp/dirge-screenshot-" (os/time) ".png")]
-          (sh "screencapture" path)
-          (if (= (sh "test" "-f" path) 0) path nil))
+        (if-let [base (mktemp-path "/tmp/dirge-screenshot-XXXXXX")]
+          (let [path (string base ".png")]
+            (os/execute ["/bin/rm" "-f" base])
+            (sh "screencapture" path)
+            (os/execute ["chmod" "600" path])
+            (if (= (sh "test" "-f" path) 0) path nil))
+          nil)
 
         nil)
       ([_] nil))))
@@ -424,10 +470,14 @@
                   (harness/block
                     (string "computer-use blocked — host desktop requires opt-in.\n"
                             "Set DIRGE_COMPUTER_USE_HOST=1 or create ~/.config/dirge/computer-use-host-consent"))
-                  (let [desc (describe-action parsed)]
-                    (if (harness/confirm "computer-use" desc)
-                      (set pending-result (execute-action parsed))
-                      (harness/block "computer-use denied by user"))))))))))
+                  (if (= (harness/check-computer-action (parsed :action)) "deny")
+                    (harness/block
+                      (string "computer-use blocked by PDP deny_tools: " (parsed :action)
+                              "\nAdd deny_tools: [computer] or deny_tools: [computer:" (parsed :action) "] in your agent definition."))
+                    (let [desc (describe-action parsed)]
+                      (if (harness/confirm "computer-use" desc)
+                        (set pending-result (execute-action parsed))
+                        (harness/block "computer-use denied by user")))))))))))
   nil)
 
 (defn computer_use-on-tool-end [ctx]

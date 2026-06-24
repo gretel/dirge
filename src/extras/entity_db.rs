@@ -111,10 +111,9 @@ pub fn resolve_entity(conn: &Connection, kind: &str, name: &str) -> Result<Optio
     let mut rows = stmt
         .query_map(params![kind, name], |row| row.get(0))
         .map_err(|e| format!("resolve_entity query: {e}"))?;
-    Ok(rows
-        .next()
+    rows.next()
         .transpose()
-        .map_err(|e| format!("resolve_entity iter: {e}"))?)
+        .map_err(|e| format!("resolve_entity iter: {e}"))
 }
 
 /// Insert a new entity row. Returns the new row's id.
@@ -194,7 +193,7 @@ pub fn insert_relation(
 /// Convenience: upsert two entities and insert a relation between them.
 /// The compressor says "error E0308 occurred_in crate dirge-core" — this
 /// creates both entities and the edge in one call.
-#[allow(dead_code)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub fn record_entity_pair(
     conn: &Connection,
     session_id: &str,
@@ -216,6 +215,7 @@ pub fn record_entity_pair(
 /// When `session_id` is `Some`, results are scoped to that session only
 /// via `AND e.session_id = ?`. This prevents stale cross-session entities
 /// from leaking into the current agent's reasoning context.
+#[allow(clippy::type_complexity)]
 pub fn search_entities(
     conn: &Connection,
     query: &str,

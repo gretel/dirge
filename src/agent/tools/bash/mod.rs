@@ -79,9 +79,7 @@ impl Tool for BashTool {
             name: "bash".to_string(),
             description: with_contract_hint(
                 "bash",
-                &("Execute a bash command in the current working directory. Returns stdout and stderr.
-
-CONTRACT: `command` is a literal shell command, not a JSON object. Pipe heavy output through `head`/`tail`/`grep` — the harness caps stored output at 256 KiB.".to_owned()
+                &("Execute a bash command in the current working directory. Returns stdout and stderr.".to_owned()
                 + cfg!(feature = "experimental-ui-computer-use").then_some("\n\nDesktop automation: prefix commands with `computer:` to control the desktop GUI. Actions: `computer:open_url <url>` (opens in browser), `computer:screenshot` (captures screen), `computer:type <text>`, `computer:key <keys>`, `computer:click <button>`, `computer:move <x> <y>`. Each action prompts for user confirmation.").unwrap_or("")),
             ),
             parameters: serde_json::json!({

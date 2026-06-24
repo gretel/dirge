@@ -9,8 +9,8 @@
 //!   without a model.
 //! - [`runtime`] — **the runtime glue**: drain a forked phase runner to text
 //!   ([`runtime::collect_runner_text`]), fork a write-disabled reviewer
-//!   ([`runtime::review_once`]), and the live-workflow state carried across
-//!   `Done` events ([`runtime::ActivePlan`] / [`runtime::PlanKickoff`]).
+//!   off-thread ([`runtime::spawn_review`]), and the live-workflow state carried
+//!   across `Done` events ([`runtime::ActivePlan`] / [`runtime::PlanKickoff`]).
 //!
 //! Entry + wiring (outside this module): `ui/slash/cmd_plan.rs` runs the
 //! explore→plan forks; the UI loop launches the streamed implement run; and
