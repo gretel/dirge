@@ -5,8 +5,10 @@
 //! froze rendering, input, and Ctrl+C for the whole call. This module is the
 //! off-thread half: the loop resolves the model on-thread, [`spawn`]s the query
 //! as a task that streams the answer back, and a dedicated `select!` arm renders
-//! it. Nothing in the session is touched, so it needs no install/continuation
-//! machinery — just the answer (or error) to print.
+//! it. Nothing in the session is touched, so there's no install/continuation —
+//! just the answer (or error) to print. The loop still marks `is_running` while
+//! the task runs (like the other phases) so Ctrl+C aborts it and a typed prompt
+//! queues instead of racing it; the arm drains the queue on completion.
 
 use crate::provider::AnyModel;
 

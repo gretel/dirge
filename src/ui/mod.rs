@@ -2328,6 +2328,16 @@ pub async fn run_interactive(
                                         let model =
                                             client.completion_model(session.model.to_string());
                                         ui.btw_phase = Some(crate::ui::btw::spawn(model, query));
+                                        // Mark busy like every other phase: this
+                                        // gates Ctrl+C/Esc to abort the task (else
+                                        // they fall through to idle handlers and an
+                                        // empty-line Ctrl+C exits the session),
+                                        // makes a typed prompt queue instead of
+                                        // spawning a runner that races the btw task,
+                                        // and makes a second /btw queue rather than
+                                        // orphan the first.
+                                        ui.is_running = true;
+                                        renderer.set_avatar_state(avatar::AvatarState::Thinking);
                                     }
                                     #[cfg(feature = "git-worktree")]
                                     Err(e) if e.to_string().starts_with("DEFER_WT_MERGE:") => {
@@ -3378,6 +3388,10 @@ pub async fn run_interactive(
                         renderer.write_line("btw: task ended unexpectedly", c_error())?;
                     }
                 }
+                // Release the busy state set at spawn; a prompt typed during the
+                // query was queued, so drain it into the next turn.
+                drain_interjections!();
+                renderer.set_avatar_state(avatar::AvatarState::Idle);
                 renderer.request_repaint();
             }
             // dirge-x9a3: the spawned `!cmd` shell command streams its output
