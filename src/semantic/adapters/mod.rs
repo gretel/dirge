@@ -7,6 +7,8 @@ mod clojure;
 mod cpp;
 #[cfg(feature = "semantic-elixir")]
 mod elixir;
+#[cfg(feature = "semantic-sql")]
+mod sql;
 #[cfg(feature = "semantic-go")]
 mod go;
 #[cfg(feature = "semantic-java")]
@@ -28,6 +30,8 @@ pub use clojure::ClojureAdapter;
 pub use cpp::CppAdapter;
 #[cfg(feature = "semantic-elixir")]
 pub use elixir::ElixirAdapter;
+#[cfg(feature = "semantic-sql")]
+pub use sql::SqlAdapter;
 #[cfg(feature = "semantic-go")]
 pub use go::GoAdapter;
 #[cfg(feature = "semantic-java")]
