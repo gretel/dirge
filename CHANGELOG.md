@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.12.4] - 2026-06-25
 
+### Added
+- **Config-driven aliases for built-in slash commands.** A top-level
+  `slash_aliases` map renames a built-in or adds a short alias — `{"exit":
+  "quit", "q": "/quit"}` makes `/exit` and `/q` both run `/quit`. A leading `/`
+  on either side is optional, arguments after the alias pass through verbatim,
+  and an alias inherits its target's safety class (so an alias for `/quit` works
+  mid-run). Resolved once at startup; bad targets and keys that shadow a built-in
+  warn on the same path as keymap warnings. Aliases register in tab-completion,
+  the ghost suffix, and `/help`. (#522; thanks @nikolap)
+
 ### Fixed
 - **`--print --output-format stream-json` now streams incrementally.** The
   headless run loop received the agent's per-turn and per-tool events but, in

@@ -23,6 +23,10 @@ pub(crate) struct AliasMap {
 
 impl AliasMap {
     /// Alias names (without leading `/`) — for tab-completion registration.
+    /// Gated to `slash-completion` — its only caller
+    /// (`register_alias_commands` in `ui::mod`) is, so without the feature
+    /// this would be dead code on a `--no-default-features` build.
+    #[cfg(feature = "slash-completion")]
     pub(crate) fn names(&self) -> Vec<String> {
         self.map.keys().cloned().collect()
     }
@@ -62,6 +66,18 @@ pub(crate) fn build_alias_map(cfg: &Config) -> (AliasMap, Vec<String>) {
                 "slash_aliases: {:?} -> {:?}: {:?} is not a known built-in command \
                  (see /help); it will be passed through but may not resolve",
                 alias, target, target_cmd,
+            ));
+        }
+        // Shadowing a real built-in is allowed (the doc'd use case is
+        // renaming one), but it's also a common footgun — `{"quit":
+        // "clear"}` silently makes `/quit` run `/clear` and locks the user
+        // out of the real command. Warn so it's a deliberate choice, not a
+        // typo that swallows a command.
+        if super::is_known_slash_command(&format!("/{alias_key}")) {
+            warnings.push(format!(
+                "slash_aliases: {:?} -> {:?}: alias key {:?} shadows the built-in \
+                 /{alias_key}, which can no longer be run by that name",
+                alias, target, alias_key,
             ));
         }
         map.insert(alias_key, target_cmd);
@@ -162,6 +178,23 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "both targets are known built-ins: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn build_alias_map_warns_when_key_shadows_builtin() {
+        // `/quit` is a built-in; aliasing the key `quit` to `/clear`
+        // shadows it. Still stored (intended use case is renaming), but it
+        // must warn so it isn't a silent footgun.
+        let cfg: Config =
+            serde_json::from_str(r#"{ "slash_aliases": { "quit": "clear" } }"#).unwrap();
+        let (am, warnings) = build_alias_map(&cfg);
+        assert_eq!(am.map.get("quit").map(String::as_str), Some("/clear"));
+        assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("shadows") && warnings[0].contains("/quit"),
+            "warning should name the shadowed built-in: {}",
+            warnings[0],
         );
     }
 
