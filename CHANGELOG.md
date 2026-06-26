@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.3] - 2026-06-26
+
+### Fixed
+- **Compaction no longer makes side-LLM summary calls with Anthropic OAuth
+  credentials.** A bare summarization request doesn't look like a normal Claude
+  Code turn and could trip Anthropic's third-party-use detection, so explicit
+  `/compress`, preemptive compaction, reactive overflow recovery, and in-loop
+  folding now route their summary call through `summarization_provider` and
+  refuse to fall back to Anthropic OAuth. Configure a non-Anthropic-OAuth
+  `summarization_provider` to keep high-fidelity LLM summaries. (#529)
+- **OAuth sessions without a summarizer degrade gracefully instead of breaking.**
+  When no safe summarizer is configured, reactive overflow and explicit
+  `/compress` now fall back to a local prune-only emergency compaction (drop the
+  oldest turns with a deterministic note) so the session keeps going, rather than
+  hard-erroring. The disabled-compaction error is also matched through its full
+  source chain so that fallback can't be silently skipped by a wrapped error.
+  (#530)
+
+### Added
+- **Startup notice when compaction can only prune.** On an Anthropic OAuth
+  session with no non-OAuth `summarization_provider`, the interactive UI now warns
+  once at launch that context folds will be lossy prune-only, so it isn't a
+  surprise at the first fold. The notice self-clears once a summarizer is
+  configured. (#531)
+
 ## [0.13.2] - 2026-06-26
 
 ### Added
