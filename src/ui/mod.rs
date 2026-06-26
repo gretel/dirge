@@ -2343,6 +2343,40 @@ pub async fn run_interactive(
                                                     renderer.write_line(&format!("warning: failed to save session: {e}"), c_error())?;
                                                 }
                                             }
+                                            Err(e) if crate::provider::is_anthropic_oauth_compaction_disabled_error(&e) => {
+                                                // OAuth can't be used for the side
+                                                // summarizer, but the user explicitly
+                                                // asked to shrink context — fall back to
+                                                // prune-only (matching reactive overflow)
+                                                // so /compress still does something.
+                                                match crate::ui::slash::prepare_prune_only_compaction(
+                                                    &mut renderer,
+                                                    session,
+                                                    cfg,
+                                                    crate::provider::ANTHROPIC_OAUTH_COMPACTION_DISABLED,
+                                                ) {
+                                                    Ok(Some(req)) => {
+                                                        renderer.write_line(
+                                                            "LLM compaction requires a non-Anthropic-OAuth summarization_provider; using prune-only compaction (no summary).",
+                                                            c_error(),
+                                                        )?;
+                                                        ui.compaction_phase = Some(crate::ui::compaction::spawn_local(
+                                                            req.summary,
+                                                            req.cut_idx,
+                                                            req.tokens_before,
+                                                            crate::ui::compaction::CompactionThen::Nothing,
+                                                        ));
+                                                        ui.is_running = true;
+                                                        renderer.set_avatar_state(avatar::AvatarState::Thinking);
+                                                    }
+                                                    Ok(None) => {
+                                                        // prepare_prune_only_compaction already rendered why.
+                                                    }
+                                                    Err(e) => {
+                                                        renderer.write_line(&format!("compress error: {e}"), c_error())?;
+                                                    }
+                                                }
+                                            }
                                             Err(e) => {
                                                 renderer.write_line(&format!("compress error: {e}"), c_error())?;
                                             }

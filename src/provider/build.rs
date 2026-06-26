@@ -34,8 +34,15 @@ pub(crate) const ANTHROPIC_OAUTH_COMPACTION_DISABLED: &str = concat!(
 );
 
 pub(crate) fn is_anthropic_oauth_compaction_disabled_error(err: &anyhow::Error) -> bool {
-    err.to_string()
-        .contains(ANTHROPIC_OAUTH_COMPACTION_DISABLED)
+    // Walk the full source chain, not just the outermost message: `anyhow`'s
+    // `to_string()` shows only the top context, so a `bail!` wrapped with
+    // `.context(...)` would otherwise escape detection and skip the prune-only
+    // fallback this error is meant to route to.
+    err.chain().any(|cause| {
+        cause
+            .to_string()
+            .contains(ANTHROPIC_OAUTH_COMPACTION_DISABLED)
+    })
 }
 
 fn openai_api_billing_fallback_key(cli: &Cli) -> Option<&str> {

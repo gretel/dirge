@@ -665,6 +665,36 @@ fn ui_compaction_refuses_anthropic_oauth_without_summarization_provider() {
     );
 }
 
+#[test]
+fn oauth_compaction_disabled_error_is_detected_through_context_wrapping() {
+    use anyhow::Context;
+
+    // The disabled-compaction error is the routing key the reactive-overflow
+    // handler uses to switch to prune-only fallback. It must stay detectable
+    // even if a caller wraps it with extra context — `anyhow`'s `to_string()`
+    // only shows the outermost message, so a naive top-level match would miss
+    // a wrapped error and silently drop the prune-only fallback.
+    let bare = anyhow::anyhow!(crate::provider::ANTHROPIC_OAUTH_COMPACTION_DISABLED);
+    assert!(
+        crate::provider::is_anthropic_oauth_compaction_disabled_error(&bare),
+        "bare disabled-compaction error must be detected"
+    );
+
+    let wrapped = Err::<(), _>(bare)
+        .context("preparing compaction")
+        .unwrap_err();
+    assert!(
+        crate::provider::is_anthropic_oauth_compaction_disabled_error(&wrapped),
+        "disabled-compaction error must be detected through a context wrapper"
+    );
+
+    let unrelated = anyhow::anyhow!("some other failure").context("preparing compaction");
+    assert!(
+        !crate::provider::is_anthropic_oauth_compaction_disabled_error(&unrelated),
+        "unrelated errors must not be misrouted to the prune-only fallback"
+    );
+}
+
 // --- C6/C7: compaction prefix is full + includes tool calls -----
 
 use super::summarize;
