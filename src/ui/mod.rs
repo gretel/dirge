@@ -3241,7 +3241,7 @@ pub async fn run_interactive(
                                         // than what it replaced) — retrying would just
                                         // overflow again.
                                         renderer.write_line(
-                                            "auto-compact made no progress; leaving session as-is. Try /compress with stricter instructions, lower keep_recent_tokens, or /clear.",
+                                            "auto-compact made no progress; leaving session as-is. Lower keep_recent_tokens, configure summarization_provider, or /clear.",
                                             c_error(),
                                         )?;
                                         Next::Finish { clear_queue: true }
@@ -3272,7 +3272,7 @@ pub async fn run_interactive(
                             }
                             CompactionThen::RetryAfterOverflow { .. } => {
                                 renderer.write_line(
-                                    &format!("auto-compact failed ({error}); leaving session as-is. Try /compress manually or /clear."),
+                                    &format!("auto-compact failed ({error}); leaving session as-is. Configure summarization_provider or use /clear."),
                                     c_error(),
                                 )?;
                                 Next::Finish { clear_queue: true }

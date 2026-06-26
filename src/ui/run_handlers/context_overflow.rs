@@ -140,15 +140,47 @@ pub(crate) async fn handle_context_overflow(
             // Compaction decided there's nothing to shrink — retrying would just
             // overflow again. Surface it and drop queued messages (safety).
             ctx.renderer.write_line(
-                "auto-compact made no progress; leaving session as-is. Try /compress with stricter instructions, lower keep_recent_tokens, or /clear.",
+                "auto-compact made no progress; leaving session as-is. Lower keep_recent_tokens, configure summarization_provider, or /clear.",
                 c_error(),
             )?;
             *is_running = false;
             drop_queued(ctx, interjection_queue, "compact no-op")?;
         }
+        Err(e) if crate::provider::is_anthropic_oauth_compaction_disabled_error(&e) => {
+            match crate::ui::slash::prepare_prune_only_compaction(
+                ctx.renderer,
+                ctx.session,
+                ctx.cfg,
+                crate::provider::ANTHROPIC_OAUTH_COMPACTION_DISABLED,
+            )? {
+                Some(req) => {
+                    ctx.renderer.write_line(
+                        "LLM compaction requires a non-Anthropic-OAuth summarization_provider; using prune-only emergency compaction for this retry.",
+                        c_error(),
+                    )?;
+                    *compaction_phase = Some(crate::ui::compaction::spawn_local(
+                        req.summary,
+                        req.cut_idx,
+                        req.tokens_before,
+                        crate::ui::compaction::CompactionThen::RetryAfterOverflow {
+                            prompt: prompt.to_string(),
+                            made_progress,
+                        },
+                    ));
+                }
+                None => {
+                    ctx.renderer.write_line(
+                        "auto-compact could not prune enough context. Configure summarization_provider or use /clear.",
+                        c_error(),
+                    )?;
+                    *is_running = false;
+                    drop_queued(ctx, interjection_queue, "compact failure")?;
+                }
+            }
+        }
         Err(e) => {
             ctx.renderer.write_line(
-                &format!("auto-compact failed ({e}); leaving session as-is. Try /compress manually or /clear."),
+                &format!("auto-compact failed ({e}); leaving session as-is. Configure summarization_provider or use /clear."),
                 c_error(),
             )?;
             *is_running = false;

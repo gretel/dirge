@@ -74,7 +74,7 @@ Accepted top-level keys:
 | `providers`               | object  | Map of provider alias → entry. The active model lives in `providers.<active-provider>.model`. Each role key below points at one of these aliases. See [Providers and roles](#providers-and-roles). |
 | `review_provider`         | string  | Provider alias for the background session-review pass. Falls back to `provider`. |
 | `escalation_provider`     | string  | Provider alias for the one-shot retry after repair-exhaustion / pre-write syntax failure. Falls back to `provider` (no-op when equal). |
-| `summarization_provider`  | string  | Provider alias for context compaction. Falls back to `provider`. |
+| `summarization_provider`  | string  | Provider alias for context compaction. Falls back to `provider`; with Anthropic OAuth, configure a non-Anthropic-OAuth summarization provider for LLM compaction side calls. Reactive overflow can still use a local prune-only emergency fallback, but high-fidelity LLM summaries require this route. |
 | `subagent_provider`       | string  | Provider alias for `task` tool subagents. Falls back to `provider`. |
 | `critic_provider`         | string  | Provider alias for the F6 in-loop critic (tier 3). When set, the verifier escalates to a bounded LLM critique at finalization on substantive runs (one call per run), and it also serves as the judge for the **goal gate** (`--goal`). **No fallback** — unset means no critic, no goal gate, and no cost. |
 | `context_target` | integer | Working-context budget in tokens (default `100000`). The compaction decision treats the effective window as `min(model_window, context_target)`, so the live context is folded — and project memory formed — to stay within the budget instead of trusting a model's full advertised window, whose effective quality degrades well before it fills (the "smart zone" runs out around 100k regardless of size — see [Chroma context-rot research](https://garrit.xyz/posts/2026-05-06-dont-trust-large-context-windows)). Floored at 16k; a value above the model's real window is a no-op. With the default fold fraction the live context stays around 75% of the budget. |
@@ -311,7 +311,7 @@ expired tokens before rebuilding the Anthropic client.
 | `provider` | Default / main loop | (none — required) |
 | `review_provider` | Background session-review pass | `provider` |
 | `escalation_provider` | One-shot retry after repair-exhaustion / pre-write syntax failure | `provider` (no-op when equal) |
-| `summarization_provider` | Context compaction | `provider` |
+| `summarization_provider` | Context compaction side calls (required for LLM compaction when `provider` uses Anthropic OAuth) | `provider` when safe |
 | `subagent_provider` | `task` tool subagents | `provider` |
 | `critic_provider` | F6 in-loop critic (tier 3) + goal-gate judge (`--goal`) | none (off) |
 

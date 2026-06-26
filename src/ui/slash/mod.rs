@@ -179,6 +179,15 @@ pub(crate) struct CompactionRequest {
     pub tokens_before: u64,
 }
 
+pub(crate) struct PruneOnlyCompactionRequest {
+    /// Deterministic local summary; no side LLM call is made.
+    pub summary: String,
+    /// Message prefix length to drop on install (`session.messages[..cut_idx]`).
+    pub cut_idx: usize,
+    /// Token cost of the dropped prefix — for the net-savings check on install.
+    pub tokens_before: u64,
+}
+
 /// Outcome of the cheap on-thread compaction decision.
 pub(crate) enum CompactionDecision {
     /// Nothing to do — the reason was already rendered.
@@ -209,6 +218,69 @@ pub(crate) fn preemptive_compaction_due(total: u64, incoming: u64, max_tokens: u
     total > 0 && total.saturating_add(incoming) > max_tokens * PROACTIVE_COMPACTION_PERCENT / 100
 }
 
+fn compaction_cut_idx(session: &Session, cfg: &Config) -> usize {
+    let keep_recent = cfg.resolve_keep_recent_tokens();
+    let mut accumulated = 0u64;
+    let mut cut_idx = session.messages.len();
+    for (i, msg) in session.messages.iter().enumerate().rev() {
+        if accumulated >= keep_recent {
+            cut_idx = i + 1;
+            break;
+        }
+        accumulated = accumulated.saturating_add(msg.estimated_tokens);
+    }
+    align_cut_to_user_boundary(&session.messages, cut_idx)
+}
+
+fn tokens_before_cut(session: &Session, cut_idx: usize) -> u64 {
+    session.messages[..cut_idx]
+        .iter()
+        .map(|m| m.estimated_tokens)
+        .sum()
+}
+
+fn build_prune_only_summary(session: &Session, cut_idx: usize, reason: &str) -> String {
+    let first_retained = session.messages.get(cut_idx).map(|m| {
+        let preview: String = m.content.chars().take(160).collect();
+        format!("{:?}: {}", m.role, preview.replace('\n', " "))
+    });
+    let previous_summary_note = session
+        .compactions
+        .last()
+        .map(|_| "- A previous compaction summary existed, but was not re-summarized by an LLM during this emergency fallback.\n")
+        .unwrap_or("");
+    format!(
+        "## Emergency prune-only compaction\n\
+         - Reason: {reason}\n\
+         - Dropped {cut_idx} older messages without LLM summarization to recover usable context.\n\
+         - The dropped turns were not summarized; treat the remaining recent conversation as the source of truth.\n\
+         {previous_summary_note}\
+         - If important context is missing, ask the user for clarification instead of guessing.\n\
+         - First retained message: {}",
+        first_retained.unwrap_or_else(|| "(none)".to_string())
+    )
+}
+
+pub(crate) fn prepare_prune_only_compaction(
+    renderer: &mut Renderer,
+    session: &Session,
+    cfg: &Config,
+    reason: &str,
+) -> anyhow::Result<Option<PruneOnlyCompactionRequest>> {
+    renderer.write_line("applying prune-only emergency compaction...", c_agent())?;
+    let cut_idx = compaction_cut_idx(session, cfg);
+    if cut_idx == 0 {
+        renderer.write_line("nothing to prune (entire context is recent)", c_agent())?;
+        return Ok(None);
+    }
+    let tokens_before = tokens_before_cut(session, cut_idx);
+    Ok(Some(PruneOnlyCompactionRequest {
+        summary: build_prune_only_summary(session, cut_idx, reason),
+        cut_idx,
+        tokens_before,
+    }))
+}
+
 /// dirge-tv3p: the SYNCHRONOUS, on-UI-thread half of compaction — decide
 /// whether/what to compact and build the summarizer prompt. Cheap (token math +
 /// conversation serialization), so it stays on the loop; the slow LLM call it
@@ -227,7 +299,6 @@ pub(crate) fn prepare_compaction(
     renderer.write_line("", Color::White)?;
 
     let reserve = cfg.resolve_reserve_tokens();
-    let keep_recent = cfg.resolve_keep_recent_tokens();
     let max_tokens = session.context_window.saturating_sub(reserve);
 
     // Non-forced reactive callers skip when context is within the hard limit;
@@ -240,24 +311,7 @@ pub(crate) fn prepare_compaction(
         return Ok(CompactionDecision::NoOp);
     }
 
-    let mut accumulated = 0u64;
-    let mut cut_idx = session.messages.len();
-    for (i, msg) in session.messages.iter().enumerate().rev() {
-        if accumulated >= keep_recent {
-            cut_idx = i + 1;
-            break;
-        }
-        accumulated = accumulated.saturating_add(msg.estimated_tokens);
-    }
-
-    // F3: nudge `cut_idx` forward until the first kept message is a
-    // User message (or we hit the end). Without this, the kept tail
-    // could start with an Assistant message — Anthropic + OpenAI
-    // expect alternating user/assistant role order; an assistant
-    // following a system summary breaks the role sequence and gets
-    // rejected with a 400. opencode handles this via `splitTurn`
-    // (`compaction.ts:161-184`).
-    cut_idx = align_cut_to_user_boundary(&session.messages, cut_idx);
+    let cut_idx = compaction_cut_idx(session, cfg);
 
     if cut_idx == 0 {
         renderer.write_line("nothing to compress (entire context is recent)", c_agent())?;
@@ -292,11 +346,8 @@ pub(crate) fn prepare_compaction(
         previous_summary,
         augmented_instructions.as_deref(),
     )?;
-    let tokens_before: u64 = messages_to_summarize
-        .iter()
-        .map(|m| m.estimated_tokens)
-        .sum();
-    let model = client.completion_model(session.model.to_string());
+    let tokens_before = tokens_before_cut(session, cut_idx);
+    let model = crate::provider::build_compaction_model(cfg, client, &session.model)?;
 
     Ok(CompactionDecision::Ready(Box::new(CompactionRequest {
         model,

@@ -28,6 +28,16 @@ use super::{
     AnyAgent, AnyAgentInner, AnyClient, AnyModel, client, default_model_for_entry, summarize,
 };
 
+pub(crate) const ANTHROPIC_OAUTH_COMPACTION_DISABLED: &str = concat!(
+    "Anthropic OAuth is not used for compaction side-LLM calls; ",
+    "configure `summarization_provider` to a non-Anthropic-OAuth provider",
+);
+
+pub(crate) fn is_anthropic_oauth_compaction_disabled_error(err: &anyhow::Error) -> bool {
+    err.to_string()
+        .contains(ANTHROPIC_OAUTH_COMPACTION_DISABLED)
+}
+
 fn openai_api_billing_fallback_key(cli: &Cli) -> Option<&str> {
     cli.resolved_api_key
         .as_deref()
@@ -556,16 +566,75 @@ fn build_critic_fn(
     }))
 }
 
+/// Resolve the model for non-blocking UI compaction side-LLM calls.
+///
+/// When `summarization_provider` is configured AND resolves to a DIFFERENT
+/// alias than the default role, build a dedicated client/model for it (so a
+/// cheaper/faster summarizer can be pointed at compaction); otherwise reuse the
+/// active session model via `main_client`. Resolution failure for an explicitly
+/// configured provider falls back to the main model only when that fallback is
+/// safe; Anthropic OAuth fallback is refused so compaction side calls do not
+/// trip the Claude-Code classifier.
+pub(crate) fn build_compaction_model(
+    cfg: &Config,
+    main_client: &AnyClient,
+    main_model_name: &str,
+) -> anyhow::Result<AnyModel> {
+    // Keep the non-blocking UI compaction path (`/compress`, preemptive
+    // compaction, reactive overflow recovery) on the same provider route as
+    // the in-loop compaction summarizer. In particular, Anthropic OAuth should
+    // not be used for this side one-shot when `summarization_provider` points
+    // elsewhere: the OAuth/Claude-Code classifier is intended for the main CLI
+    // turn shape, not arbitrary summarizer requests.
+    if cfg.summarization_provider.is_some() {
+        let default_role = cfg.resolve_role(crate::config::ConfigRole::Default);
+        let summ_role = cfg.resolve_role(crate::config::ConfigRole::Summarization);
+        if let (Some((default_alias, _)), Some((alias, entry))) = (default_role, summ_role)
+            && !default_alias.eq_ignore_ascii_case(&alias)
+        {
+            match create_role_client(&alias, &cfg.providers_map(), cfg.auth) {
+                Ok(client) => {
+                    if matches!(&client, AnyClient::AnthropicOauth(_)) {
+                        anyhow::bail!(ANTHROPIC_OAUTH_COMPACTION_DISABLED);
+                    }
+                    let model_name = entry
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| default_model_for_entry(&alias, &entry).to_string());
+                    tracing::info!(
+                        target: "dirge::provider",
+                        alias = %alias,
+                        "summarization_provider active for UI compaction",
+                    );
+                    return Ok(client.completion_model(model_name));
+                }
+                Err(e) => {
+                    eprintln!(
+                        "warning: summarization_provider '{alias}' failed to build ({e}); \
+                         falling back to the main model for compaction if safe"
+                    );
+                }
+            }
+        }
+    }
+    if matches!(main_client, AnyClient::AnthropicOauth(_)) {
+        anyhow::bail!(ANTHROPIC_OAUTH_COMPACTION_DISABLED);
+    }
+    Ok(main_client.completion_model(main_model_name.to_string()))
+}
+
+fn anthropic_oauth_compaction_disabled_fn() -> crate::agent::compression::SummarizeFn {
+    std::sync::Arc::new(|_prompt: String| {
+        Box::pin(async { anyhow::bail!(ANTHROPIC_OAUTH_COMPACTION_DISABLED) })
+    })
+}
+
 /// dirge-008x + dirge-nw25: build the in-loop compaction summarizer.
 ///
-/// When `summarization_provider` is configured AND resolves to a
-/// DIFFERENT alias than the default role, build a dedicated client/model
-/// for it (so a cheaper/faster summarizer can be pointed at compaction);
-/// otherwise reuse the main agent `model`. The returned `SummarizeFn`
-/// runs one tool-less completion per fold via `summarize_with_model`.
-/// Resolution failure for an explicitly-configured provider falls back to
-/// the main model with a stderr warning rather than disabling compaction.
-fn build_summarize_fn(
+/// Uses the same summarization-provider routing and Anthropic OAuth guard as
+/// [`build_compaction_model`], but adapts the resolved model into the
+/// `SummarizeFn` callback consumed by the agent loop.
+pub(crate) fn build_summarize_fn(
     cfg: &Config,
     main_model: AnyModel,
 ) -> crate::agent::compression::SummarizeFn {
@@ -586,6 +655,9 @@ fn build_summarize_fn(
         {
             match create_role_client(&alias, &cfg.providers_map(), cfg.auth) {
                 Ok(client) => {
+                    if matches!(&client, AnyClient::AnthropicOauth(_)) {
+                        return anthropic_oauth_compaction_disabled_fn();
+                    }
                     let model_name = entry
                         .model
                         .clone()
@@ -601,11 +673,14 @@ fn build_summarize_fn(
                 Err(e) => {
                     eprintln!(
                         "warning: summarization_provider '{alias}' failed to build ({e}); \
-                         falling back to the main model for compaction"
+                         falling back to the main model for compaction if safe"
                     );
                 }
             }
         }
+    }
+    if matches!(&main_model, AnyModel::AnthropicOauth(_)) {
+        return anthropic_oauth_compaction_disabled_fn();
     }
     from_model(main_model)
 }

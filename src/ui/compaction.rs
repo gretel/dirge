@@ -103,7 +103,8 @@ mod recovery_tests {
 /// Terminal event from the spawned summarizer task. (There's no `Progress` —
 /// the loop already printed "compressing…" and the spinner animates on-loop.)
 pub(crate) enum CompactionPhaseEvent {
-    /// The summarizer returned; install this summary on the UI thread.
+    /// The summarizer returned, or a deterministic local fallback summary was
+    /// produced; install this summary on the UI thread.
     Done { summary: String },
     /// The summarizer errored (or the injection guard tripped on the prompt
     /// build — though that's caught earlier, on-thread).
@@ -124,6 +125,25 @@ pub(crate) struct CompactionPhaseHandle {
 /// Spawn the summarizer LLM off-thread and return the handle the UI loop drives
 /// from its `select!`. `req` carries the model + prebuilt prompt produced by
 /// `prepare_compaction` on the UI thread.
+pub(crate) fn spawn_local(
+    summary: String,
+    cut_idx: usize,
+    tokens_before: u64,
+    then: CompactionThen,
+) -> CompactionPhaseHandle {
+    let (tx, rx) = tokio::sync::mpsc::channel::<CompactionPhaseEvent>(1);
+    let task = tokio::spawn(async move {
+        let _ = tx.send(CompactionPhaseEvent::Done { summary }).await;
+    });
+    CompactionPhaseHandle {
+        rx,
+        task,
+        cut_idx,
+        tokens_before,
+        then,
+    }
+}
+
 pub(crate) fn spawn(req: CompactionRequest, then: CompactionThen) -> CompactionPhaseHandle {
     let CompactionRequest {
         model,

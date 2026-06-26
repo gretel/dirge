@@ -575,6 +575,96 @@ async fn with_summarizer_stashes_summarize_fn_dirge_008x() {
     assert_eq!(out, "summary of: hello");
 }
 
+#[test]
+fn ui_compaction_model_honors_summarization_provider() {
+    use std::collections::HashMap;
+
+    let providers = HashMap::from([
+        (
+            "main".to_string(),
+            crate::config::ProviderEntry {
+                provider_type: Some("openai".to_string()),
+                model: Some("gpt-main".to_string()),
+                api_key: Some("sk-main".to_string()),
+                ..Default::default()
+            },
+        ),
+        (
+            "summ".to_string(),
+            crate::config::ProviderEntry {
+                provider_type: Some("deepseek".to_string()),
+                model: Some("deepseek-chat".to_string()),
+                api_key: Some("sk-summ".to_string()),
+                ..Default::default()
+            },
+        ),
+    ]);
+    let cfg = crate::config::Config {
+        provider: Some("main".to_string()),
+        summarization_provider: Some("summ".to_string()),
+        providers: Some(providers),
+        ..Default::default()
+    };
+    let main_client =
+        crate::provider::create_client_with_auth("main", None, &cfg.providers_map(), cfg.auth)
+            .expect("main client builds from literal API key");
+
+    let model = crate::provider::build_compaction_model(&cfg, &main_client, "gpt-main")
+        .expect("summarization_provider route resolves");
+
+    assert!(
+        matches!(model, crate::provider::AnyModel::DeepSeek(_)),
+        "UI compaction must use summarization_provider, not the active session model"
+    );
+}
+
+#[tokio::test]
+async fn in_loop_compaction_refuses_anthropic_oauth_without_summarization_provider() {
+    let cfg = crate::config::Config::default();
+    let client = rig::providers::anthropic::Client::builder()
+        .api_key("sk-ant-oat-test")
+        .http_client(crate::provider::anthropic_http::AnthropicHttpClient::new(
+            "sk-ant-oat-test".to_string(),
+        ))
+        .build()
+        .expect("Anthropic OAuth client builds");
+    let model = crate::provider::AnyModel::AnthropicOauth(client.completion_model("claude-sonnet"));
+
+    let summarize = crate::provider::build_summarize_fn(&cfg, model);
+    let err = summarize("prompt".to_string())
+        .await
+        .expect_err("Anthropic OAuth must not be used for in-loop side compaction");
+
+    assert!(
+        err.to_string().contains("summarization_provider"),
+        "error should tell the user to configure summarization_provider: {err}"
+    );
+}
+
+#[test]
+fn ui_compaction_refuses_anthropic_oauth_without_summarization_provider() {
+    let cfg = crate::config::Config::default();
+    let main_client = crate::provider::AnyClient::AnthropicOauth(
+        rig::providers::anthropic::Client::builder()
+            .api_key("sk-ant-oat-test")
+            .http_client(crate::provider::anthropic_http::AnthropicHttpClient::new(
+                "sk-ant-oat-test".to_string(),
+            ))
+            .build()
+            .expect("Anthropic OAuth client builds"),
+    );
+
+    let err = match crate::provider::build_compaction_model(&cfg, &main_client, "claude-sonnet") {
+        Ok(_) => panic!("Anthropic OAuth must not be used for side compaction"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("summarization_provider"),
+        "error should tell the user to configure summarization_provider: {err}"
+    );
+}
+
 // --- C6/C7: compaction prefix is full + includes tool calls -----
 
 use super::summarize;
