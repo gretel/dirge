@@ -1187,6 +1187,28 @@ pub async fn run_interactive(
     }
 
     render_session(&mut renderer, session, cli, cfg, context)?;
+
+    // dirge-wetz: one-time startup heads-up when compaction can only
+    // prune. Anthropic OAuth isn't used for compaction side-LLM calls, so
+    // without a non-OAuth `summarization_provider` every fold degrades to
+    // lossy prune-only (no LLM summary). Reuse the exact runtime decision
+    // (`build_compaction_model`) so the notice never disagrees with what
+    // compaction actually does. Side-effect-free in the common case (no
+    // `summarization_provider` set → no client is built).
+    if matches!(
+        crate::provider::build_compaction_model(cfg, &client, &session.model),
+        Err(ref e) if crate::provider::is_anthropic_oauth_compaction_disabled_error(e)
+    ) {
+        renderer.write_line(
+            "note: Anthropic OAuth can't run compaction summaries — context folds will be prune-only (lossy, no LLM summary).",
+            theme::warn(),
+        )?;
+        renderer.write_line(
+            "      set `summarization_provider` to a non-Anthropic-OAuth provider for high-fidelity summaries (see docs/config.md).",
+            theme::dim(),
+        )?;
+    }
+
     renderer.request_repaint();
 
     // Notification receiver. The SENDER side was installed at the
