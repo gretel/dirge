@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **`auth: "chatgpt"` now honors fresh Dirge OpenAI OAuth credentials before
+  falling back to legacy Codex storage.** This prevents a stale
+  `~/.codex/auth.json` access token from causing repeated `token_expired` 401s
+  after `dirge auth openai` has already produced a fresh, refreshable Dirge
+  credential.
+
 ## [0.13.2] - 2026-06-26
 
 ### Added

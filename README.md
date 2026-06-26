@@ -227,8 +227,10 @@ Provider credential precedence is unchanged: configured API keys,
 `--api-key-file`, `--api-key-stdin`, config `api_key`, config `api_key_env`, and
 provider environment variables win first. If no higher-precedence OpenAI key is
 available, Dirge uses the fresh stored OAuth access token against the ChatGPT
-Codex backend. Expired OAuth credentials require rerunning `dirge auth openai` or
-setting an API key.
+Codex backend. Explicit `auth: "chatgpt"` uses this Dirge-managed token before
+falling back to legacy `~/.codex/auth.json`, so rerunning `dirge auth openai`
+refreshes Dirge even when Codex's own login file is stale. Expired OAuth
+credentials require rerunning `dirge auth openai` or setting an API key.
 
 Troubleshooting: a 404 or "device-code auth is not enabled" error means the
 ChatGPT Codex security setting is still disabled. A timeout means the browser

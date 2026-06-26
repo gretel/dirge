@@ -1,5 +1,7 @@
 use std::path::PathBuf;
 
+use crate::auth::openai_oauth::normalize_optional_string;
+use crate::auth::store::OpenAiOAuthCredential;
 use crate::config::ProviderAuth;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -47,12 +49,37 @@ fn resolve_chatgpt_auth_from(
     chatgpt_account_id: Option<String>,
     auth_file_path: PathBuf,
 ) -> anyhow::Result<ProviderAuthHeaders> {
+    resolve_chatgpt_auth_from_with_dirge_oauth(
+        codex_access_token,
+        chatgpt_account_id,
+        auth_file_path,
+        crate::provider::client::load_fresh_openai_oauth,
+    )
+}
+
+fn resolve_chatgpt_auth_from_with_dirge_oauth(
+    codex_access_token: Option<String>,
+    chatgpt_account_id: Option<String>,
+    auth_file_path: PathBuf,
+    load_openai_oauth: impl FnOnce() -> anyhow::Result<Option<OpenAiOAuthCredential>>,
+) -> anyhow::Result<ProviderAuthHeaders> {
     if let Some(token) = codex_access_token
         && !token.trim().is_empty()
     {
         return Ok(ProviderAuthHeaders {
             bearer_token: token.trim().to_string(),
-            chatgpt_account_id: chatgpt_account_id.filter(|v| !v.trim().is_empty()),
+            chatgpt_account_id: normalize_optional_string(chatgpt_account_id),
+        });
+    }
+
+    // `dirge auth openai` writes Dirge's own refreshable OAuth credential.
+    // Honor it for explicit `auth: chatgpt` before falling back to legacy
+    // `codex login` storage; otherwise a stale ~/.codex/auth.json can keep
+    // winning even after the user has completed the newer Dirge login flow.
+    if let Some(credential) = load_openai_oauth()? {
+        return Ok(ProviderAuthHeaders {
+            bearer_token: credential.access_token().to_string(),
+            chatgpt_account_id: credential.account_id().map(str::to_string),
         });
     }
 
@@ -284,6 +311,34 @@ mod tests {
 
         assert_eq!(headers.bearer_token, "env-token");
         assert_eq!(headers.chatgpt_account_id.as_deref(), Some("acct-env"));
+    }
+
+    #[test]
+    fn dirge_openai_oauth_wins_over_codex_auth_file() {
+        let dir = std::env::temp_dir().join(format!("dirge-chatgpt-auth-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        std::fs::write(
+            &path,
+            r#"{ "tokens": { "access_token": "stale-codex-token", "account_id": "acct-codex" } }"#,
+        )
+        .unwrap();
+
+        let headers = resolve_chatgpt_auth_from_with_dirge_oauth(None, None, path, || {
+            Ok(Some(OpenAiOAuthCredential::new(
+                "fresh-dirge-token",
+                "refresh-token",
+                None,
+                Some("acct-dirge".to_string()),
+                i64::MAX,
+            )))
+        })
+        .unwrap();
+
+        assert_eq!(headers.bearer_token, "fresh-dirge-token");
+        assert_eq!(headers.chatgpt_account_id.as_deref(), Some("acct-dirge"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

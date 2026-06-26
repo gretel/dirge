@@ -454,7 +454,7 @@ where
         })
 }
 
-fn load_fresh_openai_oauth() -> anyhow::Result<Option<OpenAiOAuthCredential>> {
+pub(crate) fn load_fresh_openai_oauth() -> anyhow::Result<Option<OpenAiOAuthCredential>> {
     let store = OpenAiAuthStore::default();
     fresh_openai_oauth_at(store.load_openai()?, current_epoch_ms(), |credential| {
         let refreshed = refresh_openai_credential(credential)?;

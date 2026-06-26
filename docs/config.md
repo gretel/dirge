@@ -263,7 +263,10 @@ the OpenAI authorization if you want to force a new login.
 
 For the canonical `openai` provider with no configured `base_url`, a fresh
 stored OAuth credential is treated as subscription auth and is preferred before
-API-key billing. OpenAI-compatible aliases and providers with a custom
+API-key billing. Explicit `auth: "chatgpt"` also uses this fresh Dirge-managed
+OpenAI OAuth credential before falling back to legacy `~/.codex/auth.json`
+storage, so rerunning `dirge auth openai` is enough to recover from a stale
+Codex login file. OpenAI-compatible aliases and providers with a custom
 `base_url` keep normal API-key behavior. If no fresh OAuth credential exists,
 Dirge uses the usual API-key sources: explicit CLI keys, key files/stdin, config
 `api_key`, config `api_key_env`, and provider environment variables. If the
