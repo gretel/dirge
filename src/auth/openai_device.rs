@@ -1,3 +1,5 @@
+pub(crate) use super::openai_oauth::OAuthTokens;
+use super::openai_oauth::OpenAiOAuthFlow;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde::de;
@@ -68,27 +70,6 @@ impl fmt::Debug for AuthorizationCode {
         f.debug_struct("AuthorizationCode")
             .field("authorization_code", &"[REDACTED]")
             .field("code_verifier", &"[REDACTED]")
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct OAuthTokens {
-    pub(crate) access_token: String,
-    pub(crate) refresh_token: String,
-    pub(crate) id_token: String,
-    pub(crate) account_id: Option<String>,
-    pub(crate) expires_in: Option<u64>,
-}
-
-impl fmt::Debug for OAuthTokens {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("OAuthTokens")
-            .field("access_token", &"[REDACTED]")
-            .field("refresh_token", &"[REDACTED]")
-            .field("id_token", &"[REDACTED]")
-            .field("account_id", &self.account_id)
-            .field("expires_in", &self.expires_in)
             .finish()
     }
 }
@@ -316,38 +297,17 @@ where
         &self,
         code: AuthorizationCode,
     ) -> Result<OAuthTokens> {
-        let response = self
-            .http
-            .post_form(
-                format!("{}/oauth/token", self.issuer),
-                vec![
-                    ("grant_type".to_string(), "authorization_code".to_string()),
-                    ("code".to_string(), code.authorization_code),
-                    (
-                        "redirect_uri".to_string(),
-                        format!("{}/deviceauth/callback", self.issuer),
-                    ),
-                    ("client_id".to_string(), self.client_id.clone()),
-                    ("code_verifier".to_string(), code.code_verifier),
-                ],
-            )
-            .await?;
-
-        match response.status {
-            200..=299 => {
-                let body: TokenResponse = parse_response(&response.body)?;
-                let account_id = normalize_optional_string(body.account_id)
-                    .or_else(|| account_id_from_access_token(&body.access_token));
-                Ok(OAuthTokens {
-                    access_token: body.access_token,
-                    refresh_token: body.refresh_token,
-                    id_token: body.id_token,
-                    account_id,
-                    expires_in: body.expires_in,
-                })
-            }
-            status => Err(DeviceAuthError::TokenExchangeStatus { status }),
-        }
+        OpenAiOAuthFlow::new(
+            self.issuer.clone(),
+            self.client_id.clone(),
+            self.http.clone(),
+        )
+        .exchange_authorization_code(
+            code.authorization_code,
+            format!("{}/deviceauth/callback", self.issuer),
+            code.code_verifier,
+        )
+        .await
     }
 
     /// Exchange a refresh token for a fresh access token at `{issuer}/oauth/token`.
@@ -355,34 +315,13 @@ where
     /// OpenAI's refresh response may omit `refresh_token`/`id_token`; in that
     /// case the prior refresh token is retained so future refreshes still work.
     pub(crate) async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuthTokens> {
-        let response = self
-            .http
-            .post_form(
-                format!("{}/oauth/token", self.issuer),
-                vec![
-                    ("grant_type".to_string(), "refresh_token".to_string()),
-                    ("refresh_token".to_string(), refresh_token.to_string()),
-                    ("client_id".to_string(), self.client_id.clone()),
-                ],
-            )
-            .await?;
-
-        match response.status {
-            200..=299 => {
-                let body: RefreshTokenResponse = parse_response(&response.body)?;
-                let account_id = normalize_optional_string(body.account_id)
-                    .or_else(|| account_id_from_access_token(&body.access_token));
-                Ok(OAuthTokens {
-                    access_token: body.access_token,
-                    refresh_token: normalize_optional_string(body.refresh_token)
-                        .unwrap_or_else(|| refresh_token.to_string()),
-                    id_token: body.id_token.unwrap_or_default(),
-                    account_id,
-                    expires_in: body.expires_in,
-                })
-            }
-            status => Err(DeviceAuthError::TokenExchangeStatus { status }),
-        }
+        OpenAiOAuthFlow::new(
+            self.issuer.clone(),
+            self.client_id.clone(),
+            self.http.clone(),
+        )
+        .refresh_access_token(refresh_token)
+        .await
     }
 }
 
@@ -405,67 +344,6 @@ struct AuthorizationCodeResponse {
     #[serde(rename = "code_challenge")]
     _code_challenge: String,
     code_verifier: String,
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: String,
-    id_token: String,
-    #[serde(
-        default,
-        alias = "chatgpt_account_id",
-        alias = "chatgptAccountId",
-        alias = "chatgpt_account",
-        alias = "accountId"
-    )]
-    account_id: Option<String>,
-    expires_in: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct RefreshTokenResponse {
-    access_token: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    #[serde(default)]
-    id_token: Option<String>,
-    #[serde(
-        default,
-        alias = "chatgpt_account_id",
-        alias = "chatgptAccountId",
-        alias = "chatgpt_account",
-        alias = "accountId"
-    )]
-    account_id: Option<String>,
-    expires_in: Option<u64>,
-}
-
-fn normalize_optional_string(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-/// Extract `chatgpt_account_id` from the access token's JWT payload.
-///
-/// OpenAI's `/oauth/token` response omits a top-level account id; the id lives
-/// inside the access token's `https://api.openai.com/auth` claim. Without it the
-/// Codex backend rejects requests with a 401, so fall back to the JWT when the
-/// response body has no account id.
-pub(crate) fn account_id_from_access_token(access_token: &str) -> Option<String> {
-    use base64::Engine;
-
-    let payload = access_token.split('.').nth(1)?;
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(payload)
-        .ok()?;
-    let claims: serde_json::Value = serde_json::from_slice(&decoded).ok()?;
-    let account_id = claims
-        .get("https://api.openai.com/auth")?
-        .get("chatgpt_account_id")?
-        .as_str()?;
-    normalize_optional_string(Some(account_id.to_string()))
 }
 
 fn default_poll_interval_seconds() -> u64 {

@@ -499,9 +499,13 @@ fn refresh_openai_credential(
     let prior_id_token = credential.id_token().map(str::to_string);
     let prior_account_id = credential.account_id().map(str::to_string);
     let tokens = std::thread::spawn(
-        move || -> anyhow::Result<crate::auth::openai_device::OAuthTokens> {
+        move || -> anyhow::Result<crate::auth::openai_oauth::OAuthTokens> {
             let runtime = tokio::runtime::Runtime::new()?;
-            let flow = crate::auth::openai_device::OpenAiDeviceAuthFlow::default();
+            let flow = crate::auth::openai_oauth::OpenAiOAuthFlow::new(
+                crate::auth::openai_device::DEFAULT_ISSUER,
+                crate::auth::openai_device::DEFAULT_CLIENT_ID,
+                crate::auth::openai_device::ReqwestDeviceAuthHttp::default(),
+            );
             Ok(runtime.block_on(flow.refresh_access_token(&refresh_token))?)
         },
     )

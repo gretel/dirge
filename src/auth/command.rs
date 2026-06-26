@@ -1,13 +1,13 @@
+use super::oauth_pkce;
 use super::openai_device::{
-    DEFAULT_CLIENT_ID, DEFAULT_ISSUER, DeviceAuthHttp, DeviceAuthRuntime, DeviceCode, OAuthTokens,
-    OpenAiDeviceAuthFlow, Result as DeviceAuthResult, account_id_from_access_token,
+    DEFAULT_CLIENT_ID, DEFAULT_ISSUER, DeviceAuthHttp, DeviceAuthRuntime, DeviceCode,
+    OpenAiDeviceAuthFlow, Result as DeviceAuthResult,
 };
+use super::openai_oauth::{self, OAuthTokens};
 use super::store::{OpenAiAuthStore, OpenAiOAuthCredential};
 use anyhow::Context;
-use base64::Engine;
-use sha2::{Digest, Sha256};
 use std::future::Future;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::Path;
 use std::pin::Pin;
@@ -113,8 +113,8 @@ where
     W: Write,
     N: FnOnce() -> anyhow::Result<i64>,
 {
-    let verifier = pkce_verifier();
-    let challenge = pkce_challenge(&verifier);
+    let verifier = oauth_pkce::verifier();
+    let challenge = oauth_pkce::challenge(&verifier);
     let state = oauth_state();
     let authorize_url = openai_browser_authorize_url(&challenge, &state);
     let listener = TcpListener::bind(("127.0.0.1", BROWSER_CALLBACK_PORT)).with_context(|| {
@@ -204,69 +204,18 @@ where
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
-struct BrowserTokenResponse {
-    access_token: String,
-    refresh_token: String,
-    #[serde(default)]
-    id_token: Option<String>,
-    #[serde(default)]
-    expires_in: Option<u64>,
-    #[serde(
-        default,
-        alias = "chatgpt_account_id",
-        alias = "chatgptAccountId",
-        alias = "chatgpt_account",
-        alias = "accountId"
-    )]
-    account_id: Option<String>,
-}
-
 async fn exchange_browser_authorization_code(
     code: &str,
     verifier: &str,
 ) -> anyhow::Result<OAuthTokens> {
-    let token_url = format!("{DEFAULT_ISSUER}/oauth/token");
-    let body = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("grant_type", "authorization_code")
-        .append_pair("client_id", DEFAULT_CLIENT_ID)
-        .append_pair("code", code)
-        .append_pair("code_verifier", verifier)
-        .append_pair("redirect_uri", BROWSER_REDIRECT_URI)
-        .finish();
-    let response = reqwest::Client::new()
-        .post(token_url)
-        .header(
-            reqwest::header::CONTENT_TYPE,
-            "application/x-www-form-urlencoded",
-        )
-        .body(body)
-        .send()
-        .await?;
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    if !status.is_success() {
-        anyhow::bail!(
-            "OpenAI browser OAuth token exchange failed with status {}{}",
-            status.as_u16(),
-            if body.trim().is_empty() {
-                String::new()
-            } else {
-                format!(": {body}")
-            }
-        );
-    }
-    let token: BrowserTokenResponse =
-        serde_json::from_str(&body).context("OpenAI browser OAuth token response was invalid")?;
-    let account_id = normalize_optional_string(token.account_id)
-        .or_else(|| account_id_from_access_token(&token.access_token));
-    Ok(OAuthTokens {
-        access_token: token.access_token,
-        refresh_token: token.refresh_token,
-        id_token: token.id_token.unwrap_or_default(),
-        account_id,
-        expires_in: token.expires_in,
-    })
+    openai_oauth::exchange_browser_authorization_code(
+        DEFAULT_ISSUER,
+        DEFAULT_CLIENT_ID,
+        code,
+        verifier,
+        BROWSER_REDIRECT_URI,
+    )
+    .await
 }
 
 fn openai_browser_authorize_url(challenge: &str, state: &str) -> String {
@@ -291,78 +240,20 @@ fn wait_for_browser_callback(
     listener: TcpListener,
     expected_state: &str,
 ) -> anyhow::Result<String> {
-    let (mut stream, _) = listener.accept()?;
-    let mut buf = [0_u8; 8192];
-    let len = stream.read(&mut buf)?;
-    let request = String::from_utf8_lossy(&buf[..len]);
-    let result = parse_browser_callback_request(&request, expected_state);
-    let (status, body) = match &result {
-        Ok(_) => (
-            "200 OK",
-            "OpenAI authentication completed. You can close this window.",
-        ),
-        Err(_) => (
-            "400 Bad Request",
-            "OpenAI authentication failed. You can close this window and rerun dirge auth openai.",
-        ),
-    };
-    write!(
-        stream,
-        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        body.len(),
-        body
+    let (code, _) = oauth_pkce::wait_for_callback(
+        listener,
+        &oauth_pkce::CallbackOptions {
+            success_body: "OpenAI authentication completed. You can close this window.",
+            failure_body: "OpenAI authentication failed. You can close this window and rerun dirge auth openai.",
+            error_context: "OpenAI OAuth",
+            expected_state: Some(expected_state),
+        },
     )?;
-    result
-}
-
-fn parse_browser_callback_request(request: &str, expected_state: &str) -> anyhow::Result<String> {
-    let line = request
-        .lines()
-        .next()
-        .context("empty OpenAI OAuth callback request")?;
-    let target = line
-        .split_whitespace()
-        .nth(1)
-        .context("malformed OpenAI OAuth callback request")?;
-    let url = url::Url::parse(&format!("http://localhost{target}"))?;
-    let state = url
-        .query_pairs()
-        .find(|(key, _)| key == "state")
-        .map(|(_, value)| value.into_owned())
-        .context("OpenAI OAuth callback missing state")?;
-    if state != expected_state {
-        anyhow::bail!("OpenAI OAuth state mismatch");
-    }
-    let code = url
-        .query_pairs()
-        .find(|(key, _)| key == "code")
-        .map(|(_, value)| value.into_owned())
-        .context("OpenAI OAuth callback missing code")?;
     Ok(code)
 }
 
 fn oauth_state() -> String {
     uuid::Uuid::new_v4().simple().to_string()
-}
-
-fn pkce_verifier() -> String {
-    format!(
-        "{}{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
-    )
-}
-
-fn pkce_challenge(verifier: &str) -> String {
-    let digest = Sha256::digest(verifier.as_bytes());
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-}
-
-fn normalize_optional_string(value: Option<String>) -> Option<String> {
-    value
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
 }
 
 pub(crate) fn oauth_tokens_to_credential(
@@ -451,7 +342,7 @@ mod tests {
     #[test]
     fn pkce_challenge_uses_s256_url_safe_no_pad() {
         assert_eq!(
-            pkce_challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            oauth_pkce::challenge("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
             "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
         );
     }
@@ -461,11 +352,14 @@ mod tests {
         let request =
             "GET /auth/callback?code=AUTH-CODE&state=STATE HTTP/1.1\r\nHost: localhost\r\n\r\n";
         assert_eq!(
-            parse_browser_callback_request(request, "STATE").unwrap(),
-            "AUTH-CODE"
+            oauth_pkce::parse_callback_request_with_state(request, "OpenAI OAuth", Some("STATE"),)
+                .unwrap(),
+            ("AUTH-CODE".to_string(), "STATE".to_string())
         );
 
-        let err = parse_browser_callback_request(request, "OTHER").unwrap_err();
+        let err =
+            oauth_pkce::parse_callback_request_with_state(request, "OpenAI OAuth", Some("OTHER"))
+                .unwrap_err();
         assert!(err.to_string().contains("state mismatch"));
     }
 }

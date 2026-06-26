@@ -2,8 +2,10 @@ pub(crate) mod command;
 // Shared 0600 file-store + expiry + account-id helpers used by both OAuth stores.
 pub(crate) mod file_store;
 // Staged for downstream CLI/provider beads; this child owns the tested protocol flow.
+pub(crate) mod oauth_pkce;
 #[allow(dead_code)]
 pub(crate) mod openai_device;
+pub(crate) mod openai_oauth;
 // Staged for downstream provider/CLI beads; this child owns persistence behavior.
 #[allow(dead_code)]
 pub(crate) mod store;
