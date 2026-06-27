@@ -13,6 +13,7 @@ What sets dirge apart from other agentic editors:
 - **One explainable permission engine.** All authorization flows through a single Policy Decision Point with four modes, op-based rules, session allowlists, and a `/why` command that traces exactly which policy decided and why. See [docs/permissions.md](docs/permissions.md).
 - **Role-based multi-provider routing.** Point the main loop, review, escalation, summarization, and subagent roles at different models — mix DeepSeek, GLM, Anthropic, OpenAI, Ollama, and any OpenAI-compatible endpoint in one session. Define your own opt-in [agent profiles](docs/agents.md) (a named model + prompt + tool-policy bundle) and switch personas mid-session with `/agent`.
 - **Self-improving project memory.** Persistent per-project memory (plus a global cross-project tier for durable user preferences) and a post-session orchestrator that extracts learnings and curates memory + skills.
+- **A built-in issue board.** A persistent, agent-facing kanban in the session DB — the harness surfaces the top open issues at the start of every turn, so the agent works its backlog without polling a tracker. The `issue` tool manages it; `/issues` views it. See [docs/issues.md](docs/issues.md).
 - **Long-horizon sessions that resume where they left off.** Every conversation keeps a durable, incrementally-refreshed checkpoint, anchored to a stable identity so resuming a long, compacted session recovers its live state instead of a stale snapshot. Autonomous runs can be held to a natural-language stop condition with `--goal`. Adapted from [MiMo-Code](https://github.com/XiaomiMiMo/MiMo-Code).
 - **Code intelligence baked in.** Tree-sitter [semantic tools](docs/semantic.md) and [LSP diagnostics](docs/lsp.md) for 10+ languages, surfaced inline so the agent fixes compile errors on the same turn.
 - **Extensible at runtime.** A [Janet plugin system](docs/plugins.md) hooks the full lifecycle, and [Claude-compatible skills](docs/skills.md) load instructions on demand.
@@ -252,6 +253,7 @@ authorization, delete the `auth.json` file and log in again.
 | `/reasoning` | Toggle reasoning visibility |
 | `/btw <question>` | Ask a quick question (no tools, doesn't affect session) |
 | `/sessions` | List/save/load sessions |
+| `/issues` | View the native issue board (`/issues list`, `/issues <id>`, `/issues search <q>`); the agent manages it with the `issue` tool. See [docs/issues.md](docs/issues.md) |
 | `/tree [id-prefix]` | Show session tree; with prefix, switch the active branch to that leaf |
 | `/fork [id-prefix]` | Branch off the chosen message (default: last user message) and restore its text to the editor |
 | `/clone <id-prefix>` | Switch the active branch to the entry without restoring text |
