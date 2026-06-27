@@ -153,7 +153,7 @@ fn real_user_prompt(msg: &SessionMessage) -> Option<&str> {
 // context struct is tracked separately; silence the lint.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 pub async fn run_interactive(
-    client: AnyClient,
+    mut client: AnyClient,
     mut agent: AnyAgent,
     cli: &Cli,
     cfg: &Config,
@@ -2332,7 +2332,7 @@ pub async fn run_interactive(
                                 // /help) have no UserMessage event, so we keep the echo.
                                 write_user_lines(&mut renderer, &text)?;
                                 renderer.write_line("", Color::White)?;
-                                let result = handle_slash(&expanded, &mut agent, &client, &mut renderer, session, cli, cfg, context, &mut ui.show_reasoning, &mut ui.is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut ui.todo_tools_enabled, &bg_store, &sandbox, #[cfg(unix)] &user_tx, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref(), &mut ui.plan_phase).await;
+                                let result = handle_slash(&expanded, &mut agent, &mut client, &mut renderer, session, cli, cfg, context, &mut ui.show_reasoning, &mut ui.is_running, &mut input, &permission, &ask_tx, &question_tx, &plan_tx, &mut ui.todo_tools_enabled, &bg_store, &sandbox, #[cfg(unix)] &user_tx, #[cfg(feature = "loop")] &mut loop_state, #[cfg(feature = "mcp")] mcp_manager.as_ref(), #[cfg(feature = "semantic")] semantic_manager, #[cfg(feature = "lsp")] lsp_manager.as_ref(), &mut ui.plan_phase).await;
                                 match result {
                                 Err(e) if e.to_string().starts_with("DEFER_COMPRESS:") => {
                                     let err_msg = e.to_string();

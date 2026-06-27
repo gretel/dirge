@@ -52,7 +52,9 @@ pub(super) fn c_error() -> Color {
 /// Keeps individual handler signatures tractable.
 pub(super) struct SlashCtx<'a> {
     pub agent: &'a mut AnyAgent,
-    pub client: &'a AnyClient,
+    // `&mut` so `/model` can swap the live client when switching to a model
+    // that belongs to a different configured provider.
+    pub client: &'a mut AnyClient,
     pub renderer: &'a mut Renderer,
     pub session: &'a mut Session,
     pub cli: &'a Cli,
@@ -495,7 +497,7 @@ fn split_command_parts(text: &str) -> SmallVec<[&str; 3]> {
 pub async fn handle_slash(
     text: &str,
     agent: &mut AnyAgent,
-    client: &AnyClient,
+    client: &mut AnyClient,
     renderer: &mut Renderer,
     session: &mut Session,
     cli: &Cli,

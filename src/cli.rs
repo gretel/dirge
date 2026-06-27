@@ -313,6 +313,19 @@ impl Cli {
         if let Some(m) = self.model.as_deref() {
             return CompactString::new(m);
         }
+        // When `--provider` overrides the config default, take the model from
+        // THAT provider's entry — otherwise `--provider ollama` switches the
+        // endpoint but still loads the config default provider's model (the
+        // `Default` role below tracks `cfg.provider`, not the CLI override).
+        if let Some(provider) = self.provider.as_deref().filter(|p| !p.is_empty())
+            && let Some(providers) = cfg.providers.as_ref()
+            && let Some(entry) = providers
+                .get(provider)
+                .or_else(|| providers.get(&provider.to_ascii_lowercase()))
+            && let Some(m) = entry.model.as_deref()
+        {
+            return CompactString::new(m);
+        }
         if let Some((_, entry)) = cfg.resolve_role(config::ConfigRole::Default)
             && let Some(m) = entry.model
         {
@@ -441,6 +454,64 @@ mod tests {
         assert!(openai_help.contains("browser OAuth"));
         assert!(openai_help.contains("device-code auth"));
         assert!(openai_help.contains("ChatGPT Codex security settings"));
+    }
+
+    fn cfg_with_glm_default_and_ollama() -> config::Config {
+        use std::collections::HashMap;
+        let providers = HashMap::from([
+            (
+                "glm".to_string(),
+                config::ProviderEntry {
+                    provider_type: Some("glm".to_string()),
+                    model: Some("glm-5.2".to_string()),
+                    ..Default::default()
+                },
+            ),
+            (
+                "ollama".to_string(),
+                config::ProviderEntry {
+                    provider_type: Some("openai".to_string()),
+                    base_url: Some("http://127.0.0.1:11434/v1".to_string()),
+                    model: Some("vibe-thinker:latest".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        config::Config {
+            provider: Some("glm".to_string()),
+            providers: Some(providers),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_model_honors_provider_override() {
+        // `--provider ollama` (no --model) must take ollama's pinned model, not
+        // the config default provider's (glm) — otherwise the endpoint switches
+        // but the model stays glm-5.2.
+        let cli = Cli::parse_from(["dirge", "--provider", "ollama"]);
+        assert_eq!(
+            cli.resolve_model(&cfg_with_glm_default_and_ollama()),
+            "vibe-thinker:latest"
+        );
+    }
+
+    #[test]
+    fn resolve_model_without_override_uses_config_default() {
+        let cli = Cli::parse_from(["dirge"]);
+        assert_eq!(
+            cli.resolve_model(&cfg_with_glm_default_and_ollama()),
+            "glm-5.2"
+        );
+    }
+
+    #[test]
+    fn resolve_model_explicit_model_flag_wins_over_provider() {
+        let cli = Cli::parse_from(["dirge", "--provider", "ollama", "--model", "llama3.1"]);
+        assert_eq!(
+            cli.resolve_model(&cfg_with_glm_default_and_ollama()),
+            "llama3.1"
+        );
     }
 
     #[test]

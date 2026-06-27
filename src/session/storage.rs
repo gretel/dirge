@@ -44,10 +44,34 @@ pub(crate) fn global_memory_db_path() -> PathBuf {
 }
 
 pub(crate) fn config_path() -> PathBuf {
-    if let Some(dir) = std::env::var_os("DIRGE_CONFIG_DIR") {
+    config_path_from(
+        std::env::var_os("DIRGE_CONFIG_DIR"),
+        std::env::var_os("XDG_CONFIG_HOME"),
+        dirs::home_dir().unwrap_or_else(|| PathBuf::from(".")),
+    )
+}
+
+/// Resolve the dirge config directory, precedence:
+///   1. `DIRGE_CONFIG_DIR` — explicit dirge override.
+///   2. `$XDG_CONFIG_HOME/dirge` — the XDG base-dir spec (only when set to an
+///      absolute path, as the spec requires; relative values are ignored).
+///   3. `~/.config/dirge` — the XDG default.
+///
+/// Pure (env values passed in) so it's testable without touching process env.
+fn config_path_from(
+    dirge_config_dir: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: PathBuf,
+) -> PathBuf {
+    if let Some(dir) = dirge_config_dir.filter(|d| !d.is_empty()) {
         return PathBuf::from(dir);
     }
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+    if let Some(xdg) = xdg_config_home.filter(|d| !d.is_empty()) {
+        let xdg = PathBuf::from(xdg);
+        if xdg.is_absolute() {
+            return xdg.join("dirge");
+        }
+    }
     home.join(".config").join("dirge")
 }
 
@@ -256,6 +280,55 @@ pub fn delete_session(id: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn config_path_prefers_dirge_config_dir() {
+        let p = config_path_from(
+            Some(OsString::from("/explicit/dirge")),
+            Some(OsString::from("/xdg")),
+            PathBuf::from("/home/u"),
+        );
+        assert_eq!(p, PathBuf::from("/explicit/dirge"));
+    }
+
+    #[test]
+    fn config_path_honors_xdg_config_home() {
+        let p = config_path_from(
+            None,
+            Some(OsString::from("/xdg/cfg")),
+            PathBuf::from("/home/u"),
+        );
+        assert_eq!(p, PathBuf::from("/xdg/cfg/dirge"));
+    }
+
+    #[test]
+    fn config_path_ignores_relative_xdg_and_falls_back_to_home() {
+        // The XDG spec says XDG_CONFIG_HOME must be absolute; a relative value
+        // is treated as unset.
+        let p = config_path_from(
+            None,
+            Some(OsString::from("relative/cfg")),
+            PathBuf::from("/home/u"),
+        );
+        assert_eq!(p, PathBuf::from("/home/u/.config/dirge"));
+    }
+
+    #[test]
+    fn config_path_defaults_to_home_config_dirge() {
+        let p = config_path_from(None, None, PathBuf::from("/home/u"));
+        assert_eq!(p, PathBuf::from("/home/u/.config/dirge"));
+    }
+
+    #[test]
+    fn config_path_treats_empty_overrides_as_unset() {
+        let p = config_path_from(
+            Some(OsString::from("")),
+            Some(OsString::from("")),
+            PathBuf::from("/home/u"),
+        );
+        assert_eq!(p, PathBuf::from("/home/u/.config/dirge"));
+    }
 
     /// dirge-sn1k: under test, the data dir must route to a per-process
     /// temp location (never the user's real ~/.../dirge), so persistence

@@ -31,6 +31,24 @@ fn configured_models(
     rows
 }
 
+/// If `model` is the model pinned by a configured provider *other than*
+/// `active`, return that provider's alias — signalling that `/model <model>`
+/// should switch the live client to it, not just rename the model on the
+/// active provider. Returns `None` for a free-form id or a model on the active
+/// provider (keep the current client).
+fn cross_provider_target(
+    providers: &HashMap<String, ProviderEntry>,
+    active: &str,
+    model: &str,
+) -> Option<String> {
+    providers
+        .iter()
+        .find(|(alias, entry)| {
+            entry.model.as_deref() == Some(model) && !alias.eq_ignore_ascii_case(active)
+        })
+        .map(|(alias, _)| alias.clone())
+}
+
 pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
     if parts.len() < 2 {
         ctx.renderer
@@ -57,6 +75,37 @@ pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         }
     } else {
         let new_model = CompactString::new(parts[1].trim());
+
+        // If the chosen model is one a *different* configured provider pins,
+        // switch the live client to that provider too — otherwise we'd send its
+        // model name to the active provider's endpoint (e.g. an ollama model to
+        // GLM, which 400s). Free-form ids and same-provider models keep the
+        // current client. The `/model` list shows `model · alias` rows, so this
+        // makes selecting a listed cross-provider model actually route there.
+        let providers = ctx.cfg.providers_map();
+        let target_alias = cross_provider_target(
+            &providers,
+            ctx.session.provider.as_str(),
+            new_model.as_str(),
+        );
+
+        let mut switched_to: Option<String> = None;
+        if let Some(alias) = target_alias {
+            match crate::provider::create_client_with_auth(&alias, None, &providers, ctx.cfg.auth) {
+                Ok(new_client) => {
+                    *ctx.client = new_client;
+                    switched_to = Some(alias);
+                }
+                Err(e) => {
+                    ctx.renderer.write_line(
+                        &format!("could not switch to provider '{alias}': {e}"),
+                        c_error(),
+                    )?;
+                    return Ok(());
+                }
+            }
+        }
+
         let model = ctx.client.completion_model(new_model.to_string());
         *ctx.agent = crate::provider::build_agent(
             model,
@@ -79,14 +128,25 @@ pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         )
         .await;
         ctx.session.model = new_model.clone();
-        ctx.session.provider = ctx.cli.resolve_provider(ctx.cfg);
+        // On a cross-provider switch the active provider IS the target alias;
+        // otherwise it stays whatever the CLI/config resolves to.
+        ctx.session.provider = match &switched_to {
+            Some(alias) => CompactString::new(alias),
+            None => ctx.cli.resolve_provider(ctx.cfg),
+        };
         let new_ctx = ctx.cfg.resolve_context_window(new_model.as_str());
         let old_ctx = ctx.session.context_window;
         if new_ctx != old_ctx {
             ctx.session.context_window = new_ctx;
         }
-        ctx.renderer
-            .write_line(&format!("switched to model: {}", new_model), c_agent())?;
+        let provider_note = switched_to
+            .as_deref()
+            .map(|a| format!("  ·  {a}"))
+            .unwrap_or_default();
+        ctx.renderer.write_line(
+            &format!("switched to model: {new_model}{provider_note}"),
+            c_agent(),
+        )?;
         let reserve = ctx.cfg.resolve_reserve_tokens();
         let budget = new_ctx.saturating_sub(reserve);
         if new_ctx < old_ctx && ctx.session.total_estimated_tokens > budget {
@@ -124,6 +184,34 @@ mod tests {
             model: model.map(str::to_string),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn cross_provider_target_finds_other_providers_model() {
+        let providers = HashMap::from([
+            ("glm".to_string(), entry(Some("glm-5.2"))),
+            ("ollama".to_string(), entry(Some("vibe-thinker:latest"))),
+        ]);
+        // Active = glm; picking ollama's model routes to the ollama provider.
+        assert_eq!(
+            cross_provider_target(&providers, "glm", "vibe-thinker:latest").as_deref(),
+            Some("ollama")
+        );
+    }
+
+    #[test]
+    fn cross_provider_target_none_for_active_providers_model() {
+        let providers = HashMap::from([
+            ("glm".to_string(), entry(Some("glm-5.2"))),
+            ("ollama".to_string(), entry(Some("vibe-thinker:latest"))),
+        ]);
+        // The model belongs to the active provider → no client swap.
+        assert_eq!(cross_provider_target(&providers, "glm", "glm-5.2"), None);
+        // A free-form id no provider pins → no swap (rename on current client).
+        assert_eq!(
+            cross_provider_target(&providers, "glm", "some-other-model"),
+            None
+        );
     }
 
     #[test]
