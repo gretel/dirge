@@ -56,6 +56,7 @@ pub(crate) fn config_path() -> PathBuf {
 ///   2. `$XDG_CONFIG_HOME/dirge` — the XDG base-dir spec (only when set to an
 ///      absolute path, as the spec requires; relative values are ignored).
 ///   3. `~/.config/dirge` — the XDG default.
+///
 /// Pure (env values passed in) so it's testable without touching process env.
 fn config_path_from(
     dirge_config_dir: Option<std::ffi::OsString>,
