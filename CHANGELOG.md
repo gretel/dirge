@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **`auth: "chatgpt"` falls back to legacy `codex login` storage when a Dirge
+  OpenAI OAuth credential is present but unusable** (expired with a failed or
+  absent refresh, or an unreadable store). It previously hard-errored the
+  session in that case even when a valid `~/.codex/auth.json` could have served
+  it; now it warns and uses the legacy file. (#533)
+
 ## [0.13.4] - 2026-06-26
 
 ### Changed
