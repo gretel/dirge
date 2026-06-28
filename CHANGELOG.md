@@ -6,6 +6,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.13.9] - 2026-06-28
+
+### Changed
+- **The `issue` tool is auto-allowed by default.** It's now classified as a
+  builtin-allowed meta operation (like `write_todo_list`), so the agent records
+  its own work (create/start/block/close/update) without a permission prompt
+  each time — the tracker is a local, user-viewable (`/issues`), reversible DB,
+  so the prompts were friction without security value. Still overridable via an
+  explicit deny rule. (#537)
+
 ## [0.13.8] - 2026-06-28
 
 ### Added
