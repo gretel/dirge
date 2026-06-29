@@ -137,6 +137,9 @@ pub(crate) fn build_panel_data(
     #[cfg(not(feature = "lsp"))]
     let lsp: Vec<(String, String, bool)> = Vec::new();
 
+    // The TODOS panel mirrors this session's live issue board (open /
+    // in_progress / blocked). Terminal items (done / cancelled) have already
+    // dropped off the board, so no completed glyph is needed here.
     let todos: Vec<(String, String)> = {
         let list = crate::agent::tools::todo::TODO_LIST.lock_ignore_poison();
         list.iter()
@@ -144,7 +147,7 @@ pub(crate) fn build_panel_data(
             .map(|t| {
                 let status = match t.status.as_str() {
                     "in_progress" => "[~]",
-                    "completed" => "[x]",
+                    "blocked" => "[!]",
                     _ => "[ ]",
                 };
                 (status.to_string(), t.content.to_string())

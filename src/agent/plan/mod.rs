@@ -26,7 +26,7 @@
 //! |---------|-------|-----------|---------|----------|-------|
 //! | **Phased `/plan` workflow** | `agent::plan` (this module) | explore→plan→implement→review for one complex request | user runs `/plan <req>` (needs `phased_workflow_enabled`) | one request | [`runtime::ActivePlan`] / [`runtime::PlanKickoff`] (ephemeral) |
 //! | **Plan *mode*** | [`crate::agent::tools::plan`] (`plan_enter`/`plan_exit`) | a read-only session lock: the model proposes before touching anything | model calls `plan_enter`, or a prompt's `deny_tools` | until `plan_exit` | `PlanSwitchRequest` channel → session mode |
-//! | **Todo list** | `crate::agent::tools::todo` (`write_todo_list`) | an in-session checklist the model maintains and is nudged to finish | model calls `write_todo_list` | the session | a process-global `TODO_LIST` |
+//! | **Todo list** | `crate::agent::tools::todo` (`write_todo_list`) | bulk planning over the persistent issue board — a todo IS an issue; the model is nudged to finish open ones | model calls `write_todo_list` (or the `issue` tool) | durable (in the `issues` table; session-scoped for panel/nudge) | the `issues` table; `TODO_LIST` is a render mirror |
 //! | **Task / subagent** | `crate::agent::tools::task` (`task` + `task_status`) | spawn a background subagent for independent work | model calls `task` | per background job | `BackgroundStore` + abort registry |
 //!
 //! **Plan-mode × phased `/plan`:** orthogonal and composable. Plan-mode is a

@@ -481,19 +481,25 @@ pub async fn build_loop_tools(
         .await,
     );
 
-    // Mutates internal todo state — Sequential.
-    tools.push(
-        wrap(
-            tools::WriteTodoList::new(permission.clone(), ask_tx.clone()),
-            Some(ToolExecutionMode::Sequential),
-        )
-        .await,
-    );
-
     // Session search — read-only DB queries.
     let session_db_path = std::env::current_dir()
         .map(|c| crate::extras::dirge_paths::ProjectPaths::new(&c).session_db_path())
         .unwrap_or_else(|_| std::path::PathBuf::from(".dirge/sessions/state.db"));
+
+    // Bulk planning surface over the persistent issue board — writes to the
+    // project DB, so Sequential. Shares the `issues` table with `IssueTool`.
+    tools.push(
+        wrap(
+            tools::WriteTodoList::new(
+                session_db_path.clone(),
+                session_id.clone(),
+                permission.clone(),
+                ask_tx.clone(),
+            ),
+            Some(ToolExecutionMode::Sequential),
+        )
+        .await,
+    );
     tools.push(
         wrap(
             build_session_search_tool(

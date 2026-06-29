@@ -22,15 +22,26 @@ use crate::sync_util::LockExt;
 // (high / normal / low) are defined by the `normalize_*` vocabulary below.
 
 /// Normalize a user/agent-supplied status to a canonical value, or `None` if
-/// unrecognized. Accepts a few intuitive aliases.
+/// unrecognized. Accepts a few intuitive aliases. `pending` maps to `open` and
+/// `cancelled` is a distinct terminal state — both come in via the bulk
+/// `write_todo_list` vocabulary (pending / in_progress / completed / cancelled),
+/// which shares this store.
 pub fn normalize_status(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "open" | "todo" | "backlog" => Some("open"),
+        "open" | "todo" | "backlog" | "pending" => Some("open"),
         "in_progress" | "in-progress" | "started" | "doing" | "wip" => Some("in_progress"),
         "blocked" | "block" => Some("blocked"),
         "done" | "closed" | "complete" | "completed" | "finished" => Some("done"),
+        "cancelled" | "canceled" | "wontfix" | "drop" | "dropped" => Some("cancelled"),
         _ => None,
     }
+}
+
+/// Whether a status is terminal (closed) — `done` or `cancelled`. Terminal
+/// issues stamp `closed_at`, drop off the live board, and don't count toward
+/// the unfinished-work nudge.
+pub fn is_terminal_status(status: &str) -> bool {
+    status == "done" || status == "cancelled"
 }
 
 /// Normalize a priority, or `None` if unrecognized.
@@ -198,15 +209,16 @@ impl IssueStore {
         .map_err(|e| format!("get issue: {e}"))
     }
 
-    /// Update status (validated). Setting `done` stamps `closed_at`; moving off
-    /// `done` clears it. Returns false if the issue doesn't exist.
+    /// Update status (validated). Setting a terminal status (`done` /
+    /// `cancelled`) stamps `closed_at`; moving off one clears it. Returns false
+    /// if the issue doesn't exist.
     pub fn set_status(&self, id: i64, status: &str) -> Result<bool, String> {
         let status = normalize_status(status).ok_or_else(|| {
-            format!("unknown status '{status}' (use open|in_progress|blocked|done)")
+            format!("unknown status '{status}' (use open|in_progress|blocked|done|cancelled)")
         })?;
         let conn = self.conn.lock_ignore_poison();
         let now = now();
-        let n = if status == "done" {
+        let n = if is_terminal_status(status) {
             conn.execute(
                 "UPDATE issues SET status = ?2, updated_at = ?3, closed_at = ?3 WHERE id = ?1",
                 params![id, status, now],
@@ -256,14 +268,49 @@ impl IssueStore {
     /// within a state, high priority first, then most-recently-touched.
     /// `limit` caps the rows (the caller bounds context); `None` = all.
     pub fn board(&self, limit: Option<usize>) -> Result<Vec<Issue>, String> {
+        self.board_query(None, limit)
+    }
+
+    /// The live board scoped to one session: open / in_progress / blocked
+    /// issues created or last touched under `session_id`, ordered like
+    /// [`Self::board`]. This is what the right-pane panel and the
+    /// finish-your-work nudge read — both are session-scoped, unlike the
+    /// project-wide turn-start reminder. `session_id = None` matches issues
+    /// with a NULL session.
+    pub fn board_for_session(
+        &self,
+        session_id: Option<&str>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Issue>, String> {
+        self.board_query(Some(session_id), limit)
+    }
+
+    /// Shared live-board query for [`Self::board`] (project-wide) and
+    /// [`Self::board_for_session`] (session-scoped), so the column list and the
+    /// status/priority ordering can't drift between them. `session = None` means
+    /// no session filter; `session = Some(sid)` filters `session_id IS sid`
+    /// (where `sid = None` matches a NULL session). A trailing `id DESC` makes
+    /// the order total — a single `sync_todos` batch stamps every row with the
+    /// same `updated_at`, so without it the within-bucket order would be
+    /// nondeterministic.
+    fn board_query(
+        &self,
+        session: Option<Option<&str>>,
+        limit: Option<usize>,
+    ) -> Result<Vec<Issue>, String> {
         let conn = self.conn.lock_ignore_poison();
+        let where_session = if session.is_some() {
+            "session_id IS ?1 AND "
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT {COLS} FROM issues
-             WHERE status IN ('open','in_progress','blocked')
+             WHERE {where_session}status IN ('open','in_progress','blocked')
              ORDER BY
                CASE status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 ELSE 2 END,
                CASE priority WHEN 'high' THEN 0 WHEN 'normal' THEN 1 ELSE 2 END,
-               updated_at DESC
+               updated_at DESC, id DESC
              {}",
             match limit {
                 Some(n) => format!("LIMIT {n}"),
@@ -271,18 +318,86 @@ impl IssueStore {
             }
         );
         let mut stmt = conn.prepare(&sql).map_err(|e| format!("board: {e}"))?;
-        let rows = stmt
-            .query_map([], row_to_issue)
-            .map_err(|e| format!("board: {e}"))?;
+        let rows = match session {
+            Some(sid) => stmt.query_map(params![sid], row_to_issue),
+            None => stmt.query_map([], row_to_issue),
+        }
+        .map_err(|e| format!("board: {e}"))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|e| format!("board: {e}"))
     }
 
-    /// Count of live (non-done) issues — used for the "N more" injection hint.
+    /// Bulk reconcile a `write_todo_list`-style plan into this session's issues,
+    /// in one transaction. Each `(title, status, priority)` triple is upserted
+    /// by `(session_id, title)`: a matching issue is updated (status + priority,
+    /// stamping/clearing `closed_at` as the status crosses the terminal line),
+    /// and a missing one is created. Empty titles are skipped.
+    ///
+    /// Deliberately NOT a full replace: issues absent from the list are left
+    /// untouched rather than closed, so a partial plan can't silently wipe work
+    /// the model (or the `issue` tool) is still tracking. The model closes an
+    /// item by restating it with status `completed` / `cancelled`. Returns the
+    /// number of items applied.
+    pub fn sync_todos(
+        &self,
+        session_id: Option<&str>,
+        items: &[(&str, &str, &str)],
+    ) -> Result<usize, String> {
+        let mut conn = self.conn.lock_ignore_poison();
+        let tx = conn
+            .transaction()
+            .map_err(|e| format!("sync todos (begin): {e}"))?;
+        let now = now();
+        let mut applied = 0usize;
+        for (title, status, priority) in items {
+            let title = title.trim();
+            if title.is_empty() {
+                continue;
+            }
+            let status = normalize_status(status).unwrap_or("open");
+            let priority = normalize_priority(priority).unwrap_or("normal");
+            let closed: Option<&str> = is_terminal_status(status).then_some(now.as_str());
+            let existing: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM issues WHERE session_id IS ?1 AND title = ?2 ORDER BY id DESC LIMIT 1",
+                    params![session_id, title],
+                    |r| r.get(0),
+                )
+                .optional()
+                .map_err(|e| format!("sync todos (lookup): {e}"))?;
+            match existing {
+                Some(id) => {
+                    tx.execute(
+                        "UPDATE issues SET status = ?2, priority = ?3, updated_at = ?4, closed_at = ?5 WHERE id = ?1",
+                        params![id, status, priority, now, closed],
+                    )
+                    .map_err(|e| format!("sync todos (update): {e}"))?;
+                }
+                None => {
+                    tx.execute(
+                        "INSERT INTO issues (title, body, status, priority, session_id, created_at, updated_at, closed_at)
+                         VALUES (?1, '', ?2, ?3, ?4, ?5, ?5, ?6)",
+                        params![title, status, priority, session_id, now, closed],
+                    )
+                    .map_err(|e| format!("sync todos (insert): {e}"))?;
+                }
+            }
+            applied += 1;
+        }
+        tx.commit()
+            .map_err(|e| format!("sync todos (commit): {e}"))?;
+        Ok(applied)
+    }
+
+    /// Count of live issues — used for the "N more" injection hint. Must match
+    /// [`Self::board`]'s membership (open / in_progress / blocked) so the
+    /// overflow hint is consistent: both terminal states (`done` and
+    /// `cancelled`) are excluded, otherwise cancelled issues would inflate the
+    /// "and N more" count for rows the model can never list.
     pub fn open_count(&self) -> Result<usize, String> {
         let conn = self.conn.lock_ignore_poison();
         conn.query_row(
-            "SELECT COUNT(*) FROM issues WHERE status != 'done'",
+            "SELECT COUNT(*) FROM issues WHERE status NOT IN ('done','cancelled')",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -469,6 +584,89 @@ mod tests {
         assert!(block.trim_end().ends_with("</system-reminder>"));
         // Only 2 shown, 4 live → overflow hint mentions the remaining 2.
         assert!(block.contains("2 more open issue"), "{block}");
+    }
+
+    #[test]
+    fn cancelled_is_terminal_stamps_closed_at_and_leaves_board() {
+        let s = store();
+        let id = s.create("x", "", None, Some("sess-1")).unwrap();
+        assert!(s.set_status(id, "cancelled").unwrap());
+        let c = s.get(id).unwrap().unwrap();
+        assert_eq!(c.status, "cancelled");
+        assert!(c.closed_at.is_some(), "cancelled should stamp closed_at");
+        // Terminal → off the live board.
+        assert!(s.board(None).unwrap().iter().all(|i| i.id != id));
+    }
+
+    #[test]
+    fn open_count_excludes_both_terminal_states() {
+        let s = store();
+        let live = s.create("live", "", None, None).unwrap();
+        let _ = live;
+        let done = s.create("done", "", None, None).unwrap();
+        s.set_status(done, "done").unwrap();
+        let cancelled = s.create("cancelled", "", None, None).unwrap();
+        s.set_status(cancelled, "cancelled").unwrap();
+        // Only the one live issue counts — cancelled must not inflate it (it's
+        // excluded from board(), so the "N more" hint would otherwise lie).
+        assert_eq!(s.open_count().unwrap(), 1);
+        assert_eq!(s.board(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn board_for_session_scopes_to_session_and_excludes_terminal() {
+        let s = store();
+        let mine = s.create("mine open", "", None, Some("sess-1")).unwrap();
+        let mine_done = s.create("mine done", "", None, Some("sess-1")).unwrap();
+        s.set_status(mine_done, "done").unwrap();
+        let _other = s.create("other", "", None, Some("sess-2")).unwrap();
+
+        let board = s.board_for_session(Some("sess-1"), None).unwrap();
+        let ids: Vec<i64> = board.iter().map(|i| i.id).collect();
+        assert_eq!(ids, vec![mine], "only this session's live issues");
+    }
+
+    #[test]
+    fn sync_todos_upserts_by_title_and_does_not_close_omitted() {
+        let s = store();
+        // First plan: two items.
+        let n = s
+            .sync_todos(
+                Some("sess-1"),
+                &[
+                    ("Build auth", "pending", "high"),
+                    ("Write tests", "in_progress", "low"),
+                ],
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+        let board = s.board_for_session(Some("sess-1"), None).unwrap();
+        assert_eq!(board.len(), 2);
+
+        // Restate with one completed; the other is omitted (must stay live).
+        s.sync_todos(Some("sess-1"), &[("Build auth", "completed", "high")])
+            .unwrap();
+        let board = s.board_for_session(Some("sess-1"), None).unwrap();
+        let titles: Vec<&str> = board.iter().map(|i| i.title.as_str()).collect();
+        // "Build auth" closed (off the board), "Write tests" untouched (still live).
+        assert_eq!(titles, vec!["Write tests"], "omitted item not auto-closed");
+        // No duplicate "Build auth" row was created on the second sync.
+        assert_eq!(s.search("Build auth", 10).unwrap().len(), 1);
+        let done = s.search("Build auth", 10).unwrap().pop().unwrap();
+        assert_eq!(done.status, "done");
+        assert!(done.closed_at.is_some());
+    }
+
+    #[test]
+    fn sync_todos_reopen_clears_closed_at() {
+        let s = store();
+        s.sync_todos(Some("sess-1"), &[("task", "completed", "normal")])
+            .unwrap();
+        s.sync_todos(Some("sess-1"), &[("task", "in_progress", "normal")])
+            .unwrap();
+        let issue = s.search("task", 10).unwrap().pop().unwrap();
+        assert_eq!(issue.status, "in_progress");
+        assert!(issue.closed_at.is_none(), "reopen must clear closed_at");
     }
 
     #[test]
