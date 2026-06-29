@@ -539,6 +539,7 @@ pub(crate) fn sync_and_drain_via_sentinel(stdout: &mut dyn std::io::Write, budge
 /// [`resume_tui_after_subprocess`]. Returns `None` when there is no
 /// controlling terminal: the input reader is already restored in that case so
 /// the caller may fall back to a non-interactive path.
+#[cfg(unix)]
 pub(crate) fn suspend_tui_for_subprocess(
     user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
 ) -> Option<Vec<u8>> {
@@ -573,6 +574,7 @@ pub(crate) fn suspend_tui_for_subprocess(
 /// Counterpart to [`suspend_tui_for_subprocess`]: re-enters the alternate
 /// screen, restores TUI modes, forces a repaint, syncs against the terminal,
 /// and restarts the input reader.
+#[cfg(unix)]
 pub(crate) fn resume_tui_after_subprocess(
     renderer: &mut crate::ui::renderer::Renderer,
     user_tx: &tokio::sync::mpsc::UnboundedSender<crate::event::UserEvent>,
