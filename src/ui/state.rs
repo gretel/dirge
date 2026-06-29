@@ -205,10 +205,6 @@ pub(crate) struct UiState {
     /// In-flight non-blocking `/btw` side query (one-shot LLM on a spawned task);
     /// the `btw_phase` arm renders the answer. dirge-nret.
     pub(crate) btw_phase: Option<crate::ui::btw::BtwPhaseHandle>,
-    /// In-flight non-blocking `!cmd` shell command (on a spawned task); the
-    /// `shell_phase` arm renders the output and, for a visible command, feeds it
-    /// to the agent. dirge-x9a3.
-    pub(crate) shell_phase: Option<crate::ui::shell_phase::ShellPhaseHandle>,
     /// In-flight non-blocking `/wt-merge` (git merge on a blocking thread); the
     /// `wt_merge_phase` arm runs the post-merge continuation. dirge-iagk.
     /// Unconditional so the select! arm can be (select! rejects `#[cfg]` arms);
@@ -415,7 +411,6 @@ impl UiState {
             compaction_phase: None,
             review_phase: None,
             btw_phase: None,
-            shell_phase: None,
             wt_merge_phase: None,
             active_plan: None,
 
