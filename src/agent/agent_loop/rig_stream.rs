@@ -187,7 +187,7 @@ where
                         // retry. Matches runner.rs:301-304.
                         let detail = if !open_tool_calls.is_empty() {
                             format!(
-                                "stream chunk timed out after {}s while a tool call was mid-assembly (provider stalled emitting tool-call deltas — common DeepSeek symptom; the harness narrows to {}s while assembling tool calls). This is retried automatically; if your model legitimately pauses longer than {}s between deltas, raise `timeouts.tool_call_gap_secs` in config.json.",
+                                "stream chunk timed out after {}s while a tool call was mid-assembly (provider stalled emitting tool-call deltas — common DeepSeek symptom; the harness narrows to {}s while assembling tool calls). Retried automatically when no text has emitted yet; otherwise the partial response is kept to avoid duplicating it. If your model legitimately pauses longer than {}s between deltas, raise `timeouts.tool_call_gap_secs` in config.json.",
                                 t.as_secs(),
                                 tool_call_gap_timeout.as_secs(),
                                 tool_call_gap_timeout.as_secs(),
