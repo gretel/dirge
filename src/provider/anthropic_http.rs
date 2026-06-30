@@ -199,11 +199,10 @@ fn hoist_system_messages(value: &mut serde_json::Value) {
         if m.get("role").and_then(serde_json::Value::as_str) != Some("system") {
             return true;
         }
-        if let Some(text) = system_message_text(m) {
-            if !text.is_empty() {
+        if let Some(text) = system_message_text(m)
+            && !text.is_empty() {
                 hoisted.push(text);
             }
-        }
         false
     });
 

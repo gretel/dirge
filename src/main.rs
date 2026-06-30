@@ -1135,11 +1135,10 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let sandbox = sandbox::Sandbox::new(cli.resolve_sandbox(&cfg));
-    if let Some(image) = cli.resolve_microvm_image(&cfg) {
-        if let Err(e) = sandbox.set_microvm_image(image) {
+    if let Some(image) = cli.resolve_microvm_image(&cfg)
+        && let Err(e) = sandbox.set_microvm_image(image) {
             eprintln!("warning: failed to set microvm image: {e}");
         }
-    }
     if let Err(e) =
         sandbox.set_microvm_resources(cfg.resolve_microvm_cpus(), cfg.resolve_microvm_memory_mib())
     {

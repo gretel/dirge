@@ -1507,8 +1507,8 @@ pub async fn run_interactive(
                         // Ctrl+C is forwarded as byte `0x03` (the PTY line
                         // discipline delivers it as a genuine SIGINT, so the
                         // child traps/aborts normally — no UI fakery).
-                        if ui.shell_box_visible {
-                            if let Some(s) = ui.shell_session.as_mut() {
+                        if ui.shell_box_visible
+                            && let Some(s) = ui.shell_session.as_mut() {
                                 if key.code == KeyCode::Esc {
                                     if let Some(tx) = s.interrupt.take() {
                                         let _ = tx.send(());
@@ -1521,7 +1521,6 @@ pub async fn run_interactive(
                                 renderer.request_repaint();
                                 continue;
                             }
-                        }
                         // #234 chord-sequence runtime (global commands). While
                         // a prefix is pending, Esc / Ctrl+G cancels it (before
                         // the Esc/Ctrl+C panic gesture below). Then accumulate
@@ -2898,11 +2897,10 @@ pub async fn run_interactive(
                         if let Some(parser) = ui.shell_parser.as_mut() {
                             parser.process(&chunk);
                         }
-                        if ui.shell_box_visible {
-                            if let Some(parser) = ui.shell_parser.as_ref() {
+                        if ui.shell_box_visible
+                            && let Some(parser) = ui.shell_parser.as_ref() {
                                 renderer.set_shell_overlay(shell_overlay_rows(parser));
                             }
-                        }
                         renderer.request_repaint();
                     }
                     crate::ui::shell_session::ShellEvent::Exited { outcome } => {

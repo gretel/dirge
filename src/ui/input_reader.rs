@@ -106,11 +106,10 @@ pub(crate) fn spawn_input_reader(user_tx: tokio::sync::mpsc::UnboundedSender<Use
                         }),
                         _ => None,
                     };
-                    if let Some(ev) = ev {
-                        if let Err(tokio::sync::mpsc::error::SendError(_)) = user_tx.send(ev) {
+                    if let Some(ev) = ev
+                        && let Err(tokio::sync::mpsc::error::SendError(_)) = user_tx.send(ev) {
                             break;
                         }
-                    }
                 }
                 Ok(event::Event::Paste(text)) => {
                     if let Err(tokio::sync::mpsc::error::SendError(_)) =

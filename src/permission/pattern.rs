@@ -151,15 +151,14 @@ fn glob_to_regex(pattern: &str, path_style: bool) -> String {
     // `^cargo test .*$`, which requires a trailing space, so the BARE
     // command `cargo test` (no args) silently re-prompted — and most
     // `default_bash_rules` entries use the ` **` form.
-    if !path_style && !pattern.ends_with("\\ *") {
-        if let Some(head) = pattern
+    if !path_style && !pattern.ends_with("\\ *")
+        && let Some(head) = pattern
             .strip_suffix(" **")
             .or_else(|| pattern.strip_suffix(" *"))
         {
             let head_regex = glob_to_regex_inner(head, path_style);
             return format!("^{head_regex}(?: .*)?$");
         }
-    }
     // PERM-4: a user-written `/etc/**` should match BOTH the
     // directory itself and everything beneath it. Default inner
     // semantics emit `^/etc/.*$` for that pattern, which requires

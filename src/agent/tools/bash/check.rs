@@ -80,8 +80,8 @@ fn fold_cd_dirs(base: &str, segments: &[String]) -> String {
     for seg in segments {
         let mut it = seg.split_whitespace();
         let head = it.next().unwrap_or("");
-        if head == "cd" || head == "pushd" {
-            if let Some(target) = it.find(|a| !a.starts_with('-')) {
+        if (head == "cd" || head == "pushd")
+            && let Some(target) = it.find(|a| !a.starts_with('-')) {
                 let t = target.trim_matches(['"', '\'']);
                 if t.is_empty() {
                     continue;
@@ -93,7 +93,6 @@ fn fold_cd_dirs(base: &str, segments: &[String]) -> String {
                     dir = normalize_lexical(&dir.join(tp));
                 }
             }
-        }
     }
     dir.to_string_lossy().into_owned()
 }
