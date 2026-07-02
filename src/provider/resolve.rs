@@ -357,7 +357,7 @@ pub fn install_plugin_providers(map: HashMap<String, ProviderEntry>) -> usize {
     size
 }
 
-fn plugin_provider(name: &str) -> Option<ProviderEntry> {
+pub(crate) fn plugin_provider(name: &str) -> Option<ProviderEntry> {
     PLUGIN_PROVIDERS.get().and_then(|m| m.get(name).cloned())
 }
 

@@ -652,6 +652,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let provider = cli.resolve_provider(&cfg);
+    // Install built-in providers before resolution so native aliases
+    // like opencode are visible to resolve_role and create_client.
+    provider::install_plugin_providers(provider::opencode::opencode_providers());
     let config_model = cfg
         .resolve_role(config::ConfigRole::Default)
         .and_then(|(_, e)| e.model);

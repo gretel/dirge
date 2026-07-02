@@ -6,6 +6,7 @@ mod build;
 pub mod client;
 pub(crate) mod codex_http;
 mod dispatch;
+pub(crate) mod opencode;
 mod resolve;
 mod run;
 mod spawn;

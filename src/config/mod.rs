@@ -730,6 +730,12 @@ impl Config {
         {
             return Some((alias, entry.clone()));
         }
+        // Check plugin-registered providers (native aliases like opencode).
+        if let Some(entry) = crate::provider::plugin_provider(&alias)
+            .or_else(|| crate::provider::plugin_provider(&alias.to_ascii_lowercase()))
+        {
+            return Some((alias, entry.clone()));
+        }
         // Alias names a built-in but no explicit entry: synthesize a
         // default entry so callers don't have to special-case.
         if crate::provider::parse_provider(&alias).is_some() {
