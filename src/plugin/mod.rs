@@ -553,7 +553,7 @@ impl PluginManager {
         let _ = self.worker.eval(&format!("(set {var} \"\")"));
         raw.lines()
             .filter(|s| !s.is_empty())
-            .map(|s| unescape_harness_field(s))
+            .map(unescape_harness_field)
             .collect()
     }
 
