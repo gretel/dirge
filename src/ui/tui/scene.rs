@@ -16,7 +16,7 @@ use ratatui::style::{Color as RColor, Style};
 use super::bottom::{AvatarSpec, BottomBody, BottomStrip};
 use super::chat::{ChatPane, crossterm_to_ratatui};
 use super::frame::{ChatBotFrame, TopFrame};
-use super::layout::Layout;
+use super::layout::{LEFT_PANEL_MIN_W, Layout, RIGHT_PANEL_MIN_W};
 use super::panels::{LeftPanel, RightPanel};
 use crate::ui::renderer::{
     LeftPanelInfo, LineEntry, PanelData, PanelMode, SelectionRange, SubagentStatusRow,
@@ -101,7 +101,7 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     f.render_widget(TopFrame::new(&layout).style(frame_style), area);
 
     // Left panel — idle card or subagent list. Skip on narrow terminals.
-    if scene.show_left_panel && layout.left_panel.width >= 12 {
+    if scene.show_left_panel && layout.left_panel.width >= LEFT_PANEL_MIN_W {
         f.render_widget(
             LeftPanel::new(scene.left_info, scene.subagents).border_style(frame_style),
             layout.left_panel,
@@ -118,7 +118,7 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     f.render_widget(chat, area);
 
     // Right panel — stacked sub-panels. Skip on narrow terminals.
-    if scene.show_right_panel && layout.right_panel.width >= 16 {
+    if scene.show_right_panel && layout.right_panel.width >= RIGHT_PANEL_MIN_W {
         #[allow(unused_variables)]
         let is_debug = scene.right_panel_mode == PanelMode::Debug;
         #[cfg(feature = "dap")]
@@ -683,6 +683,43 @@ mod tests {
         assert!(
             region_has_content(&b, right_only.right_panel),
             "right should draw"
+        );
+    }
+
+    /// dirge-tkth: the Auto-mode show threshold (`PANEL_AUTO_MIN_COLS`)
+    /// must agree with the per-panel draw minima, so Auto never reserves a
+    /// gutter it then refuses to paint. At exactly the threshold BOTH
+    /// panels clear their draw floors; one column below it the right panel
+    /// is too narrow to draw — the blank-gutter boundary the threshold
+    /// must sit above.
+    #[test]
+    fn auto_threshold_agrees_with_panel_draw_minima() {
+        use crate::ui::renderer::PANEL_AUTO_MIN_COLS;
+        // At the threshold: both panels satisfy their draw minima.
+        let at = Layout::with_panels(PANEL_AUTO_MIN_COLS, 30, 1, true, true);
+        assert!(
+            at.left_panel.width >= LEFT_PANEL_MIN_W,
+            "left panel {} < {} at threshold {} cols",
+            at.left_panel.width,
+            LEFT_PANEL_MIN_W,
+            PANEL_AUTO_MIN_COLS
+        );
+        assert!(
+            at.right_panel.width >= RIGHT_PANEL_MIN_W,
+            "right panel {} < {} at threshold {} cols",
+            at.right_panel.width,
+            RIGHT_PANEL_MIN_W,
+            PANEL_AUTO_MIN_COLS
+        );
+        // One column below: the right panel falls under its draw floor —
+        // if Auto showed here it would reserve a blank gutter.
+        let below = Layout::with_panels(PANEL_AUTO_MIN_COLS - 1, 30, 1, true, true);
+        assert!(
+            below.right_panel.width < RIGHT_PANEL_MIN_W,
+            "right panel {} >= {} at {} cols; threshold has slack and a blank-gutter zone exists",
+            below.right_panel.width,
+            RIGHT_PANEL_MIN_W,
+            PANEL_AUTO_MIN_COLS - 1
         );
     }
 
