@@ -643,6 +643,25 @@ impl SkillStore {
             .map_err(|e| format!("Failed to archive skill: {e}"))?;
         Ok(changed > 0)
     }
+
+    /// Archive regardless of the pinned flag, and clear the pin. Used by
+    /// the explicit force-delete path (dirge-8gdv.6): once the on-disk
+    /// directory has been moved to the archive, the row must not stay
+    /// active — a pinned row would survive plain [`archive`] and re-enter
+    /// the curator pointing at a directory that no longer exists. Clearing
+    /// pinned keeps directory-gone implying row-not-active.
+    pub fn force_archive(&self, name: &str) -> Result<bool, String> {
+        let conn = self.conn.lock().unwrap();
+        let now = chrono::Utc::now().to_rfc3339();
+        let changed = conn
+            .execute(
+                "UPDATE skills SET status = 'archived', pinned = 0, updated_at = ?1
+                 WHERE name = ?2 AND status = 'active'",
+                params![now, name],
+            )
+            .map_err(|e| format!("Failed to force-archive skill: {e}"))?;
+        Ok(changed > 0)
+    }
 }
 
 /// The RFC3339 cutoff before which a use no longer counts as "recent".
@@ -1052,5 +1071,26 @@ mod tests {
         // Archived skills drop out of the active listing.
         let active = s.list_active().expect("list");
         assert!(active.iter().all(|r| r.name != "learned"));
+    }
+
+    #[test]
+    fn force_archive_removes_a_pinned_row_and_clears_the_pin() {
+        // dirge-8gdv.6: a force-delete of a pinned skill moves the
+        // directory, so the row must not stay active — otherwise it
+        // re-enters the curator pointing at a directory that's gone.
+        let s = store();
+        s.create("filed", "d", "b", SkillSource::Learned, None)
+            .expect("filed");
+        s.set_pinned("filed", true).expect("pin");
+        // The pinned guard makes plain archive a no-op here.
+        assert!(!s.archive("filed").expect("plain archive refuses pinned"));
+        assert_eq!(s.get("filed").unwrap().unwrap().status, "active");
+        // force_archive archives regardless and clears the pin.
+        assert!(s.force_archive("filed").expect("force archive"));
+        let row = s.get("filed").unwrap().unwrap();
+        assert_eq!(row.status, "archived");
+        assert!(!row.pinned);
+        let active = s.list_active().expect("list");
+        assert!(active.iter().all(|r| r.name != "filed"));
     }
 }

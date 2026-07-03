@@ -284,7 +284,16 @@ impl Tool for SkillTool {
                     // fails the row stays status='active' and re-enters the
                     // curator pointing at a directory that no longer exists.
                     // Log, don't swallow.
-                    if let Err(e) = store.archive(name) {
+                    // dirge-8gdv.6: a forced delete may target a pinned skill,
+                    // which plain archive refuses (pinned=0 guard) — leaving a
+                    // ghost active row. force_archive clears the pin so the
+                    // row always follows the directory out.
+                    let archived = if force {
+                        store.force_archive(name)
+                    } else {
+                        store.archive(name)
+                    };
+                    if let Err(e) = archived {
                         tracing::warn!(
                             target: "dirge::skill",
                             skill = %name,
