@@ -128,12 +128,14 @@ pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
         )
         .await;
         ctx.session.model = new_model.clone();
-        // On a cross-provider switch the active provider IS the target alias;
-        // otherwise it stays whatever the CLI/config resolves to.
-        ctx.session.provider = match &switched_to {
-            Some(alias) => CompactString::new(alias),
-            None => ctx.cli.resolve_provider(ctx.cfg),
-        };
+        // On a cross-provider switch the active provider becomes the target
+        // alias. On a same-provider model swap it is left UNCHANGED — the live
+        // client is still on the previously active provider, and resetting to
+        // the CLI/config default here would make the next cross-provider
+        // target call reason from the wrong active provider.
+        if let Some(alias) = &switched_to {
+            ctx.session.provider = CompactString::new(alias);
+        }
         let new_ctx = ctx.cfg.resolve_context_window(new_model.as_str());
         let old_ctx = ctx.session.context_window;
         if new_ctx != old_ctx {
