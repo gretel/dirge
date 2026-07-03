@@ -306,7 +306,10 @@ impl PluginManager {
     /// desktop actions against the permission PDP.
     #[cfg(feature = "experimental-ui-computer-use")]
     pub fn set_deny_tools_for_computer_use(&mut self, deny: &[String]) {
-        let items: Vec<String> = deny.iter().map(|t| format!("\"{t}\"")).collect();
+        let items: Vec<String> = deny
+            .iter()
+            .map(|t| format!("\"{}\"", escape_janet_string(t)))
+            .collect();
         let expr = format!(
             "(harness/set-computer-use-deny-tools [{}])",
             items.join(" ")
@@ -1232,24 +1235,31 @@ impl PluginManager {
     }
 
     /// Snapshot the plugin-registered renderers as `(custom_type,
-    /// handler-fn-name)` pairs. Same blob format as `list_commands`.
+    /// handler-fn-name)` pairs. Tab-separated, harness/-escape'd fields
+    /// — same format as `list_message_renderers`. Duplicate `type`
+    /// registrations resolve last-wins.
     pub fn list_renderers(&mut self) -> Vec<(String, String)> {
         let raw = match self.worker.eval("harness-renderer-list") {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        raw.lines()
+        if raw.is_empty() {
+            return Vec::new();
+        }
+        let parsed: Vec<(String, String)> = raw
+            .lines()
             .filter_map(|line| {
-                let mut parts = line.splitn(2, '|');
-                let kind = parts.next()?.trim();
-                let handler = parts.next()?.trim();
-                if kind.is_empty() || handler.is_empty() {
+                let mut parts = line.split('\t');
+                let t = unescape_harness_field(parts.next()?);
+                let h = unescape_harness_field(parts.next()?);
+                if t.is_empty() || h.is_empty() {
                     None
                 } else {
-                    Some((kind.to_string(), handler.to_string()))
+                    Some((t, h))
                 }
             })
-            .collect()
+            .collect();
+        dedup_last_wins(parsed, "renderer", |(t, _)| t.clone())
     }
 
     /// Invoke a registered renderer with the entry's `data` string.
