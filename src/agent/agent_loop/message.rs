@@ -208,6 +208,40 @@ pub enum DeltaPhase {
     ToolCallEnd,
 }
 
+impl DeltaPhase {
+    /// Whether this phase represents observable downstream content
+    /// the consumer has already seen. Once any content phase has
+    /// streamed we don't retry — re-running would duplicate output
+    /// the user already received.
+    ///
+    /// PROV-5: tool-call deltas are deliberately NOT content. The
+    /// model emitting a tool-call JSON fragment is not the same as
+    /// the tool actually running — dispatch happens AFTER the stream
+    /// ends, downstream of this layer. A 503 mid-tool-call emission
+    /// is therefore retryable; the consumer resets its partial
+    /// assistant state on `StreamEvent::Retry` (see `stream.rs`) so
+    /// the second attempt's tool calls don't accumulate on the
+    /// first attempt's.
+    ///
+    /// Exhaustive by design: a new `DeltaPhase` variant is a compile
+    /// error here, so the retry wrapper and the billing-fallback
+    /// safety net can't silently disagree about what counts as
+    /// committed content.
+    pub(crate) fn is_content(&self) -> bool {
+        match self {
+            DeltaPhase::TextStart
+            | DeltaPhase::TextDelta
+            | DeltaPhase::ThinkingStart
+            | DeltaPhase::ThinkingDelta => true,
+            DeltaPhase::TextEnd
+            | DeltaPhase::ThinkingEnd
+            | DeltaPhase::ToolCallStart
+            | DeltaPhase::ToolCallDelta
+            | DeltaPhase::ToolCallEnd => false,
+        }
+    }
+}
+
 /// Events the agent loop emits to consumers. Port of pi's
 /// `AgentEvent` (types.ts:403). Phase 1 introduces only the
 /// `message_*` family that `stream_assistant_response` produces;
@@ -623,6 +657,36 @@ impl LoopEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `DeltaPhase::is_content()` is the single source of truth for
+    /// "has downstream output already been emitted?" — it gates both
+    /// the retry wrapper (`retry.rs`) and the billing-fallback safety
+    /// net (`billing_fallback.rs`). Only text + thinking phases count;
+    /// tool-call phases are buffered until the stream ends (PROV-5).
+    ///
+    /// Exhaustive over the current variants: adding a new one forces a
+    /// deliberate classification here (and, because the method is an
+    /// exhaustive `match`, a compiler error until it's handled).
+    #[test]
+    fn delta_phase_is_content_classifies_every_variant() {
+        for phase in [
+            DeltaPhase::TextStart,
+            DeltaPhase::TextDelta,
+            DeltaPhase::ThinkingStart,
+            DeltaPhase::ThinkingDelta,
+        ] {
+            assert!(phase.is_content(), "{phase:?} should be content");
+        }
+        for phase in [
+            DeltaPhase::TextEnd,
+            DeltaPhase::ThinkingEnd,
+            DeltaPhase::ToolCallStart,
+            DeltaPhase::ToolCallDelta,
+            DeltaPhase::ToolCallEnd,
+        ] {
+            assert!(!phase.is_content(), "{phase:?} should NOT be content");
+        }
+    }
 
     /// Locks the `Value` transcript shape for every `LoopMessage` variant.
     /// This is the single source of truth that stream.rs / run.rs /

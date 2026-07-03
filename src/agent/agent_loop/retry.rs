@@ -167,7 +167,7 @@ pub fn retrying_stream_fn_with_non_retryable(
                         StreamEvent::Delta { phase, .. } => {
                             // Real content streamed → no future
                             // retry is safe (would duplicate).
-                            if is_content_delta(*phase) {
+                            if phase.is_content() {
                                 committed = true;
                             }
                             yield evt;
@@ -251,27 +251,6 @@ pub fn retrying_stream_fn_with_non_retryable(
             }
         })
     })
-}
-
-/// Phases that represent observable downstream content. Once any
-/// of these have streamed, we don't retry — the consumer has
-/// already seen output and re-running would duplicate it.
-///
-/// PROV-5: tool-call deltas are NOT included. The model emitting
-/// a tool-call JSON fragment is not the same as the tool actually
-/// running — dispatch happens AFTER the stream ends, downstream
-/// of this retry layer. A 503 mid-tool-call-emission is therefore
-/// retryable; the consumer resets its partial-assistant state on
-/// `StreamEvent::Retry` (see `stream.rs`) so the second attempt's
-/// tool calls don't accumulate on top of the first attempt's.
-fn is_content_delta(phase: DeltaPhase) -> bool {
-    matches!(
-        phase,
-        DeltaPhase::TextStart
-            | DeltaPhase::TextDelta
-            | DeltaPhase::ThinkingStart
-            | DeltaPhase::ThinkingDelta
-    )
 }
 
 #[cfg(test)]
@@ -568,7 +547,7 @@ mod tests {
                     partial: empty_assistant(),
                 },
                 // A tool-call fragment is NOT committed content
-                // (is_content_delta) — only text/thinking phases are.
+                // (DeltaPhase::is_content) — only text/thinking phases are.
                 StreamEvent::Delta {
                     partial: empty_assistant(),
                     phase: DeltaPhase::ToolCallStart,
@@ -745,34 +724,6 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         // Final event surfaces the abort.
         assert!(matches!(events.last(), Some(StreamEvent::Error { .. })));
-    }
-
-    /// `is_content_delta` returns true for text + thinking phases
-    /// (which the user has already seen) and false for everything
-    /// else. PROV-5: tool-call deltas are explicitly NOT committed
-    /// — they're buffered until the stream ends and only then
-    /// dispatched, so a 503 during ToolCallStart/Delta/End is
-    /// safely retryable. The consumer in `stream.rs` resets its
-    /// partial-assistant state on `StreamEvent::Retry`.
-    #[test]
-    fn is_content_delta_classifies_phases() {
-        for phase in [
-            DeltaPhase::TextStart,
-            DeltaPhase::TextDelta,
-            DeltaPhase::ThinkingStart,
-            DeltaPhase::ThinkingDelta,
-        ] {
-            assert!(is_content_delta(phase), "{phase:?} should be content");
-        }
-        for phase in [
-            DeltaPhase::TextEnd,
-            DeltaPhase::ThinkingEnd,
-            DeltaPhase::ToolCallStart,
-            DeltaPhase::ToolCallDelta,
-            DeltaPhase::ToolCallEnd,
-        ] {
-            assert!(!is_content_delta(phase), "{phase:?} should NOT be content");
-        }
     }
 
     /// Records the `messages` each inner attempt was called with, so a test can

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 
-use crate::agent::agent_loop::message::{DeltaPhase, StreamEvent};
+use crate::agent::agent_loop::message::StreamEvent;
 use crate::agent::agent_loop::stream::StreamFn;
 use crate::permission::ask::{AskRequest, AskSender, UserDecision};
 
@@ -130,7 +130,7 @@ pub(crate) fn with_openai_api_billing_fallback(
                         }
                     }
                     StreamEvent::Delta { partial, phase } => {
-                        if is_content_delta(phase) {
+                        if phase.is_content() {
                             committed = true;
                         }
                         yield StreamEvent::Delta { partial, phase };
@@ -191,16 +191,6 @@ fn model_access_is_plan_limited(lower: &str) -> bool {
         || lower.contains("account")
         || lower.contains("workspace");
     access_denied && plan_scoped
-}
-
-fn is_content_delta(phase: DeltaPhase) -> bool {
-    matches!(
-        phase,
-        DeltaPhase::TextStart
-            | DeltaPhase::TextDelta
-            | DeltaPhase::ThinkingStart
-            | DeltaPhase::ThinkingDelta
-    )
 }
 
 #[cfg(test)]
