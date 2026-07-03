@@ -15,7 +15,7 @@ use std::path::Path;
 /// string so the `starts_with` comparisons in `is_external_path`
 /// still work for the literal form.
 pub(crate) fn canonicalize_for_cache(working_dir: &str) -> String {
-    std::fs::canonicalize(working_dir)
+    dunce::canonicalize(working_dir)
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|| working_dir.to_string())
@@ -27,7 +27,7 @@ pub(crate) fn canonicalize_for_cache(working_dir: &str) -> String {
 /// home for the `path.canonicalize().unwrap_or_else(|_| path.into())`
 /// idiom that was copy-pasted with varied fallbacks (dirge-b2g7).
 pub fn canonical_or_self(path: &Path) -> std::path::PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Normalize a path string for prefix comparison. On Windows
@@ -72,6 +72,36 @@ pub(crate) fn path_is_within(child: &str, base: &str) -> bool {
     child == base || child.starts_with(&format!("{base}/"))
 }
 
+/// Drop-in replacement for `Path::starts_with` when the two sides may
+/// come back from canonicalization in different Windows forms. dunce
+/// returns MIXED forms within one tree: short paths get simplified
+/// (`C:\proj`) while >MAX_PATH or reserved-name (aux/nul) paths stay
+/// verbatim (`\\?\C:\...`). `Path::starts_with` compares prefix
+/// components (`VerbatimDisk` vs `Disk`) and returns false, so prefix
+/// guards silently fail. Compares the [`normalize_for_prefix`] forms
+/// instead, boundary-safe. Unlike [`path_is_within`] a root `base`
+/// matches (same as `Path::starts_with`) — callers like the LSP
+/// root walk own their boundary semantics. No-op normalization on
+/// Unix, so behavior there is identical to `Path::starts_with`.
+pub(crate) fn path_starts_with(child: &Path, base: &Path) -> bool {
+    let child = normalize_for_prefix(&child.to_string_lossy());
+    let base = normalize_for_prefix(&base.to_string_lossy());
+    let base = base.trim_end_matches('/');
+    if base.is_empty() {
+        // `base` was the filesystem root (`/`): every absolute path is
+        // under it, matching `Path::starts_with`.
+        return child.starts_with('/');
+    }
+    child == base || child.starts_with(&format!("{base}/"))
+}
+
+/// Path equality over the [`normalize_for_prefix`] forms — the `==`
+/// analogue of [`path_starts_with`], for the same mixed
+/// verbatim-vs-simplified reason. No-op normalization on Unix.
+pub(crate) fn paths_equivalent(a: &Path, b: &Path) -> bool {
+    normalize_for_prefix(&a.to_string_lossy()) == normalize_for_prefix(&b.to_string_lossy())
+}
+
 /// `c:` / `Z:` — a normalized drive root with no path component.
 fn is_drive_root(s: &str) -> bool {
     let b = s.as_bytes();
@@ -85,7 +115,7 @@ pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {
     } else {
         Path::new(working_dir).join(p)
     };
-    match std::fs::canonicalize(&joined) {
+    match dunce::canonicalize(&joined) {
         Ok(canonical) => canonical.to_string_lossy().to_string(),
         Err(_) => {
             // The full path doesn't exist on disk (e.g. a write to a
@@ -116,7 +146,7 @@ pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {
             let mut ancestor = normalized.as_path();
             let mut tail: Vec<std::ffi::OsString> = Vec::new();
             loop {
-                if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) {
+                if let Ok(canonical_ancestor) = dunce::canonicalize(ancestor) {
                     let mut out = canonical_ancestor;
                     for seg in tail.iter().rev() {
                         out.push(seg);
@@ -217,6 +247,85 @@ mod tests {
     use super::*;
 
     #[test]
+    fn path_starts_with_basic_and_boundary() {
+        assert!(path_starts_with(
+            Path::new("/proj/src/a.rs"),
+            Path::new("/proj")
+        ));
+        assert!(path_starts_with(Path::new("/proj"), Path::new("/proj")));
+        // Boundary-safe: a sibling sharing a name prefix is NOT within.
+        assert!(!path_starts_with(
+            Path::new("/proj-other/a.rs"),
+            Path::new("/proj")
+        ));
+        assert!(!path_starts_with(
+            Path::new("/elsewhere/a.rs"),
+            Path::new("/proj")
+        ));
+        // Unlike `path_is_within`, a root base matches (Path::starts_with
+        // semantics — nearest_root callers may legitimately stop at `/`).
+        assert!(path_starts_with(Path::new("/a/b"), Path::new("/")));
+    }
+
+    #[test]
+    fn paths_equivalent_basic() {
+        assert!(paths_equivalent(
+            Path::new("/proj/src"),
+            Path::new("/proj/src")
+        ));
+        assert!(!paths_equivalent(
+            Path::new("/proj/src"),
+            Path::new("/proj")
+        ));
+    }
+
+    /// The LSP regression: dunce returns MIXED forms within one tree on
+    /// Windows — short paths simplified (`C:\proj`), >MAX_PATH or
+    /// reserved-name (aux/nul) paths verbatim (`\\?\C:\...`). A raw
+    /// `Path::starts_with` compares VerbatimDisk vs Disk prefix components
+    /// and always fails, so `nearest_root` bailed and LSP root detection
+    /// silently stopped for that file.
+    #[cfg(windows)]
+    #[test]
+    fn path_starts_with_windows_verbatim_vs_simplified() {
+        assert!(path_starts_with(
+            Path::new(r"\\?\C:\proj\aux\src\a.rs"),
+            Path::new(r"C:\proj"),
+        ));
+        assert!(path_starts_with(
+            Path::new(r"C:\proj\src\a.rs"),
+            Path::new(r"\\?\C:\proj"),
+        ));
+        // Drive-letter case and mixed separators.
+        assert!(path_starts_with(
+            Path::new(r"\\?\c:\proj/src/a.rs"),
+            Path::new(r"C:\proj"),
+        ));
+        // Boundary still enforced under normalization.
+        assert!(!path_starts_with(
+            Path::new(r"\\?\C:\proj-other\a.rs"),
+            Path::new(r"C:\proj"),
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn paths_equivalent_windows_verbatim_vs_simplified() {
+        assert!(paths_equivalent(
+            Path::new(r"\\?\C:\proj"),
+            Path::new(r"C:\proj")
+        ));
+        assert!(paths_equivalent(
+            Path::new(r"\\?\c:\proj"),
+            Path::new(r"C:\proj")
+        ));
+        assert!(!paths_equivalent(
+            Path::new(r"\\?\C:\proj2"),
+            Path::new(r"C:\proj")
+        ));
+    }
+
+    #[test]
     fn path_is_within_basic_and_boundary() {
         assert!(path_is_within("/proj/src/a.rs", "/proj"));
         assert!(path_is_within("/proj", "/proj"));
@@ -244,6 +353,38 @@ mod tests {
         assert!(!path_is_within(r"\\?\C:\proj-other\a.dfy", r"C:\proj"));
     }
 
+    /// Regression: `resolve_absolute` must NOT leak a Windows verbatim
+    /// (`\\?\`) prefix into the string it returns. That form flowed into
+    /// tool `resolved_path`s (apply_patch, edit, read-gate cache keys) and
+    /// surfaced to the model as `\\?\C:\...\file.dfy`. `dunce::canonicalize`
+    /// strips it for normal-length paths. Applies to both existing files
+    /// and not-yet-created ones (the ancestor-walk branch).
+    #[cfg(windows)]
+    #[test]
+    fn resolve_absolute_has_no_verbatim_prefix() {
+        let dir = std::env::temp_dir().join(format!("dirge-verbatim-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("here.dfy");
+        std::fs::write(&existing, "x").unwrap();
+
+        let r1 = resolve_absolute(existing.to_str().unwrap(), "/");
+        assert!(
+            !r1.starts_with(r"\\?\"),
+            "existing file leaked verbatim prefix: {r1}"
+        );
+
+        // Nonexistent file (create path) — exercises the ancestor-walk branch.
+        let missing = dir.join("newdir").join("not-yet.dfy");
+        let r2 = resolve_absolute(missing.to_str().unwrap(), dir.to_str().unwrap());
+        assert!(
+            !r2.starts_with(r"\\?\"),
+            "new-file path leaked verbatim prefix: {r2}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// F7: `resolve_absolute` must follow symlinks so a symlink
     /// pointing at a deny-listed path can't bypass the rule.
     #[test]
@@ -259,10 +400,17 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&target, &link).unwrap();
         #[cfg(windows)]
-        std::os::windows::fs::symlink_file(&target, &link).unwrap();
+        if let Err(e) = std::os::windows::fs::symlink_file(&target, &link) {
+            // Creating symlinks on Windows needs SeCreateSymbolicLinkPrivilege
+            // (Developer Mode or admin; OS error 1314 otherwise). Skip
+            // gracefully where it's unavailable instead of failing the suite.
+            eprintln!("skipping resolve_absolute_follows_symlinks: cannot create symlink: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
 
         let resolved = resolve_absolute(link.to_str().unwrap(), "/");
-        let expected = std::fs::canonicalize(&target)
+        let expected = dunce::canonicalize(&target)
             .unwrap()
             .to_string_lossy()
             .into_owned();
@@ -289,14 +437,29 @@ mod tests {
         let link = base.join("link_proj");
         #[cfg(unix)]
         std::os::unix::fs::symlink(&real, &link).unwrap();
+        #[cfg(windows)]
+        if let Err(e) = std::os::windows::fs::symlink_dir(&real, &link) {
+            // Needs SeCreateSymbolicLinkPrivilege on Windows (OS error 1314
+            // without Developer Mode / admin). Skip gracefully.
+            eprintln!(
+                "skipping resolve_absolute_walks_to_deepest_existing_ancestor_through_symlink: \
+                 cannot create symlink: {e}"
+            );
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
 
         // newdir/sub do NOT exist yet; only `link_proj` (→ real_proj) does.
         let target = link.join("newdir/sub/file.rs");
         let resolved = resolve_absolute(target.to_str().unwrap(), link.to_str().unwrap());
 
-        let expected = std::fs::canonicalize(&real)
+        // Build the tail with per-component joins so the separators match how
+        // `resolve_absolute` reattaches them (platform-native: `\` on Windows).
+        let expected = dunce::canonicalize(&real)
             .unwrap()
-            .join("newdir/sub/file.rs")
+            .join("newdir")
+            .join("sub")
+            .join("file.rs")
             .to_string_lossy()
             .into_owned();
         assert_eq!(
@@ -327,7 +490,7 @@ mod tests {
         let traversal = "newdir/../../../../../../etc/passwd";
         let resolved = resolve_absolute(traversal, &cwd);
 
-        let cwd_canonical = std::fs::canonicalize(&real).unwrap();
+        let cwd_canonical = dunce::canonicalize(&real).unwrap();
         let resolved_path = std::path::PathBuf::from(&resolved);
         assert!(
             !resolved_path.starts_with(&cwd_canonical),
@@ -350,7 +513,7 @@ mod tests {
         let new_file = dir.join("does-not-exist-yet.txt");
 
         let resolved = resolve_absolute(new_file.to_str().unwrap(), "/");
-        let expected_parent = std::fs::canonicalize(&dir).unwrap();
+        let expected_parent = dunce::canonicalize(&dir).unwrap();
         let expected = expected_parent
             .join("does-not-exist-yet.txt")
             .to_string_lossy()
@@ -381,7 +544,7 @@ mod tests {
 
         let resolved = resolve_absolute(traversal, &cwd);
 
-        let cwd_canonical = std::fs::canonicalize(&cwd).unwrap();
+        let cwd_canonical = dunce::canonicalize(&cwd).unwrap();
         let resolved_path = std::path::PathBuf::from(&resolved);
         assert!(
             !resolved_path.starts_with(&cwd_canonical) && !resolved_path.starts_with(&cwd),
