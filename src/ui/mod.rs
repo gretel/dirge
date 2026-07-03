@@ -7,6 +7,7 @@ pub(crate) mod buffer;
 mod chat_state;
 pub(crate) mod colors;
 pub(crate) mod compaction;
+pub(crate) mod done_phase;
 pub(crate) mod events;
 pub(crate) mod gitstatus;
 mod highlight;
@@ -18,9 +19,11 @@ pub(crate) mod notifications;
 pub(crate) mod panel_data;
 mod panel_render;
 pub(crate) mod permission_ui;
+pub(crate) mod phase;
 pub(crate) mod picker;
 #[cfg(feature = "plugin")]
 mod plugin_tree;
+pub(crate) mod prompt_phase;
 #[cfg(unix)]
 pub(crate) mod pty_relay;
 #[cfg(unix)]
@@ -1621,7 +1624,7 @@ pub async fn run_interactive(
                                 // `AbortRunnerOnDrop` guard cancels the inner
                                 // phase runner too (dirge-vuzz).
                                 if let Some(ph) = ui.plan_phase.take() {
-                                    ph.task.abort();
+                                    ph.core.task.abort();
                                 }
                                 // dirge-tv3p: abort an in-flight non-blocking
                                 // compaction (the summarizer task) too. Dropping
@@ -1629,21 +1632,33 @@ pub async fn run_interactive(
                                 // task cancels the LLM call. Any continuation
                                 // prompt is discarded with the handle.
                                 if let Some(ph) = ui.compaction_phase.take() {
-                                    ph.task.abort();
+                                    ph.core.task.abort();
+                                }
+                                // dirge-qhfk: and an in-flight off-loop on-prompt
+                                // hook dispatch; its submit continuation is
+                                // discarded (is_running is cleared above).
+                                if let Some(ph) = ui.prompt_phase.take() {
+                                    ph.core.task.abort();
+                                }
+                                // dirge-qhfk: and an in-flight off-loop Done hook
+                                // chain; its model-swap + finalize is discarded
+                                // (the partial turn is persisted below).
+                                if let Some(ph) = ui.done_phase.take() {
+                                    ph.core.task.abort();
                                 }
                                 // dirge-4koy: likewise abort an in-flight `/plan`
                                 // reviewer (the write-disabled reviewer task);
                                 // its verdict continuation is discarded.
                                 if let Some(ph) = ui.review_phase.take() {
-                                    ph.task.abort();
+                                    ph.core.task.abort();
                                 }
                                 // dirge-nret: and an in-flight `/btw` side query.
                                 if let Some(ph) = ui.btw_phase.take() {
-                                    ph.task.abort();
+                                    ph.core.task.abort();
                                 }
                                 // dirge-iagk: and an in-flight `/wt-merge`.
                                 if let Some(ph) = ui.wt_merge_phase.take() {
-                                    ph.task.abort();
+                                    ph.core.task.abort();
                                 }
                                 // Cooperative cancel first: lets the
                                 // retry loop and rig stream observe
@@ -1741,23 +1756,31 @@ pub async fn run_interactive(
                             ui.is_running = false;
                             // Abort an in-flight phased `/plan` task too (dirge-vuzz).
                             if let Some(ph) = ui.plan_phase.take() {
-                                ph.task.abort();
+                                ph.core.task.abort();
                             }
                             // dirge-tv3p: and an in-flight non-blocking compaction.
                             if let Some(ph) = ui.compaction_phase.take() {
-                                ph.task.abort();
+                                ph.core.task.abort();
+                            }
+                            // dirge-qhfk: and an in-flight off-loop on-prompt hook.
+                            if let Some(ph) = ui.prompt_phase.take() {
+                                ph.core.task.abort();
+                            }
+                            // dirge-qhfk: and an in-flight off-loop Done hook chain.
+                            if let Some(ph) = ui.done_phase.take() {
+                                ph.core.task.abort();
                             }
                             // dirge-4koy: and an in-flight `/plan` reviewer.
                             if let Some(ph) = ui.review_phase.take() {
-                                ph.task.abort();
+                                ph.core.task.abort();
                             }
                             // dirge-nret: and an in-flight `/btw` side query.
                             if let Some(ph) = ui.btw_phase.take() {
-                                ph.task.abort();
+                                ph.core.task.abort();
                             }
                             // dirge-iagk: and an in-flight `/wt-merge`.
                             if let Some(ph) = ui.wt_merge_phase.take() {
-                                ph.task.abort();
+                                ph.core.task.abort();
                             }
                             if let Some(tx) = ui.agent_cancel.take() {
                                 let _ = tx.try_send(());
@@ -2698,165 +2721,48 @@ pub async fn run_interactive(
                             } else {
                                 // User message will be rendered when the
                                 // agent loop emits AgentEvent::UserMessage.
-                                let history = crate::agent::runner::convert_history(session);
-
-                                #[allow(unused_mut)]
-                                let mut plugin_hint: Option<String> = None;
-                                #[allow(unused_mut)]
-                                let mut plugin_replace: Option<String> = None;
+                                //
+                                // dirge-qhfk: dispatch `on-prompt` OFF the loop
+                                // thread so a hook opening a dialog can't
+                                // deadlock the loop that services dialog_rx. The
+                                // `prompt_phase` arm resolves the hook's
+                                // hint/replace and runs the shared submit tail.
+                                // Setting is_running=true routes further submits
+                                // to the steering queue (same as compaction), so
+                                // the in-flight phase can't be clobbered. With no
+                                // plugin there's no on-prompt — run the tail now.
                                 #[cfg(feature = "plugin")]
-                                if let Some(pm) = plugin_manager {
-                                    let mut mgr = pm.lock_ignore_poison();
-                                    match mgr.dispatch(
-                                        "on-prompt",
-                                        &format!(
-                                            "@{{:prompt \"{}\"}}",
-                                            crate::plugin::escape_janet_string(&text)
-                                        ),
-                                    ) {
-                                        Ok(results) if !results.is_empty() => {
-                                            for line in &results {
-                                                // Sanitize plugin output (ANSI injection defense).
-                                                let safe = sanitize_output(line);
-                                                renderer.write_line(
-                                                    &format!("[plugin] {}", safe),
-                                                    theme::dim(),
-                                                )?;
-                                            }
-                                            plugin_hint = Some(results.join("\n"));
-                                        }
-                                        Ok(_) => {}
-                                        Err(e) => {
-                                            renderer.write_line(
-                                                &format!("[plugin] on-prompt error: {e}"),
-                                                c_error(),
-                                            )?;
-                                        }
-                                    }
-                                    // A plugin hook may queue a follow-up prompt via
-                                    // harness/request-prompt; pick it up here.
-                                    if let Some(pending) = mgr.take_pending_prompt() {
-                                        plugin_hint = Some(pending);
-                                    }
-                                    // harness/replace-prompt rewrites the current
-                                    // turn entirely (distinct from request-prompt
-                                    // which queues a follow-up turn). Takes
-                                    // precedence over hint prepending below.
-                                    plugin_replace = mgr.take_pending_prompt_replace();
-                                }
-
-                                let prompt = if let Some(replacement) = plugin_replace {
-                                    // Echo the rewrite so the user can see what
-                                    // the LLM is actually receiving — otherwise
-                                    // it looks like their message vanished.
-                                    renderer.write_line(
-                                        "[plugin] prompt rewritten:",
-                                        theme::dim(),
-                                    )?;
-                                    for line in replacement.lines() {
-                                        renderer.write_line(
-                                            &format!("  {}", sanitize_output(line)),
-                                            theme::dim(),
-                                        )?;
-                                    }
-                                    replacement
-                                } else if let Some(hint) = plugin_hint {
-                                    format!("{}\n\n{}", hint, text)
+                                let deferred_to_prompt_hook = if let Some(pm) = plugin_manager {
+                                    ui.prompt_phase = Some(crate::ui::prompt_phase::spawn(
+                                        pm.clone(),
+                                        text.to_string(),
+                                    ));
+                                    ui.is_running = true;
+                                    renderer.set_avatar_state(avatar::AvatarState::Thinking);
+                                    true
                                 } else {
-                                    text.to_string()
+                                    false
                                 };
+                                #[cfg(not(feature = "plugin"))]
+                                let deferred_to_prompt_hook = false;
 
-                                // Phase 8: track the user prompt for
-                                // session DB persistence.
-                                ui.last_user_prompt = text.to_string();
-
-                                // Batch2-1 (audit fix): preemptive
-                                // compaction check. Estimate the new
-                                // prompt's token cost; if
-                                // projected_total > 85% of the budget,
-                                // compact BEFORE sending so we don't
-                                // pay an extra round-trip + provider
-                                // ContextOverflow error on the way to
-                                // reactive auto-compact. Reactive
-                                // recovery still lives at the
-                                // ContextOverflow arm in case our
-                                // estimate undershoots.
-                                let reserve_for_check = cfg.resolve_reserve_tokens();
-                                let max_tokens_for_check =
-                                    session.context_window.saturating_sub(reserve_for_check);
-                                let est_new_tokens =
-                                    crate::session::Session::estimate_tokens(&prompt);
-                                // `compact_enabled = false` opts out of proactive
-                                // compaction (this is the only site that still
-                                // honors it now that the eager post-turn pass is
-                                // gone — dirge-21sb). Reactive overflow recovery
-                                // stays ungated: it's emergency rescue, not
-                                // proactive, matching the old eager/reactive split.
-                                let preemptive_fired = cfg.resolve_compact_enabled()
-                                    && crate::ui::slash::preemptive_compaction_due(
-                                        session.total_estimated_tokens,
-                                        est_new_tokens,
-                                        max_tokens_for_check,
-                                    );
-                                // dirge-tv3p: when preemptive compaction fires,
-                                // run the summarizer OFF-thread (it was a 10-60s
-                                // inline freeze) and defer this turn to the
-                                // `compaction_phase` arm, which installs the
-                                // summary then resends the prompt. `deferred`
-                                // skips the inline runner-spawn below.
-                                let mut deferred_to_compaction = false;
-                                let history = if preemptive_fired {
-                                    renderer.write_line(
-                                        "▒░ preemptive compaction (context near limit) ░▒",
-                                        theme::accent(),
+                                if !deferred_to_prompt_hook {
+                                    let mut ctx = make_run_ctx!();
+                                    run_handlers::submit::submit_resolved_prompt(
+                                        &mut ctx,
+                                        &make_agent_build_deps!(),
+                                        &mut agent,
+                                        None,
+                                        None,
+                                        &text,
+                                        &mut ui.is_running,
+                                        &mut ui.agent_rx,
+                                        &mut ui.agent_abort,
+                                        &mut ui.agent_interject,
+                                        &mut ui.agent_cancel,
+                                        &ui.interjection_queue,
+                                        &mut ui.compaction_phase,
                                     )?;
-                                    // forced=true: the preemptive trigger above
-                                    // already decided (at 85%, factoring the
-                                    // incoming prompt), so bypass prepare's
-                                    // stricter within-limits gate — otherwise it
-                                    // no-ops in the 85–100% band (dirge-rz4i).
-                                    match crate::ui::slash::prepare_compaction(
-                                        None, true, &agent, &client, &mut renderer, session, cfg,
-                                    ) {
-                                        Ok(crate::ui::slash::CompactionDecision::Ready(req)) => {
-                                            ui.compaction_phase = Some(crate::ui::compaction::spawn(
-                                                    *req,
-                                                crate::ui::compaction::CompactionThen::SendPrompt {
-                                                    run_prompt: prompt.clone(),
-                                                    record_text: text.to_string(),
-                                                },
-                                            ));
-                                            ui.is_running = true;
-                                            renderer.set_avatar_state(avatar::AvatarState::Thinking);
-                                            deferred_to_compaction = true;
-                                            history
-                                        }
-                                        Ok(crate::ui::slash::CompactionDecision::NoOp) => {
-                                            crate::agent::runner::convert_history(session)
-                                        }
-                                        Err(e) => {
-                                            renderer.write_line(
-                                                &format!("preemptive compaction failed (will retry reactively if needed): {e}"),
-                                                c_error(),
-                                            )?;
-                                            crate::agent::runner::convert_history(session)
-                                        }
-                                    }
-                                } else {
-                                    history
-                                };
-
-                                if !deferred_to_compaction {
-                                    let runner = agent.clone().spawn_runner(
-                                        crate::agent::tools::background::prepend_pending_notifications(&prompt, bg_store.as_ref()),
-                                        history,
-                                        Some(ui.interjection_queue.clone()),
-                                    );
-                                    runner.install_into(&mut ui.agent_rx, &mut ui.agent_abort, &mut ui.agent_interject, &mut ui.agent_cancel, &mut ui.is_running);
-
-                                    session.add_message(MessageRole::User, &text);
-                                    begin_snapshot_turn(session);
-                                    renderer.set_avatar_state(avatar::AvatarState::Idle);
                                 }
                             }
                         }
@@ -3177,7 +3083,6 @@ pub async fn run_interactive(
                             &mut ui.was_reasoning,
                             &mut ui.is_running,
                             &mut agent,
-                            context,
                             &make_agent_build_deps!(),
                             &mut ui.agent_rx,
                             &mut ui.agent_abort,
@@ -3187,6 +3092,8 @@ pub async fn run_interactive(
                             &mut ui.review_phase,
                             #[cfg(feature = "plugin")]
                             plugin_manager,
+                            #[cfg(feature = "plugin")]
+                            &mut ui.done_phase,
                             #[cfg(feature = "loop")]
                             loop_bits,
                         ).await?;
@@ -3431,7 +3338,7 @@ pub async fn run_interactive(
             // so a closed channel is handled instead of busy-looping the select.
             ev = async {
                 if let Some(ph) = &mut ui.plan_phase {
-                    ph.rx.recv().await
+                    ph.core.rx.recv().await
                 } else {
                     std::future::pending().await
                 }
@@ -3472,6 +3379,135 @@ pub async fn run_interactive(
                     }
                 }
             }
+            // dirge-qhfk: off-loop `on-prompt` hook. The dispatch ran on a
+            // spawned task so a hook opening a dialog couldn't freeze the loop;
+            // this arm prints its `[plugin]` output and runs the shared submit
+            // tail with the resolved hint/replace.
+            ev = async {
+                if let Some(ph) = &mut ui.prompt_phase {
+                    ph.core.rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                use crate::ui::prompt_phase::PromptPhaseEvent;
+                let Some(handle) = ui.prompt_phase.take() else {
+                    continue;
+                };
+                let text = handle.text;
+                match ev {
+                    Some(PromptPhaseEvent::Ready(result)) => {
+                        for line in &result.lines {
+                            renderer.write_line(&format!("[plugin] {}", line), theme::dim())?;
+                        }
+                        for err in &result.errors {
+                            renderer.write_line(&format!("[plugin] {}", err), c_error())?;
+                        }
+                        let mut ctx = make_run_ctx!();
+                        run_handlers::submit::submit_resolved_prompt(
+                            &mut ctx,
+                            &make_agent_build_deps!(),
+                            &mut agent,
+                            result.hint,
+                            result.replace,
+                            &text,
+                            &mut ui.is_running,
+                            &mut ui.agent_rx,
+                            &mut ui.agent_abort,
+                            &mut ui.agent_interject,
+                            &mut ui.agent_cancel,
+                            &ui.interjection_queue,
+                            &mut ui.compaction_phase,
+                        )?;
+                    }
+                    None => {
+                        // Task aborted / channel closed without an event —
+                        // release the busy state so the loop accepts input.
+                        ui.is_running = false;
+                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                    }
+                }
+                renderer.request_repaint();
+            }
+            // dirge-qhfk: off-loop Done hook chain. The on-response /
+            // message-end / on-complete / prepare-next-run chain ran on a
+            // spawned task so a hook opening a dialog couldn't freeze the loop;
+            // this arm prints the collected `[plugin]` output, applies any
+            // model swap on-loop, and runs the shared finish_done tail with the
+            // (possibly rewritten) response.
+            ev = async {
+                if let Some(ph) = &mut ui.done_phase {
+                    ph.core.rx.recv().await
+                } else {
+                    std::future::pending().await
+                }
+            } => {
+                use crate::ui::done_phase::DonePhaseEvent;
+                let Some(handle) = ui.done_phase.take() else {
+                    continue;
+                };
+                let tokens = handle.tokens;
+                let cost = handle.cost;
+                match ev {
+                    Some(DonePhaseEvent::Ready(result)) => {
+                        for line in &result.lines {
+                            renderer.write_line(&format!("[plugin] {}", line), theme::dim())?;
+                        }
+                        for err in &result.errors {
+                            renderer.write_line(&format!("[plugin] {}", err), c_error())?;
+                        }
+                        // Apply a prepare-next-run model swap on-loop (agent
+                        // rebuild) before the tail runs.
+                        #[cfg(feature = "plugin")]
+                        if let Some(next_model) = result.next_model {
+                            let mut ctx = make_run_ctx!();
+                            run_handlers::done::apply_next_model(
+                                &mut ctx,
+                                &mut agent,
+                                context,
+                                &make_agent_build_deps!(),
+                                &next_model,
+                            )
+                            .await?;
+                        }
+                        let mut ctx = make_run_ctx!();
+                        #[cfg(feature = "loop")]
+                        let loop_bits = run_handlers::done::LoopBits {
+                            state: &mut loop_state,
+                            label: &mut ui.loop_label,
+                        };
+                        run_handlers::done::finish_done(
+                            &mut ctx,
+                            result.response,
+                            tokens,
+                            cost,
+                            &mut agent,
+                            &mut ui.is_running,
+                            &make_agent_build_deps!(),
+                            result.followup,
+                            &mut ui.agent_rx,
+                            &mut ui.agent_abort,
+                            &mut ui.agent_interject,
+                            &mut ui.agent_cancel,
+                            &ui.interjection_queue,
+                            &mut ui.review_phase,
+                            #[cfg(feature = "plugin")]
+                            plugin_manager,
+                            #[cfg(feature = "loop")]
+                            loop_bits,
+                        )
+                        .await?;
+                    }
+                    None => {
+                        // Task aborted / channel closed without a result (only
+                        // reachable if the task was cancelled out-of-band) —
+                        // release the busy state so the loop returns to idle.
+                        ui.is_running = false;
+                        renderer.set_avatar_state(avatar::AvatarState::Idle);
+                    }
+                }
+                renderer.request_repaint();
+            }
             // dirge-tv3p: non-blocking compaction. The summarizer LLM runs on a
             // spawned task; this arm installs its result on the UI thread and
             // runs the continuation (preemptive/reactive resend), so the loop
@@ -3480,7 +3516,7 @@ pub async fn run_interactive(
             // doesn't busy-loop the select.
             ev = async {
                 if let Some(ph) = &mut ui.compaction_phase {
-                    ph.rx.recv().await
+                    ph.core.rx.recv().await
                 } else {
                     std::future::pending().await
                 }
@@ -3685,7 +3721,7 @@ pub async fn run_interactive(
             // Option directly so a closed channel doesn't busy-loop the select.
             ev = async {
                 if let Some(ph) = &mut ui.review_phase {
-                    ph.rx.recv().await
+                    ph.core.rx.recv().await
                 } else {
                     std::future::pending().await
                 }
@@ -3738,7 +3774,7 @@ pub async fn run_interactive(
             // doesn't busy-loop the select.
             btw_result = async {
                 if let Some(ph) = &mut ui.btw_phase {
-                    ph.rx.recv().await
+                    ph.core.rx.recv().await
                 } else {
                     std::future::pending().await
                 }
@@ -3778,7 +3814,7 @@ pub async fn run_interactive(
             // `#[cfg]` arms); the field is always `None` in non-worktree builds.
             wt_merge_result = async {
                 if let Some(ph) = &mut ui.wt_merge_phase {
-                    ph.rx.recv().await
+                    ph.core.rx.recv().await
                 } else {
                     std::future::pending().await
                 }
@@ -4886,7 +4922,7 @@ fn modified_visible_rows(rect: Option<ratatui::layout::Rect>) -> usize {
 /// run triggered by one must have a matching snapshot turn or
 /// rewinding to it would restore nothing and its edits would fold
 /// into the previous turn's bucket.
-fn begin_snapshot_turn(session: &crate::session::Session) {
+pub(crate) fn begin_snapshot_turn(session: &crate::session::Session) {
     if let Some(uid) = session.messages.last().map(|m| m.id.clone()) {
         crate::agent::tools::snapshots::begin_turn(&uid);
     }

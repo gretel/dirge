@@ -71,12 +71,17 @@ pub struct Rule {
 
 impl Rule {
     fn matches(&self, req: &AccessRequest, op: Operation, resource: &Resource) -> bool {
+        // A deny rule sees through env/wrapper prefixes (dirge-8zem);
+        // an allow (or ask) rule matches the raw form only — a prefix
+        // changes what actually executes, so it must not ride an allow.
+        let cands = if self.effect == Effect::Deny {
+            resource.deny_match_candidates()
+        } else {
+            resource.match_candidates()
+        };
         self.op.matches(op)
             && self.tool.as_deref().is_none_or(|t| t == req.tool)
-            && resource
-                .match_candidates()
-                .iter()
-                .any(|k| self.pattern.matches(k))
+            && cands.iter().any(|k| self.pattern.matches(k))
     }
 }
 
@@ -185,6 +190,14 @@ impl Decider for SessionAllowlistPolicy {
         resource: &Resource,
         ctx: &PolicyCtx,
     ) -> Option<Verdict> {
+        // dirge-g9qj: never let a session grant silently allow a complex
+        // command. "Allow always" on `echo $(x)` suggests a broad
+        // `echo *` pattern, which would then cover an unrelated
+        // `echo $(rm -rf ~)`. A complex command's inner command is
+        // invisible, so it re-prompts every time (Yolo still overrides).
+        if resource.is_complex_command() {
+            return None;
+        }
         resource
             .match_candidates()
             .iter()
@@ -204,9 +217,11 @@ impl Decider for ConfiguredRulePolicy {
     }
     fn applies_to(&self, op: Operation, resource: &Resource) -> bool {
         // Coarse: op + pattern (the tool narrowing is applied in
-        // `decide`, which has the full request). A false positive here
-        // only means `decide` runs and returns None — harmless.
-        let cands = resource.match_candidates();
+        // `decide`, which has the full request). Uses the widest
+        // candidate set so a deny rule matching only the stripped form
+        // isn't missed. A false positive here only means `decide` runs
+        // and returns None — harmless.
+        let cands = resource.deny_match_candidates();
         self.rules
             .iter()
             .any(|r| r.op.matches(op) && cands.iter().any(|k| r.pattern.matches(k)))
@@ -218,8 +233,20 @@ impl Decider for ConfiguredRulePolicy {
         resource: &Resource,
         _: &PolicyCtx,
     ) -> Option<Verdict> {
-        last_match(&self.rules, req, op, resource)
-            .map(|r| Verdict::new(r.effect, format!("rule {:?} → {:?}", r.original, r.effect)))
+        let r = last_match(&self.rules, req, op, resource)?;
+        // dirge-g9qj: a complex command (substitution / subshell) matches
+        // allow rules only on its OUTER head (`echo $(rm -rf ~)` matches
+        // `echo **`), but the inner command never gets its own claim — so
+        // an allow here would run it unprompted. Suppress the ALLOW and
+        // fall through to the default (Ask), forcing confirmation. A Deny
+        // still stands: a matching deny on a complex command is honored.
+        if r.effect == Effect::Allow && resource.is_complex_command() {
+            return None;
+        }
+        Some(Verdict::new(
+            r.effect,
+            format!("rule {:?} → {:?}", r.original, r.effect),
+        ))
     }
 }
 
@@ -543,10 +570,7 @@ mod tests {
         }
     }
     fn cmd(s: &str) -> Resource {
-        Resource::Command {
-            raw: s.to_string(),
-            head: s.split_whitespace().next().unwrap_or("").to_string(),
-        }
+        Resource::command(s)
     }
     fn url(u: &str) -> Resource {
         Resource::Url(u.to_string())

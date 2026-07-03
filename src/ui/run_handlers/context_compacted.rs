@@ -93,17 +93,23 @@ pub(crate) async fn handle_context_compacted(
     let origin = ctx.session.effective_origin().to_string();
     let mut intent = ctx.session.first_user_prompt().unwrap_or("").to_string();
     if let Ok(db) = crate::extras::session_db::SessionDb::open(&paths.session_db_path()) {
-        let old_sid = format!("dirge-{}", crate::text::short_id(ctx.session.id.as_str()));
+        let old_sid = crate::text::db_session_id(ctx.session.id.as_str());
+        // The rotated session's turns will persist under
+        // `db_session_id(new_session_id)` (agent_io), so the fold row must
+        // be inserted and linked under the SAME canonical key — otherwise
+        // the turns and the parent link land in different rows and
+        // `resolve_parent` can't walk the fold (dirge-g1ze).
+        let new_sid = crate::text::db_session_id(new_session_id);
         let _ = db.end_session(&old_sid, "compression");
         let now = chrono::Utc::now().to_rfc3339();
         let _ = db.insert_session(
-            new_session_id,
+            &new_sid,
             "cli",
             &ctx.session.model,
             &ctx.session.provider,
             &now,
         );
-        let _ = db.set_parent_session(new_session_id, &old_sid);
+        let _ = db.set_parent_session(&new_sid, &old_sid);
         // On a later fold the original ask is no longer in the live
         // messages; recover it from the write-once checkpoint slot.
         if let Some(cp) = db.get_checkpoint(&origin).ok().flatten()
@@ -129,8 +135,21 @@ pub(crate) async fn handle_context_compacted(
         // summary so it reaches resumed context through the existing
         // summary-injection path.
         let anchored = anchor_summary_with_intent(&intent, summary);
+        // dirge-4kgk: `first_kept_index` arrives in LOOP space (the agent
+        // loop's `current_context.messages`, where every tool_result is its
+        // own entry). `compress_reporting` drains `session.messages`, where
+        // tool results are embedded in their assistant message — a much
+        // shorter vec. Feeding the loop-space index straight in over-drains
+        // and destroys the recent verbatim tail, so a crash-resume recovers
+        // only the lossy summary. Recompute the cut in session space using
+        // the same keep-recent policy as the `/compress` path.
+        let _ = first_kept_index;
+        let session_cut = crate::session::compact::compaction_cut_idx(
+            ctx.session,
+            ctx.cfg.resolve_keep_recent_tokens(),
+        );
         ctx.session
-            .compress_reporting(anchored, first_kept_index, token_savings);
+            .compress_reporting(anchored, session_cut, token_savings);
     }
     // dirge-hs61: capture the outgoing id, do ALL the mutations (id
     // rotation + disk save), THEN fire the on_session_switch hook. Pre-fix
