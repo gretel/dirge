@@ -461,14 +461,14 @@ impl SqliteMemoryStore {
         std::fs::create_dir_all(paths.sessions_dir())
             .map_err(|e| format!("Failed to create sessions directory: {e}"))?;
         let db = SessionDb::open(&paths.session_db_path())?;
-        let conn = db.conn;
+        let mut conn = db.conn;
         // Two connections to state.db can coexist in one process
         // (session persistence + memory). WAL is already on; a busy
         // timeout turns rare write collisions into short waits.
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(|e| format!("Failed to set busy timeout: {e}"))?;
 
-        import_markdown_if_present(&conn, paths)?;
+        import_markdown_if_present(&mut conn, paths)?;
 
         Self::from_connection(conn)
     }
@@ -1937,7 +1937,7 @@ struct LegacyUsage {
 /// imported anyway — the render-time scan withholds them from the
 /// system prompt, same policy the markdown store applied to
 /// hand-edited files.
-fn import_markdown_if_present(conn: &Connection, paths: &ProjectPaths) -> Result<(), String> {
+fn import_markdown_if_present(conn: &mut Connection, paths: &ProjectPaths) -> Result<(), String> {
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))
         .map_err(|e| format!("Failed to count memories: {e}"))?;
@@ -1959,6 +1959,14 @@ fn import_markdown_if_present(conn: &Connection, paths: &ProjectPaths) -> Result
     let now = chrono::Utc::now().to_rfc3339();
     let mut imported = 0usize;
     let mut imported_any_file = false;
+
+    // dirge-p53e: import atomically. A mid-loop failure must roll the
+    // whole set back instead of committing a partial import that the
+    // COUNT(*) > 0 gate above then treats as already done — which would
+    // strand the remaining entries and skip the *.imported parking.
+    let tx = conn
+        .transaction()
+        .map_err(|e| format!("Failed to begin import transaction: {e}"))?;
 
     for (target, file_name) in [("memory", "MEMORY.md"), ("pitfalls", "PITFALLS.md")] {
         let path = paths.memory_file(file_name);
@@ -1999,25 +2007,34 @@ fn import_markdown_if_present(conn: &Connection, paths: &ProjectPaths) -> Result
                 .map(|u| u.first_seen_at.clone())
                 .unwrap_or_else(|| now.clone());
 
-            conn.execute(
-                "INSERT OR IGNORE INTO memories
+            let inserted = tx
+                .execute(
+                    "INSERT OR IGNORE INTO memories
                     (uid, target, kind, content, status, tier, salience,
                      created_at, updated_at, use_count)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'hot', ?6, ?7, ?8, 0)",
-                params![
-                    uid,
-                    target,
-                    kind.as_str(),
-                    entry,
-                    status,
-                    salience,
-                    created_at,
-                    now,
-                ],
-            )
-            .map_err(|e| format!("Failed to import entry from {file_name}: {e}"))?;
-            let id = conn.last_insert_rowid();
-            conn.execute(
+                    params![
+                        uid,
+                        target,
+                        kind.as_str(),
+                        entry,
+                        status,
+                        salience,
+                        created_at,
+                        now,
+                    ],
+                )
+                .map_err(|e| format!("Failed to import entry from {file_name}: {e}"))?;
+            // dirge-p53e: INSERT OR IGNORE returns 0 when the uid
+            // already exists. last_insert_rowid() would then still name
+            // the PREVIOUS row, attaching this entry's text to the wrong
+            // FTS projection — so gate the index insert on an actual
+            // insert. A duplicate is already fully present (row + FTS).
+            if inserted == 0 {
+                continue;
+            }
+            let id = tx.last_insert_rowid();
+            tx.execute(
                 "INSERT INTO memories_fts(rowid, content) VALUES (?1, ?2)",
                 params![id, redact_for_fts(entry)],
             )
@@ -2025,6 +2042,9 @@ fn import_markdown_if_present(conn: &Connection, paths: &ProjectPaths) -> Result
             imported += 1;
         }
     }
+
+    tx.commit()
+        .map_err(|e| format!("Failed to commit import: {e}"))?;
 
     if imported_any_file {
         tracing::info!(
@@ -3376,6 +3396,123 @@ mod tests {
         let store = SqliteMemoryStore::load(&paths).unwrap();
         assert_eq!(store.view("memory")["entry_count"], 0);
         assert!(!paths.memory_file("MEMORY.md.imported").exists());
+    }
+
+    // dirge-p53e: the legacy import did `INSERT OR IGNORE` then trusted
+    // `last_insert_rowid()` to index the FTS row. When an insert was
+    // IGNORED (duplicate uid), `last_insert_rowid()` still pointed at the
+    // PREVIOUS row, so the dropped entry's redacted text overwrote that
+    // row's FTS projection — search then matched the wrong content.
+    #[test]
+    fn import_with_duplicate_uid_keeps_fts_correct() {
+        let (paths, _dir) = temp_project();
+        std::fs::create_dir_all(paths.memory_dir()).unwrap();
+        // Three distinct entries. The sidecar forces the last two to
+        // share one uid, so "charlie ..." is dropped as a duplicate —
+        // the exact condition that misattached its text to bravo's FTS
+        // row via the stale last_insert_rowid().
+        std::fs::write(
+            paths.memory_file("MEMORY.md"),
+            "alpha unique fact\n§\nbravo first carrier\n§\ncharlie second carrier\n",
+        )
+        .unwrap();
+        let key_bravo = legacy_entry_id("bravo first carrier");
+        let key_charlie = legacy_entry_id("charlie second carrier");
+        std::fs::write(
+            paths.memory_dir().join(".meta.json"),
+            format!(
+                r#"{{"{key_bravo}": {{"id": "urn:ump:collided", "kind": "semantic",
+                     "lifecycle": {{"salience": 0.5, "status": "active"}}}},
+                  "{key_charlie}": {{"id": "urn:ump:collided", "kind": "semantic",
+                     "lifecycle": {{"salience": 0.5, "status": "active"}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+
+        // The duplicate-uid entry is dropped; the other two survive.
+        let rows = store.active_search_rows().unwrap();
+        let contents: Vec<&str> = rows
+            .iter()
+            .map(|r| r["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            contents.len(),
+            2,
+            "duplicate-uid entry dropped: {contents:?}"
+        );
+        assert!(contents.iter().any(|c| c.contains("alpha unique fact")));
+        assert!(contents.iter().any(|c| c.contains("bravo first carrier")));
+        assert!(
+            !contents
+                .iter()
+                .any(|c| c.contains("charlie second carrier")),
+            "the duplicate-uid entry must not be stored",
+        );
+
+        // Every surviving row's FTS projection must describe ITS OWN
+        // content, not a neighbor's. Before the fix, bravo's FTS row
+        // held charlie's text.
+        let conn = raw_conn(&paths);
+        let mut stmt = conn
+            .prepare(
+                "SELECT m.content,
+                        (SELECT content FROM memories_fts WHERE rowid = m.id)
+                 FROM memories m ORDER BY m.id",
+            )
+            .unwrap();
+        let pairs: Vec<(String, Option<String>)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .filter_map(|r| r.ok())
+            .collect();
+        for (content, fts) in &pairs {
+            assert_eq!(
+                fts.as_deref(),
+                Some(redact_for_fts(content).as_str()),
+                "FTS projection drifted from its own row's content",
+            );
+        }
+
+        // End-to-end: bravo is searchable and returns bravo's content.
+        let found = store.search_entries_limited("bravo", 10).unwrap();
+        let hits: Vec<&str> = found["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(hits.len(), 1, "bravo should be searchable: {found}");
+        assert!(hits[0].contains("bravo first carrier"));
+        // The dropped duplicate is not searchable.
+        assert_eq!(
+            store.search_entries_limited("charlie", 10).unwrap()["count"]
+                .as_i64()
+                .unwrap(),
+            0,
+        );
+    }
+
+    #[test]
+    fn import_commits_all_rows_with_fts_in_sync() {
+        let (paths, _dir) = temp_project();
+        write_legacy_files(&paths);
+
+        let store = SqliteMemoryStore::load(&paths).unwrap();
+        // Every imported row landed in `memories` AND has a matching FTS
+        // projection — a single committed unit, not a half-imported set.
+        let conn = raw_conn(&paths);
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        let fts: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memories_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 3, "both MEMORY.md entries + the PITFALLS.md entry");
+        assert_eq!(fts, rows, "one FTS projection per committed row");
+        assert_eq!(store.view("memory")["entry_count"], 2);
+        assert_eq!(store.view("pitfalls")["entry_count"], 1);
     }
 
     // ── Breadcrumb tier + expand/search (dirge-q8wt) ─────────────

@@ -279,7 +279,20 @@ impl Tool for SkillTool {
                 // the DB row archived (best-effort).
                 self.manager.archive(name).map_err(ToolError::Msg)?;
                 if let Some(store) = &self.store {
-                    let _ = store.archive(name);
+                    // dirge-0cln: the directory move above already succeeded,
+                    // so best-effort the DB-side archive — if this silently
+                    // fails the row stays status='active' and re-enters the
+                    // curator pointing at a directory that no longer exists.
+                    // Log, don't swallow.
+                    if let Err(e) = store.archive(name) {
+                        tracing::warn!(
+                            target: "dirge::skill",
+                            skill = %name,
+                            error = %e,
+                            "Skill directory archived but DB row could not be marked archived; \
+                             it may re-enter the curator as a ghost active row"
+                        );
+                    }
                 }
                 Ok(format!(
                     "Skill '{name}' archived (recoverable under .dirge/skills/.archive/)."
@@ -651,6 +664,50 @@ mod tests {
         assert!(
             archived.is_file(),
             "deleted skill must be archived, not hard-deleted; expected {archived:?}"
+        );
+    }
+
+    /// dirge-0cln: deleting a learned skill must archive the DB row too, not
+    /// just move the directory. `list_active` (which feeds the curator's
+    /// candidate list) filters on `status='active'`; a row left active after
+    /// its directory is gone becomes a ghost the next pass tries to load.
+    #[test]
+    fn delete_archives_db_row_out_of_list_active() {
+        let (tool, _dir, store) = store_backed_tool();
+        let rt = make_runtime();
+        create_skill(&tool, &rt, "ghost-me");
+
+        // Precondition: the freshly learned skill is active and ranked.
+        assert!(
+            store
+                .list_active()
+                .unwrap()
+                .iter()
+                .any(|r| r.name == "ghost-me"),
+            "precondition: created skill should appear in list_active"
+        );
+
+        rt.block_on(tool.call(SkillArgs {
+            action: "delete".into(),
+            name: Some("ghost-me".into()),
+            content: None,
+            old_string: None,
+            new_string: None,
+            force: None,
+        }))
+        .unwrap();
+
+        // Directory-gone => row no longer active. The curator must never be
+        // handed a skill whose files are missing.
+        let active: Vec<String> = store
+            .list_active()
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert!(
+            !active.iter().any(|n| n == "ghost-me"),
+            "deleted skill must be archived out of list_active; still active: {active:?}"
         );
     }
 

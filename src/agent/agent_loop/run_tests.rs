@@ -3132,31 +3132,68 @@ fn todo_nudge_message_pluralizes() {
 /// yields the diff to review, or `None` to skip.
 #[test]
 fn run_delta_to_review_skips_when_unchanged() {
-    // Read-only turn over pre-existing WIP: diff identical to baseline → skip.
-    // This is the bug — before, any ToolResult drove the judge on the whole
-    // dirty tree even when the run touched nothing.
-    assert_eq!(
-        run_delta_to_review(Some("wip diff"), Some("wip diff")),
-        None
-    );
+    use crate::agent::agent_loop::code_review::RunDiff;
+
+    let wip = RunDiff {
+        capped: "wip diff".to_string(),
+        fingerprint: 1,
+    };
+    // Read-only turn over pre-existing WIP: identical diff → skip. Before the
+    // dirge-1g3v gate, any ToolResult drove the judge on the whole dirty tree
+    // even when the run touched nothing.
+    assert_eq!(run_delta_to_review(Some(&wip), Some(&wip)), None);
 
     // Clean tree, nothing changed → nothing to review.
     assert_eq!(run_delta_to_review(None, None), None);
 
     // Agent created changes on a clean tree → review them.
-    assert_eq!(
-        run_delta_to_review(Some("new diff"), None),
-        Some("new diff")
-    );
+    let new = RunDiff {
+        capped: "new diff".to_string(),
+        fingerprint: 2,
+    };
+    assert_eq!(run_delta_to_review(Some(&new), None), Some("new diff"));
 
     // Agent added to pre-existing WIP → the diff differs → review.
+    let wip_more = RunDiff {
+        capped: "wip + more".to_string(),
+        fingerprint: 3,
+    };
     assert_eq!(
-        run_delta_to_review(Some("wip + more"), Some("wip")),
+        run_delta_to_review(Some(&wip_more), Some(&wip)),
         Some("wip + more")
     );
 
     // Agent reverted the WIP back to clean → no current diff → nothing to review.
-    assert_eq!(run_delta_to_review(None, Some("wip")), None);
+    assert_eq!(run_delta_to_review(None, Some(&wip)), None);
+}
+
+/// dirge-8gdv: the skip decision must compare the UNcapped fingerprints, not
+/// the size-capped text. When pre-existing WIP already exceeds MAX_DIFF_BYTES,
+/// a length-preserving edit landing PAST the cap leaves the two CAPPED strings
+/// byte-identical, so the old capped-string comparison saw no change and
+/// skipped the reviewer. Two diffs with identical capped text but different
+/// fingerprints must be seen as CHANGED.
+#[test]
+fn run_delta_to_review_engages_when_capped_identical_but_fingerprint_differs() {
+    use crate::agent::agent_loop::code_review::RunDiff;
+
+    let capped = "identical capped diff text".to_string();
+    let baseline = RunDiff {
+        capped: capped.clone(),
+        fingerprint: 1,
+    };
+    let current = RunDiff {
+        capped: capped.clone(),
+        fingerprint: 2,
+    };
+
+    // The bug's premise: the capped text the reviewer would see is identical.
+    assert_eq!(baseline.capped, current.capped);
+    // …but the fingerprints differ, so the reviewer engages (not skipped).
+    assert_eq!(
+        run_delta_to_review(Some(&current), Some(&baseline)),
+        Some(capped.as_str())
+    );
 }
 
 /// Highest-priority gate (the caller hook) short-circuits the lower gates:

@@ -300,6 +300,92 @@ fn insert_message_and_fts5_search() {
     assert!(results[0].content.contains("database migrations"));
 }
 
+/// dirge-f67u regression guard: insert_message must commit all four of
+/// its effects (messages row, messages_fts projection,
+/// messages_fts_trigram projection, sessions.message_count bump) as a
+/// single atomic unit. A partial write leaves a message row with no FTS
+/// projection (invisible to search) and message_count drift, and later
+/// corrupts the external-content FTS5 index on delete. We can't inject a
+/// deterministic mid-transaction fault, so this asserts the committed
+/// end-state: all four effects present and consistent.
+#[test]
+fn insert_message_commits_all_four_effects() {
+    let (db, _dir) = temp_db();
+    db.insert_session(
+        "sess-1",
+        "cli",
+        "claude-opus",
+        "anthropic",
+        "2025-01-15T10:00:00Z",
+    )
+    .unwrap();
+
+    let before: i64 = db
+        .conn
+        .query_row(
+            "SELECT message_count FROM sessions WHERE id = 'sess-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, 0);
+
+    let row_id = db
+        .insert_message(
+            "sess-1",
+            "user",
+            "how do we handle database migrations",
+            None,
+            None,
+            None,
+            "2025-01-15T10:01:00Z",
+        )
+        .unwrap();
+
+    // 1. The messages row exists at the returned id, content intact.
+    let (stored_id, stored_content): (i64, String) = db
+        .conn
+        .query_row(
+            "SELECT id, content FROM messages WHERE session_id = 'sess-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored_id, row_id);
+    assert_eq!(stored_content, "how do we handle database migrations");
+
+    // 2. Findable via the fts search path.
+    let fts_hits = db.search_messages("database migrations", None).unwrap();
+    assert_eq!(fts_hits.len(), 1, "fts search must find the message");
+    assert_eq!(fts_hits[0].id, row_id);
+
+    // 3. Findable via the trigram search path.
+    let trigram_hits = db
+        .search_messages_trigram("database migrations", None)
+        .unwrap();
+    assert_eq!(
+        trigram_hits.len(),
+        1,
+        "trigram search must find the message"
+    );
+    assert_eq!(trigram_hits[0].id, row_id);
+
+    // 4. session.message_count incremented by exactly 1.
+    let after: i64 = db
+        .conn
+        .query_row(
+            "SELECT message_count FROM sessions WHERE id = 'sess-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        after,
+        before + 1,
+        "message_count must increment by exactly 1"
+    );
+}
+
 #[test]
 fn list_sessions_returns_recent() {
     let (db, _dir) = temp_db();

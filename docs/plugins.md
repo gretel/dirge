@@ -92,7 +92,7 @@ file without imports.
 
 | Function | Signature | Effect |
 |----------|-----------|--------|
-| `harness/log` | `(msg)` | Writes to dirge's log file (visible with `dirge --verbose`). Not shown in chat |
+| `harness/log` | `(msg)` | No-op; the message is discarded (kept for backwards compatibility with plugins that still call it). Use `harness/notify` for output visible in chat, or return a value from a plugin command |
 | `harness/get-cwd` | `()` | Returns the agent's working directory |
 | `harness/has-symbol?` | `(name)` | True if `name` is bound in the Janet env |
 
@@ -350,8 +350,6 @@ and times every turn.
   return value is treated as `nil` and dispatch continues.
 - Run `dirge --verbose` (or `RUST_LOG=dirge::plugin=warn`) to see the
   structured log including Janet stack lines.
-- `harness/log` writes to the same log stream. Use it for ad-hoc
-  breadcrumbs.
 - `harness/notify` is the easiest "did this code run?" probe — it lights
   up the chat without polluting the LLM context.
 - Hook not firing? Check the function name exactly — `on_prompt`

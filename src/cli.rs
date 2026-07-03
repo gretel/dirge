@@ -60,7 +60,11 @@ pub struct Cli {
     #[arg(short = 'c', long = "continue", help = "Continue most recent session")]
     pub continue_session: bool,
 
-    #[arg(short = 'r', long = "resume", help = "Browse and select a session")]
+    #[arg(
+        short = 'r',
+        long = "resume",
+        help = "Resume the most recent session, listing the last 10 for reference"
+    )]
     pub resume: bool,
 
     #[arg(

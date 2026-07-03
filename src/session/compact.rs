@@ -48,11 +48,7 @@ pub(crate) fn compress_reporting(
     let first_kept_index = first_kept_index.min(session.messages.len());
     let summarized_count = first_kept_index;
 
-    session.total_estimated_tokens = session.total_estimated_tokens.saturating_sub(token_savings);
     let summary_tokens = Session::estimate_tokens(&summary);
-    session.total_estimated_tokens = session
-        .total_estimated_tokens
-        .saturating_add(summary_tokens);
 
     let summary_id = crate::session::new_message_id();
     let summary_ts = chrono::Utc::now().timestamp();
@@ -76,6 +72,15 @@ pub(crate) fn compress_reporting(
     session.messages.insert(0, summary_msg.clone());
 
     session.ensure_back_compat_initialized();
+    // dirge-kcef: recompute total_estimated_tokens from the post-fold
+    // message list in CANONICAL accounting instead of applying the
+    // foreign loop-space `token_savings` delta. The caller computes
+    // token_savings via estimate_messages_tokens (chars/4, no per-call
+    // overhead) but total_estimated_tokens accumulates per-message
+    // (incl. +16/call + args); mixing the two drifted the context gauge
+    // on every fold. token_savings is still stored on the Compaction
+    // record below for the "saved ~N tokens" banner.
+    session.recompute_all_estimates();
 
     let active_ids: std::collections::HashSet<CompactString> =
         session.messages.iter().map(|m| m.id.clone()).collect();
@@ -240,10 +245,21 @@ pub(crate) fn align_cut_to_user_boundary(messages: &[SessionMessage], cut_idx: u
 /// over-drains and destroys the verbatim tail; recompute the cut here in
 /// session space instead.
 pub(crate) fn compaction_cut_idx(session: &Session, keep_recent_tokens: u64) -> usize {
+    // Cap the kept tail at half the model's context window so a small-context
+    // model (whose whole session may be smaller than `keep_recent_tokens`)
+    // still retains a verbatim tail. `0` means "unknown" — don't clamp then,
+    // or we'd reintroduce the all-summarized bug.
+    let cap = if session.context_window > 0 {
+        session.context_window / 2
+    } else {
+        u64::MAX
+    };
+    let effective_keep = keep_recent_tokens.min(cap);
+
     let mut accumulated = 0u64;
     let mut cut_idx = session.messages.len();
     for (i, msg) in session.messages.iter().enumerate().rev() {
-        if accumulated >= keep_recent_tokens {
+        if accumulated >= effective_keep {
             cut_idx = i + 1;
             break;
         }
@@ -341,6 +357,103 @@ mod cut_tests {
                 .iter()
                 .any(|m| m.content.contains("recent answer")),
             "a loop-space index over-drains and loses the tail (the bug)"
+        );
+    }
+
+    /// On a small-context model (e.g. an 8k window) the whole session can
+    /// total fewer tokens than the 20_000 default `keep_recent_tokens`.
+    /// Without a clamp the accumulator never reaches the threshold, the loop
+    /// never trips, and `cut_idx` stays at `messages.len()` — dropping the
+    /// ENTIRE verbatim tail and replacing the whole conversation with just
+    /// the summary. Capping `keep_recent` at half the context window (only
+    /// when the window is known) guarantees a recent tail survives.
+    #[test]
+    fn compaction_cut_clamps_keep_recent_to_half_context_window_on_small_models() {
+        let mut s = Session::new("p", "m", 8_000);
+        // Four ~2500-token messages: total (~10k) sits well under the 20_000
+        // default keep_recent, but the recent tail (~5k) clears the 4_000
+        // clamp (half of 8_000).
+        s.add_message(MessageRole::User, &"a".repeat(10_000));
+        s.add_message(MessageRole::Assistant, &"b".repeat(10_000));
+        s.add_message(MessageRole::User, &"c".repeat(10_000));
+        s.add_message(MessageRole::Assistant, &"d".repeat(10_000));
+
+        let total: u64 = s.messages.iter().map(|m| m.estimated_tokens).sum();
+        assert!(
+            total < 20_000,
+            "fixture must sit under the default keep_recent (got {total})"
+        );
+
+        let cut = compaction_cut_idx(&s, 20_000);
+        assert!(
+            cut < s.messages.len(),
+            "small-context model must still keep a verbatim tail, got cut={cut} len={}",
+            s.messages.len()
+        );
+    }
+
+    /// dirge-kcef: after a fold, `total_estimated_tokens` must equal a
+    /// fresh canonical recompute over the kept messages — it must NOT
+    /// carry drift from the foreign `token_savings` delta the caller
+    /// passes in. The caller computes `token_savings` in LOOP space
+    /// (`estimate_messages_tokens`, chars/4 over text, no per-call
+    /// overhead), but `total_estimated_tokens` is accumulated in
+    /// CANONICAL per-message space (`estimate_message_tokens`, which
+    /// adds ~16 tokens + args per tool call). The two diverge whenever
+    /// a message carries tool calls, so the old
+    /// `total - token_savings + summary` math nudged the context
+    /// gauge on every fold. Fix: recompute from the post-fold message
+    /// list instead of applying the foreign delta.
+    #[test]
+    fn compress_reporting_total_matches_recompute_after_fold() {
+        let mut s = Session::new("p", "m", 128_000);
+        // Token-heavy head with tool calls — the two accounting spaces
+        // genuinely diverge here (canonical adds +16/call + args + name;
+        // loop space counts only text).
+        s.add_message(MessageRole::User, &"original ask ".repeat(40));
+        s.add_message_with_tool_calls(
+            MessageRole::Assistant,
+            &"working on it ".repeat(40),
+            three_tools("a"),
+        );
+        s.add_message_with_tool_calls(
+            MessageRole::Assistant,
+            &"still working ".repeat(40),
+            three_tools("b"),
+        );
+        // Small recent tail that must survive the fold verbatim.
+        s.add_message(MessageRole::User, "recent question");
+        s.add_message(MessageRole::Assistant, "recent answer");
+
+        let cut = s.messages.len() - 2;
+
+        // Foreign loop-space savings the caller would pass: chars/4 over
+        // message text (content + tool results), NO per-call overhead.
+        // Strictly smaller than the canonical estimate of the same head,
+        // which is exactly the systematic mismatch that used to drift
+        // the total.
+        let loop_space_savings: u64 = s.messages[..cut]
+            .iter()
+            .map(|m| {
+                let mut t = Session::estimate_tokens(&m.content);
+                for tc in &m.tool_calls {
+                    if let ToolCallState::Completed { result } = &tc.state {
+                        t = t.saturating_add(Session::estimate_tokens(result));
+                    }
+                }
+                t
+            })
+            .sum();
+
+        compress_reporting(&mut s, "SUMMARY".to_string(), cut, loop_space_savings);
+
+        // No drift: the total must EXACTLY equal a fresh canonical
+        // recompute over the post-fold message list, regardless of the
+        // foreign token_savings we passed in.
+        let recompute: u64 = s.messages.iter().map(|m| m.estimated_tokens).sum();
+        assert_eq!(
+            s.total_estimated_tokens, recompute,
+            "total_estimated_tokens drifted from the canonical message sum after a fold"
         );
     }
 }

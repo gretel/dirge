@@ -26,9 +26,10 @@
 //! Uses `RecoveryPolicy::backoff_duration_for_msg` which combines
 //! the policy's exponential schedule with `Retry-After` parsing
 //! from the error message. Caps at 5 minutes (per the existing
-//! policy). The wrapper sleeps with `tokio::time::sleep` so the
-//! caller's task can still be aborted during backoff via the
-//! signal.
+//! policy). The backoff sleep is raced against `AbortSignal::cancelled`
+//! via `tokio::select!`, so a cooperative cancel (signal only, no
+//! `JoinHandle::abort`) resolves the stream promptly instead of waiting
+//! out the full backoff.
 //!
 //! ## What this does NOT handle
 //!
@@ -167,7 +168,7 @@ pub fn retrying_stream_fn_with_non_retryable(
                         StreamEvent::Delta { phase, .. } => {
                             // Real content streamed → no future
                             // retry is safe (would duplicate).
-                            if is_content_delta(*phase) {
+                            if phase.is_content() {
                                 committed = true;
                             }
                             yield evt;
@@ -206,11 +207,24 @@ pub fn retrying_stream_fn_with_non_retryable(
                 match retry_msg {
                     Some(err_msg) => {
                         let backoff = policy.backoff_duration_for_msg(attempts, &err_msg);
-                        // Sleep — `tokio::time::sleep` is
-                        // cancellable via task::abort but not via
-                        // our AbortSignal. Honor the latter with
-                        // a poll-after-sleep guard.
-                        tokio::time::sleep(backoff).await;
+                        // Race the backoff sleep against the AbortSignal so a
+                        // cooperative cancel (signal only, no JoinHandle::abort)
+                        // is observed promptly instead of stalling for the full
+                        // backoff. `cancelled()` resolves immediately if the
+                        // signal is already set and is race-free (its waiter is
+                        // registered before the state check).
+                        tokio::select! {
+                            _ = tokio::time::sleep(backoff) => {}
+                            _ = signal_outer.cancelled() => {
+                                yield StreamEvent::Error {
+                                    error: "operation aborted during retry backoff".to_string(),
+                                };
+                                return;
+                            }
+                        }
+                        // Belt-and-suspenders: a cancel landing exactly as the
+                        // sleep elapses is caught here too (the select! above
+                        // may have taken the sleep arm in that instant).
                         if signal_outer.is_cancelled() {
                             yield StreamEvent::Error {
                                 error: "operation aborted during retry backoff".to_string(),
@@ -251,27 +265,6 @@ pub fn retrying_stream_fn_with_non_retryable(
             }
         })
     })
-}
-
-/// Phases that represent observable downstream content. Once any
-/// of these have streamed, we don't retry — the consumer has
-/// already seen output and re-running would duplicate it.
-///
-/// PROV-5: tool-call deltas are NOT included. The model emitting
-/// a tool-call JSON fragment is not the same as the tool actually
-/// running — dispatch happens AFTER the stream ends, downstream
-/// of this retry layer. A 503 mid-tool-call-emission is therefore
-/// retryable; the consumer resets its partial-assistant state on
-/// `StreamEvent::Retry` (see `stream.rs`) so the second attempt's
-/// tool calls don't accumulate on top of the first attempt's.
-fn is_content_delta(phase: DeltaPhase) -> bool {
-    matches!(
-        phase,
-        DeltaPhase::TextStart
-            | DeltaPhase::TextDelta
-            | DeltaPhase::ThinkingStart
-            | DeltaPhase::ThinkingDelta
-    )
 }
 
 #[cfg(test)]
@@ -568,7 +561,7 @@ mod tests {
                     partial: empty_assistant(),
                 },
                 // A tool-call fragment is NOT committed content
-                // (is_content_delta) — only text/thinking phases are.
+                // (DeltaPhase::is_content) — only text/thinking phases are.
                 StreamEvent::Delta {
                     partial: empty_assistant(),
                     phase: DeltaPhase::ToolCallStart,
@@ -640,6 +633,70 @@ mod tests {
 
         assert_eq!(counter.load(Ordering::SeqCst), 2);
         assert!(matches!(events.last(), Some(StreamEvent::Done { .. })));
+    }
+
+    /// Cancel-via-AbortSignal during the retry backoff is observed
+    /// PROMPTLY: the wrapper races the sleep against
+    /// `signal.cancelled()` instead of sleeping the full backoff and
+    /// only checking the flag afterward. Before the fix, a consumer
+    /// that cancelled via the AbortSignal alone (no `JoinHandle::abort`)
+    /// stalled for the entire backoff.
+    #[tokio::test]
+    async fn cancel_during_backoff_is_observed_promptly() {
+        // A single retryable error whose parsed retry-after forces a
+        // LARGE backoff (30s). We then cancel the AbortSignal and
+        // assert the stream resolves within a couple of seconds —
+        // impossible if the wrapper slept the full backoff first.
+        let (factory, counter) = counted_canned(vec![
+            vec![StreamEvent::Error {
+                error: "rate limit hit. retry-after-ms: 30000".to_string(),
+            }],
+            // Second attempt is never reached: we cancel mid-backoff.
+            vec![StreamEvent::Done {
+                reason: StopReason::Stop,
+                message: assistant_with("ok"),
+                usage: None,
+            }],
+        ]);
+        let wrapped = retrying_stream_fn(factory, RecoveryPolicy::default());
+        let signal = AbortSignal::new();
+        let cancel_handle = signal.clone();
+
+        let task = tokio::spawn(async move {
+            drain(wrapped(
+                ctx(),
+                crate::agent::agent_loop::StreamOptions::from_signal(signal),
+            ))
+            .await
+        });
+
+        // Let the drain reach the backoff sleep: the sole inner
+        // attempt yields a single Error synchronously, so a couple of
+        // yield_now cycles are enough to park it on the sleep.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // Cancel via the AbortSignal ALONE (the cooperative path a
+        // consumer uses without aborting the JoinHandle).
+        cancel_handle.cancel();
+
+        // Must resolve well under the 30s backoff. Before the fix this
+        // elapsed the full backoff (the sleep ignored the signal).
+        let events = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+            .await
+            .expect("cancel during backoff must resolve the stream promptly")
+            .expect("drain task should not panic");
+
+        // Inner was called exactly once — we never proceeded to attempt 2.
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                StreamEvent::Error { error }
+                    if error == "operation aborted during retry backoff"
+            )),
+            "expected an 'operation aborted during retry backoff' Error, got: {events:?}"
+        );
     }
 
     /// Max retries exceeded → final Error surfaces.
@@ -745,34 +802,6 @@ mod tests {
         assert_eq!(counter.load(Ordering::SeqCst), 1);
         // Final event surfaces the abort.
         assert!(matches!(events.last(), Some(StreamEvent::Error { .. })));
-    }
-
-    /// `is_content_delta` returns true for text + thinking phases
-    /// (which the user has already seen) and false for everything
-    /// else. PROV-5: tool-call deltas are explicitly NOT committed
-    /// — they're buffered until the stream ends and only then
-    /// dispatched, so a 503 during ToolCallStart/Delta/End is
-    /// safely retryable. The consumer in `stream.rs` resets its
-    /// partial-assistant state on `StreamEvent::Retry`.
-    #[test]
-    fn is_content_delta_classifies_phases() {
-        for phase in [
-            DeltaPhase::TextStart,
-            DeltaPhase::TextDelta,
-            DeltaPhase::ThinkingStart,
-            DeltaPhase::ThinkingDelta,
-        ] {
-            assert!(is_content_delta(phase), "{phase:?} should be content");
-        }
-        for phase in [
-            DeltaPhase::TextEnd,
-            DeltaPhase::ThinkingEnd,
-            DeltaPhase::ToolCallStart,
-            DeltaPhase::ToolCallDelta,
-            DeltaPhase::ToolCallEnd,
-        ] {
-            assert!(!is_content_delta(phase), "{phase:?} should NOT be content");
-        }
     }
 
     /// Records the `messages` each inner attempt was called with, so a test can

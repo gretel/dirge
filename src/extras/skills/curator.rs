@@ -150,7 +150,19 @@ impl Curator {
             }
             if row.effective_salience_now() <= ARCHIVE_SALIENCE_THRESHOLD {
                 self.archive_skill(&name)?;
-                let _ = s.archive(&name);
+                // dirge-0cln: the directory move succeeded; best-effort the
+                // DB archive so the row drops out of list_active. Log (don't
+                // swallow) the error — otherwise the next pass is handed a
+                // skill whose directory is already gone.
+                if let Err(e) = s.archive(&name) {
+                    tracing::warn!(
+                        target: "dirge::curator",
+                        skill = %name,
+                        error = %e,
+                        "Skill directory archived but DB row could not be marked archived; \
+                         it may re-enter curation as a ghost active row"
+                    );
+                }
                 archived.push(name);
             }
         }

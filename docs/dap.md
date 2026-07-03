@@ -296,13 +296,15 @@ TUI responsive even if the adapter takes seconds to initialize.
 
 When built with both `dap` and `plugin` features, dirge exposes the DAP
 session manager to Janet plugins through a FFI bridge (`src/dap/janet_bindings.rs`).
-Plugins can call 12 DAP functions directly — no agent middleman needed.
+Plugins can call 16 `dap/*` Janet functions directly (14 DAP operations
+plus two feature-detection predicates) — no agent middleman needed.
 
 **Janet FFI functions:**
 
 | Janet function | Args | What it does |
 |---|---|---|
 | `(dap/launch file adapter?)` | file path, optional adapter name | Spawn adapter, launch debuggee |
+| `(dap/launch-module module adapter?)` | module name (e.g. `"pytest"`), optional adapter name | Spawn adapter, launch debuggee as a module (e.g. `python -m pytest`) |
 | `(dap/attach pid adapter?)` | process ID, optional adapter name | Attach to running process |
 | `(dap/step)` | — | Step over current line |
 | `(dap/step-in)` | — | Step into function call |
@@ -376,21 +378,14 @@ to it with `/panel debug` or `/debug panel`. It auto-shows on `/debug launch`.
 
 ## Configuration
 
-Override adapter commands per adapter in `config.json`:
-
-```json
-{
-  "dap": {
-    "debugpy": {
-      "command": "/home/user/venv/bin/python",
-      "args": ["-m", "debugpy.adapter", "--log-to-stderr"]
-    },
-    "gdb": {
-      "command": "/opt/gdb-15/bin/gdb"
-    }
-  }
-}
-```
+Adapter launch/attach commands and per-language settings are defined in the
+bundled `src/dap/defaults.json`, which is compiled into the binary at build
+time via `include_str!` in `src/dap/config.rs`. There is **no runtime
+`config.json` key to override adapter commands** — a top-level `"dap"` key in
+`config.json` is ignored silently (dirge's `Config` struct does not declare a
+`dap` field). To use a different adapter binary, install it on `$PATH` (dirge
+resolves adapter commands via `$PATH` lookup) or select an adapter explicitly
+with `--adapter <name>`.
 
 ## Limitations
 
@@ -511,5 +506,3 @@ $ rustc -g src/tests/dap/fixtures/test_program.rs -o src/tests/dap/fixtures/test
 
 /debug terminate
 ```
-
-## Full worked example (Python)

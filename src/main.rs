@@ -180,25 +180,40 @@ fn resolve_config_mode(cfg: &config::Config) -> Option<SecurityMode> {
     }
 }
 
+/// Deserialize the optional `permission` config block.
+///
+/// `None` (block absent) yields the default config. `Some(v)` parses
+/// the JSON; because `PermissionConfig`/`RuleConfig` carry
+/// `#[serde(deny_unknown_fields)]`, one misspelled field fails the
+/// whole block. The caller (`build_channels`) treats `Err` as fatal —
+/// a present-but-invalid block must NOT silently fall back to defaults,
+/// which would drop every rule the user configured (including hard
+/// denies). See dirge-o2bw.
+fn parse_permission_config(value: Option<&serde_json::Value>) -> Result<PermissionConfig, String> {
+    match value {
+        None => Ok(PermissionConfig::default()),
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| e.to_string()),
+    }
+}
+
 fn build_channels(cli: &cli::Cli, cfg: &config::Config) -> Channels {
     if cli.resolve_no_tools(cfg) {
         return Channels::default();
     }
 
-    let perm_config: PermissionConfig = match cfg.permission.as_ref() {
-        Some(v) => match serde_json::from_value(v.clone()) {
-            Ok(c) => c,
-            // Surface the error loudly: falling back to defaults silently
-            // would drop the user's intended rules (and harden nothing).
-            Err(e) => {
-                eprintln!(
-                    "warning: invalid `permission` config ({e}); falling back to \
-                     defaults (all actions Ask). Fix the config to restore your rules."
-                );
-                PermissionConfig::default()
-            }
-        },
-        None => PermissionConfig::default(),
+    // A present-but-unparseable `permission` block is fatal: falling
+    // back to defaults would silently discard every rule the user
+    // configured (hard denies included). Absent (None) is fine and
+    // yields the default. See dirge-o2bw and `read_config_value` in
+    // src/config/mod.rs (present-but-unparseable config hard-exits).
+    let perm_config = match parse_permission_config(cfg.permission.as_ref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "error: invalid `permission` config: {e}\nFix the config to restore your rules; refusing to start with all rules dropped."
+            );
+            std::process::exit(1);
+        }
     };
 
     let mode = resolve_mode(cli, cfg);
@@ -342,26 +357,49 @@ fn compile_lsp_commands(cfg: &config::Config) -> std::collections::HashMap<Strin
 /// content. Warnings only — never refuse to load.
 fn warn_on_stale_resume(session: &session::Session) {
     let cwd = std::env::current_dir().ok();
-    let session_wd = session.working_dir.as_str();
-    if !session_wd.is_empty()
-        && let Some(cwd) = &cwd
-        && cwd.to_string_lossy() != session_wd
-    {
-        eprintln!(
-            "warning: resumed session was created in {:?}, current cwd is {:?}. Tool results captured against the old tree may be stale.",
-            session_wd,
-            cwd.display().to_string(),
-        );
+    for line in resume_staleness_warnings(
+        session.working_dir.as_str(),
+        cwd.as_deref(),
+        session.updated_at.as_str(),
+        chrono::Utc::now(),
+    ) {
+        eprintln!("{line}");
     }
-    if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(session.updated_at.as_str()) {
-        let age = chrono::Utc::now().signed_duration_since(updated.with_timezone(&chrono::Utc));
+}
+
+/// Pure predicate behind [`warn_on_stale_resume`]: returns the warning
+/// line(s) for a resumed session given its stored `working_dir`,
+/// `updated_at`, and the cwd / reference instant to compare against.
+/// A cwd-mismatch warning is emitted when `session_working_dir` is
+/// non-empty and differs from `cwd`; an age warning is emitted when
+/// `updated_at` parses as RFC-3339 and is >=24h before `now`.
+fn resume_staleness_warnings(
+    session_working_dir: &str,
+    cwd: Option<&std::path::Path>,
+    updated_at: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !session_working_dir.is_empty()
+        && let Some(cwd) = cwd
+        && cwd.to_string_lossy() != session_working_dir
+    {
+        out.push(format!(
+            "warning: resumed session was created in {:?}, current cwd is {:?}. Tool results captured against the old tree may be stale.",
+            session_working_dir,
+            cwd.display().to_string(),
+        ));
+    }
+    if let Ok(updated) = chrono::DateTime::parse_from_rfc3339(updated_at) {
+        let age = now.signed_duration_since(updated.with_timezone(&chrono::Utc));
         if age.num_hours() >= 24 {
-            eprintln!(
+            out.push(format!(
                 "warning: resumed session is {} hours old. Captured tool results (read/git/bash) may no longer reflect the current state of the working tree.",
                 age.num_hours(),
-            );
+            ));
         }
     }
+    out
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -736,6 +774,9 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Some(s) = sessions.into_iter().next() {
                 session = s;
+                // SESS-8: only warn when a session was actually loaded —
+                // the empty-list branch above leaves the fresh default.
+                warn_on_stale_resume(&session);
             }
         }
     }
@@ -746,6 +787,8 @@ async fn main() -> anyhow::Result<()> {
         && let Some(s) = sessions.into_iter().next()
     {
         session = s;
+        // SESS-8: warn on stale cwd/age for -c the same as --session.
+        warn_on_stale_resume(&session);
     }
 
     if let Some(session_id) = &cli.session {
@@ -2004,5 +2047,142 @@ mod resolve_mode_tests {
         let cli = cli::Cli::parse_from(["dirge"]);
         let cfg = config::Config::default();
         assert_eq!(resolve_mode(&cli, &cfg), SecurityMode::Standard);
+    }
+}
+
+/// dirge-o2bw — a present-but-unparseable `permission` config block
+/// must surface as an error, NOT silently fall back to defaults.
+/// `RuleConfig`/`PermissionConfig` carry `#[serde(deny_unknown_fields)]`,
+/// so one misspelled field fails the whole block; before the fix
+/// `build_channels` swallowed that and dropped every rule (including
+/// hard denies). These tests pin the pure helper that `build_channels`
+/// routes through; on `Err` the real `build_channels` calls
+/// `std::process::exit(1)` (untestable here, but the contract is that
+/// a present-but-invalid block is fatal and a valid-absent block is
+/// the default).
+#[cfg(test)]
+mod parse_permission_config_tests {
+    use super::*;
+    use crate::permission::Action;
+
+    #[test]
+    fn none_yields_default() {
+        // An absent block yields the default config (empty rule lists).
+        let cfg = parse_permission_config(None).expect("absent block must be Ok");
+        assert!(cfg.rules.is_empty());
+        assert!(cfg.external_directory.is_empty());
+        assert!(cfg.default.is_none());
+        assert!(cfg.doom_loop.is_none());
+    }
+
+    #[test]
+    fn valid_object_parses_rules() {
+        // A small allow/deny set modeled on RuleConfig/PermissionConfig
+        // shape: `rules` (op/match/effect) + an `external_directory` deny.
+        let v = serde_json::json!({
+            "rules": [
+                { "op": "execute", "match": "rm **", "effect": "deny" },
+                { "op": "read",    "match": "/etc/**", "effect": "allow" }
+            ],
+            "external_directory": [
+                { "match": "/**", "effect": "deny" }
+            ]
+        });
+        let cfg = parse_permission_config(Some(&v)).expect("valid permission JSON must parse");
+        assert_eq!(cfg.rules.len(), 2);
+        assert_eq!(cfg.rules[0].pattern, "rm **");
+        assert_eq!(cfg.rules[0].effect, Action::Deny);
+        assert_eq!(cfg.rules[1].effect, Action::Allow);
+        assert_eq!(cfg.external_directory.len(), 1);
+        assert_eq!(cfg.external_directory[0].effect, Action::Deny);
+    }
+
+    #[test]
+    fn unknown_field_is_error() {
+        // Misspelled top-level field — deny_unknown_fields must reject
+        // the whole block. This is the regression: previously the value
+        // silently became default, dropping every configured rule.
+        let v = serde_json::json!({
+            "rules": [ { "match": "rm **", "effect": "deny" } ],
+            "defualt": "allow"
+        });
+        assert!(
+            parse_permission_config(Some(&v)).is_err(),
+            "an unknown field must yield Err so build_channels refuses to start"
+        );
+    }
+}
+
+#[cfg(test)]
+mod resume_staleness_tests {
+    use super::*;
+
+    // Fixed reference instant so the age math is deterministic.
+    fn now() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2024-06-01T12:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn cwd_mismatch_emits_warning() {
+        // (a) session was created elsewhere than the current cwd.
+        let warnings = resume_staleness_warnings(
+            "/old/path",
+            Some(std::path::Path::new("/current/path")),
+            "2024-06-01T11:00:00Z", // 1h old — fresh, no age warning
+            now(),
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("was created in") && w.contains("/old/path")),
+            "expected a cwd-mismatch warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn matching_cwd_and_fresh_is_empty() {
+        // (b) same cwd, recent updated_at → nothing to warn about.
+        let warnings = resume_staleness_warnings(
+            "/current/path",
+            Some(std::path::Path::new("/current/path")),
+            "2024-06-01T11:00:00Z",
+            now(),
+        );
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn stale_updated_at_emits_age_warning() {
+        // (c) updated_at is 48h before `now` → crosses the 24h threshold.
+        let warnings = resume_staleness_warnings(
+            "/current/path",
+            Some(std::path::Path::new("/current/path")),
+            "2024-05-30T12:00:00Z",
+            now(),
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("hours old")),
+            "expected an age warning, got {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn empty_working_dir_and_fresh_is_empty() {
+        // (d) no working_dir recorded + fresh → nothing to warn about.
+        let warnings = resume_staleness_warnings(
+            "",
+            Some(std::path::Path::new("/current/path")),
+            "2024-06-01T11:00:00Z",
+            now(),
+        );
+        assert!(
+            warnings.is_empty(),
+            "expected no warnings, got {warnings:?}"
+        );
     }
 }

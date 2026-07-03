@@ -39,7 +39,7 @@ pub(crate) async fn cmd_code_review(ctx: &mut SlashCtx<'_>) -> anyhow::Result<()
     let findings = crate::agent::agent_loop::code_review::run_code_review(
         &review_fn,
         "",
-        &diff,
+        &diff.capped,
         "(on-demand /code-review — no session transcript)",
     )
     .await;

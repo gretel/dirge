@@ -18,8 +18,9 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
 use crate::sync_util::LockExt;
 
-// Lifecycle states (open / in_progress / blocked / done) and priorities
-// (high / normal / low) are defined by the `normalize_*` vocabulary below.
+// Lifecycle states (open / in_progress / blocked / done / cancelled) and
+// priorities (high / normal / low) are defined by the `normalize_*` vocabulary
+// below.
 
 /// Normalize a user/agent-supplied status to a canonical value, or `None` if
 /// unrecognized. Accepts a few intuitive aliases. `pending` maps to `open` and

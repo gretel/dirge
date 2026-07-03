@@ -10,9 +10,11 @@ folder:
 
 A project may also ship a partial `<project>/.dirge/config.json`. It is
 deep-merged on top of the global file: scalar fields override, while maps
-(`providers`, `mcp_servers`, `agents`, `slash_aliases`, `keybindings`) union
-key-by-key, so a project can add or override a single entry without
-redeclaring the whole map. Absent keys fall through to the global file. An
+(`providers`, `mcp_servers`, `agents`, `slash_aliases`) union key-by-key, so
+a project can add or override a single entry without redeclaring the whole
+map. Arrays are replaced wholesale, not merged — notably `keybindings` (a
+list): a project `keybindings` entry wipes the global list rather than
+extending it, so redeclare the full set if you also want the global bindings. Absent keys fall through to the global file. An
 empty object (e.g. `"providers": {}`) is a no-op, not a wipe — there is no
 syntax to clear a global map from a project config. CLI flags and env vars
 still take precedence over both files.
@@ -71,6 +73,7 @@ Accepted top-level keys:
 | Key                       | Type    | Description                                                                                                                                                                 |
 | ------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `provider`                | string  | Active provider alias. Built-ins are `openrouter`, `openai`, `anthropic`, `gemini`/`google`, `deepseek`, `glm`/`zhipu`, and `ollama`; any alias declared in `providers` is also accepted. Default: `openrouter`. See [Providers and roles](#providers-and-roles). |
+| `auth`                    | string  | Default authentication source for providers that don't set their own `providers.<name>.auth`: `api-key` (the implicit default), `chatgpt` (Codex/OpenAI login tokens), or `anthropic` / `claude-code` (Anthropic Claude Code OAuth). See [Providers and roles](#providers-and-roles). |
 | `providers`               | object  | Map of provider alias → entry. The active model lives in `providers.<active-provider>.model`. Each role key below points at one of these aliases. See [Providers and roles](#providers-and-roles). |
 | `review_provider`         | string  | Provider alias for the background session-review pass. Falls back to `provider`. |
 | `escalation_provider`     | string  | Provider alias for the one-shot retry after repair-exhaustion / pre-write syntax failure. Falls back to `provider` (no-op when equal). |
@@ -87,7 +90,7 @@ Accepted top-level keys:
 | `temperature`             | number  | Model sampling temperature in `0.0`–`2.0`. `--temperature` CLI flag overrides this. Values outside the range are clamped with a stderr warning.                            |
 | `no_tools`                | boolean | Disable all tools. Default: `false`.                                                                                                                                        |
 | `no_context_files`        | boolean | Disable loading global/project `AGENTS.md` and `CLAUDE.md` context files. Default: `false`.                                                                                 |
-| `context_window`          | integer | Session context-window size used for status and auto-compaction. Default: `128000`.                                                                                         |
+| `context_window`          | integer | Advertised model context window — feeds the status line and the legacy token-reserve path (the compaction *fold* decision uses `context_target`, not this). Resolved as: explicit value here → built-in per-model table → `128000`. The table usually decides, e.g. Claude Sonnet/Opus 4.x, DeepSeek-V4, GPT-4.1, Gemini-2.5-Flash, and Llama-4 = 1M (Gemini-2.5-Pro = 2M); base Claude and o3 = 200k; GPT-4o, DeepSeek-R1, and older 128k models = 128k. |
 | `reserve_tokens`          | integer | Tokens to reserve before compaction is triggered. Default: `16384`.                                                                                                         |
 | `keep_recent_tokens`      | integer | Approximate recent-token budget kept verbatim during compaction. Default: `20000`.                                                                                          |
 | `compact_enabled`         | boolean | Enable automatic conversation compaction. Default: `true`.                                                                                                                  |
@@ -110,7 +113,7 @@ Accepted top-level keys:
 | `tool_result_max_lines`   | integer | Body lines shown inside a tool chamber before collapsing to `↓ N more lines (Ctrl+O to expand)`. Default: `4`. Press `Ctrl+O` to re-print the most recent collapsed result in full. `edit`, `apply_patch`, `question`, `task`, and `task_status` are exempt (their body IS the value). |
 | `default_prompt`          | string  | Prompt name to activate on startup. Default: `code`.                                                                                                                        |
 | `theme`                   | string  | UI color theme. `phosphor` (default — 80s CRT green-on-black), `plain` (pre-theme white/cyan), or any `<name>.theme.json` file in the config dir. See [themes.md](themes.md). |
-| `tools`                   | object  | Optional per-tool enable map. Currently honors `tools.websearch` and `tools.webfetch` (both `bool`, default `true`); set either to `false` to drop the tool from the registered set even when its env vars are present. |
+| `tools`                   | object  | Per-tool settings. `tools.websearch` / `tools.webfetch` (`bool`, default `true`) gate the two web tools, but only as one operand of an OR: a tool is registered when its config value is true **or** its env var (`WEBSEARCH_ENABLED` / `WEBFETCH_ENABLED`; truthy = `true` or `1`) is set — so an explicit config `false` is re-enabled by the env var, not dropped. `tools.bash_output_inline_max_bytes`, `tools.webfetch_output_inline_max_bytes`, and `tools.task_output_inline_max_bytes` (`integer`, default `8192` each) cap how much of a `bash` / `webfetch` / `task` result is returned inline versus relayed to `~/.dirge/transient/<pid>/` with a head/tail summary and a `read`-tool hint. |
 | `memory`                  | object  | Long-term memory retrieval tuning. See [Hybrid memory retrieval](#hybrid-memory-retrieval) below. Absent = the builtin BM25 store. |
 | `mcp_servers`             | object  | MCP server map when compiled with the `mcp` feature. When omitted, defaults to a single Exa Web Search server; see below.                                                   |
 | `acp_servers`             | object  | ACP server config map when compiled with the `acp` feature. See the ACP section below.                                                                                       |

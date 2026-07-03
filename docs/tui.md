@@ -47,7 +47,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 | Ctrl+X | Close active chat window |
 | Ctrl+N / Ctrl+P | Switch to next/previous chat window (when multiple subagent chats exist) |
 | Esc-Esc (idle) | Open rewind picker (truncate history) |
-| Ctrl+O | Expand collapsed tool result |
+| Ctrl+O | Toggle expand/collapse of the last collapsed block (tool result or thinking burst) |
 | Ctrl+R | Toggle reasoning visibility |
 | Shift+Tab | Cycle the active prompt layer to the next prompt (silent; status badge updates) |
 | PgUp/PgDn | Scroll chat history |
@@ -63,7 +63,7 @@ kill-subagent) are **rebindable** via the `keybindings` config — see
 |---------|--------|
 | Tool results visible | Default on (`show_tool_details: true`), toggle in config |
 | 4-line collapse | Tool result bodies default to the first 4 lines + a dim `↓ N more lines (Ctrl+O to expand)` footer. Configurable via `tool_result_max_lines` (default `4`). Exempt tools — body IS the value — render unchanged: `edit` (colorized diff), `read`, `question`, `task`, `task_status`. |
-| Ctrl+O to expand | Re-prints the most-recent collapsed tool result in full as a fresh chamber. Press again to re-emit. The stash resets on every new user prompt and on context-overflow auto-recovery. |
+| Ctrl+O to toggle | Toggles the most-recent collapsed block — a tool/command result or a thinking burst — between collapsed and expanded. Expanding appends the full block at the bottom as a fresh chamber; a second press collapses (removes) it. The target resets on every new user prompt and on context-overflow auto-recovery. |
 | Hard char cap | On top of the line cap, `tool_result_max_chars` (default `500`) trims a single pathological line so a 10 MB minified blob can't blow the chamber. |
 | Colorized edit diffs | `edit` tool results render with `-` (red), `+` (green), `@@` (cyan) coloring (`show_edit_diff: true` in config) |
 

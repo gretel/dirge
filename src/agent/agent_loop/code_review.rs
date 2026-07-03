@@ -14,11 +14,10 @@
 //! daemon/queue/sqlite infrastructure around them is not relevant to an
 //! in-loop reviewer and is deliberately left behind.
 //!
-//! This module (R1) is the PURE core: the preambles, the [`Severity`] /
-//! [`Finding`] types, and the parser. The finalization wiring, the diff
-//! capture, the two-pass verify, and the severity gate land in later
-//! rounds — until then several items here have no non-test caller.
-#![allow(dead_code)]
+//! This module is the PURE core: the preambles, the [`Severity`] /
+//! [`Finding`] types, and the parser. The finalization wiring, diff
+//! capture, two-pass verify, and severity gate are wired around it in
+//! the agent loop.
 
 /// Finding severity, ported from roborev's four-level model. Declared in
 /// ASCENDING order so the derived [`Ord`] makes `Critical` the greatest —
@@ -121,52 +120,12 @@ Judge whether a feature or API exists from the project's toolchain and dependenc
 Do not flag valid recent APIs as broken, and do not miss calls to APIs that genuinely do not \
 exist for the project's versions.";
 
-/// System preamble for the security-focused pass. Ported from roborev's
-/// `default_security.md.gotmpl` — the "exploitability burden of proof"
-/// stance plus its long don't-report list, which is what keeps a security
-/// pass from drowning the user in defense-in-depth noise. Used when the
-/// reviewer runs in security stance (R3+); the format still comes from
-/// [`REVIEW_FORMAT`].
-pub const SECURITY_PREAMBLE: &str = "\
-You are a security code reviewer with an exploitability burden of proof. Review the diff for \
-concrete vulnerabilities, material weakening of security controls, and newly reachable attack \
-surface.\n\
-\n\
-Report an issue only when the changed code affects a real trust boundary, security decision, \
-secret-bearing path, privileged operation, or externally/user-controlled input path. The finding \
-does not need a turnkey exploit, but it must identify a realistic attacker capability, the \
-weakened boundary or control, and the concrete asset or privilege at risk.\n\
-\n\
-Prefer NO finding over generic hardening advice, local-only paranoia, or best-practice \
-commentary without a changed security outcome. Focus on injection, broken auth/authorization, \
-credential exposure, path traversal, unsafe deserialization/patterns, dependency risks the diff \
-introduces, CI/CD workflow injection, sensitive-data handling, security-relevant races/TOCTOU, \
-and information leakage — but do not produce one finding per category.\n\
-\n\
-Only report vulnerabilities with a plausible exploit path visible in the diff. Do NOT report:\n\
-- Theoretical vulnerabilities in code not touched by this change.\n\
-- Generic hardening unrelated to the specific code under review.\n\
-- Missing validation unless the value is attacker-controlled and reaches a security-sensitive \
-sink.\n\
-- Missing encryption/hashing/signing/rate-limiting/audit-logging unless the reviewed code \
-handles sensitive assets and the absence creates a concrete abuse path.\n\
-- Dependency pinning, stale-dependency, or typosquatting concerns unless this diff introduces or \
-changes the dependency and there is specific evidence of risk.\n\
-- Error-message leakage unless the leaked value is sensitive and reachable by an unauthorized \
-actor.\n\
-- CI permission concerns unless untrusted code or input can influence the privileged workflow.\n\
-- Environment-variable exposure unless the reviewed code newly exposes env vars across a trust \
-boundary — returning them in an HTTP response, writing them to user-visible logs, embedding them \
-in generated artifacts, sending them to third-party services, or making them readable by \
-less-privileged users.\n\
-- Process environment variables being readable by local same-user code, child processes, or \
-same-user tooling. Local same-user access is not an attacker boundary by itself — a finding must \
-involve a weaker actor gaining access they did not already have.\n\
-\n\
-Before reporting, verify: who is the attacker or less-privileged actor? What do they control? \
-What boundary or control changed? What can they now access, modify, trigger, or bypass that they \
-could not before? Is this risk introduced or materially worsened by the diff? Drop the finding if \
-those answers are vague or rely only on \"this could be more secure.\"";
+// A security-stance review mode (roborev's `default_security.md.gotmpl`,
+// the "exploitability burden of proof" preamble) was never wired up —
+// the /code-review pass ships the general REVIEW_PREAMBLE only. The
+// constant and its test were intentionally removed rather than left to
+// rot under a blanket allow; reintroduce it if/when a security stance
+// is actually wired.
 
 /// Response-format instruction, carried in the user prompt beside the diff
 /// (mirrors the critic's split: role in the preamble, format next to the
@@ -522,21 +481,44 @@ use std::process::Command;
 /// `MAX_RULES_CHARS` sizing philosophy.
 const MAX_DIFF_BYTES: usize = 64_000;
 
-/// Capture the run's uncommitted changes as a single unified diff, ready
-/// for the reviewer: tracked edits (`git diff HEAD`) plus any new
-/// untracked files, exclude-filtered and size-capped. Returns `None` when
-/// there is nothing to review (clean tree, not a git repo, or git absent)
-/// — the gate treats `None` as "no diff, skip".
+/// The run's uncommitted diff prepared for the reviewer: the size-capped
+/// text actually sent to the judge, plus an UNcapped fingerprint used to
+/// decide whether anything changed since the run-start baseline.
 ///
-/// Thin git glue on purpose: the formatting/filtering/capping below is
-/// pure and unit-tested; this function is the one impure seam.
-pub fn capture_run_diff(repo: &Path) -> Option<String> {
+/// dirge-8gdv: the skip gate used to compare the CAPPED strings, but
+/// [`cap_diff`] truncates at [`MAX_DIFF_BYTES`]. When pre-existing WIP
+/// already exceeds the cap, a length-preserving edit that lands PAST the
+/// cutoff leaves the two capped strings byte-identical, so the reviewer
+/// was wrongly skipped. The fingerprint is hashed from the
+/// filtered-but-PRE-cap text, so such an edit still changes it — only the
+/// equality/skip decision changed; the bounded text still goes to the
+/// reviewer unchanged.
+#[derive(Debug, PartialEq, Eq)]
+pub struct RunDiff {
+    /// The bounded diff sent to the reviewer (filtered + capped).
+    pub capped: String,
+    /// Hash of the filtered, PRE-cap diff — the change-detection key.
+    pub fingerprint: u64,
+}
+
+/// Capture the run's uncommitted changes as a [`RunDiff`]: tracked edits
+/// (`git diff HEAD`) plus any new untracked files, exclude-filtered and
+/// size-capped, with an UNcapped fingerprint for the change/skip decision.
+/// Returns `None` when there is nothing to review (clean tree, not a git
+/// repo, or git absent) — the gate treats `None` as "no diff, skip".
+///
+/// Thin git glue on purpose: the filtering/capping/hashing below is pure
+/// and unit-tested; this function is the one impure seam.
+pub fn capture_run_diff(repo: &Path) -> Option<RunDiff> {
     let raw = raw_uncommitted_diff(repo);
-    let formatted = format_run_diff(&raw);
-    if formatted.trim().is_empty() {
+    let filtered = filter_diff_excludes(&raw);
+    if filtered.trim().is_empty() {
         None
     } else {
-        Some(formatted)
+        Some(RunDiff {
+            fingerprint: diff_fingerprint(&filtered),
+            capped: cap_diff(&filtered, MAX_DIFF_BYTES),
+        })
     }
 }
 
@@ -629,9 +611,17 @@ fn git_stdout_allow_fail(repo: &Path, args: &[&str]) -> Option<String> {
     if s.trim().is_empty() { None } else { Some(s) }
 }
 
-/// Filter excluded files out of a raw diff, then size-cap it. Pure.
-fn format_run_diff(raw: &str) -> String {
-    cap_diff(&filter_diff_excludes(raw), MAX_DIFF_BYTES)
+/// Hash the filtered (excluded-stripped) but UNcapped diff into a u64
+/// fingerprint for the run-start-baseline change/skip decision. Computed
+/// over the PRE-cap text so a length-preserving edit landing past
+/// [`MAX_DIFF_BYTES`] — which [`cap_diff`] would mask — still changes it.
+/// Pure; std [`DefaultHasher`] only, no new deps.
+fn diff_fingerprint(filtered: &str) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut hasher = DefaultHasher::new();
+    filtered.hash(&mut hasher);
+    hasher.finish()
 }
 
 /// Drop per-file sections whose path is noise (lockfiles, generated
@@ -1123,20 +1113,6 @@ mod tests {
     }
 
     #[test]
-    fn security_preamble_has_burden_of_proof() {
-        let p = SECURITY_PREAMBLE.to_ascii_lowercase();
-        assert!(p.contains("exploitability burden of proof"));
-        assert!(p.contains("prefer no finding"));
-        // The same-user env-var carve-out is the highest-value noise filter.
-        assert!(p.contains("same-user"));
-        // The ported don't-report carve-outs that keep the security pass
-        // from flagging routine churn (roborev parity).
-        assert!(p.contains("typosquatting"));
-        assert!(p.contains("error-message leakage"));
-        assert!(p.contains("ci permission"));
-    }
-
-    #[test]
     fn review_format_defines_all_four_severities_and_separator() {
         let f = REVIEW_FORMAT;
         for level in ["critical", "high", "medium", "low"] {
@@ -1422,6 +1398,35 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         assert_eq!(cap_diff("small", 100), "small");
     }
 
+    /// dirge-8gdv: the change/skip decision keys on an UNcapped fingerprint,
+    /// not the capped string. When pre-existing WIP already exceeds the cap,
+    /// a length-preserving edit landing PAST [`MAX_DIFF_BYTES`] leaves the
+    /// two CAPPED strings byte-identical — so the old capped-string
+    /// comparison saw no change and skipped the reviewer. The fingerprint is
+    /// hashed from the PRE-cap text and DOES change.
+    #[test]
+    fn diff_fingerprint_catches_an_edit_the_cap_masks() {
+        let head = "diff --git a/f b/f\n@@ +1 @@\n+";
+        // Push the differing bytes PAST the MAX_DIFF_BYTES cutoff.
+        let padding = "a".repeat(MAX_DIFF_BYTES + 100);
+        let a = format!("{head}{padding}AAA");
+        // Same length, one byte changed past the cap.
+        let b = format!("{head}{padding}AAB");
+        // Premise of the bug: the cap really does mask this edit.
+        assert_eq!(
+            cap_diff(&a, MAX_DIFF_BYTES),
+            cap_diff(&b, MAX_DIFF_BYTES),
+            "capped strings are byte-identical — the old comparison saw no change"
+        );
+        assert_ne!(a, b, "uncapped text genuinely differs");
+        // The fingerprint is over the PRE-cap text, so it still catches it.
+        assert_ne!(
+            diff_fingerprint(&a),
+            diff_fingerprint(&b),
+            "fingerprint must change even though the cap masks the edit"
+        );
+    }
+
     // Git-backed integration: exercises the one impure seam.
     fn git(dir: &Path, args: &[&str]) -> String {
         let mut full = vec![
@@ -1485,6 +1490,7 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         std::fs::write(repo.join("Cargo.lock"), "# lockfile churn\n").unwrap();
 
         let diff = capture_run_diff(&repo).expect("dirty tree yields a diff");
+        let diff = &diff.capped;
         assert!(diff.contains("a.rs"), "tracked edit present");
         assert!(diff.contains("let x = 1"), "tracked edit body present");
         assert!(diff.contains("b.rs"), "untracked new file present");

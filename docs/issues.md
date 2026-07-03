@@ -31,10 +31,11 @@ current state. Forked review/curator runners don't receive it.
 
 ## States and priorities
 
-- **Status**: `open` → `in_progress` → `done`, plus `blocked`. The board shows
-  the live states (open / in_progress / blocked), ordered in_progress → blocked
-  → open, then by priority, then most-recently-touched. `done` issues leave the
-  board.
+- **Status**: `open` → `in_progress` → `done`, plus `blocked` and the terminal
+  `cancelled` (`wontfix` / `dropped` alias to it). The board shows the live
+  states (open / in_progress / blocked), ordered in_progress → blocked → open,
+  then by priority, then most-recently-touched. `done` and `cancelled` issues
+  leave the board (both stamp `closed_at`).
 - **Priority**: `high` / `normal` / `low` (default `normal`).
 
 Ids are short integers shown as `#7`; inputs accept `7`, `#7`, or `iss-7`.
@@ -63,7 +64,7 @@ done.
 The same store, viewed from the TUI:
 
 - `/issues` or `/issues list` — the live board
-- `/issues list <status>` — filter by `open`/`in_progress`/`blocked`/`done`
+- `/issues list <status>` — filter by `open`/`in_progress`/`blocked`/`done`/`cancelled`
 - `/issues search <query>` — substring search
 - `/issues <id>` — one issue's details (accepts `7` or `#7`)
 

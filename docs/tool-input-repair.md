@@ -30,11 +30,11 @@ pub enum RepairKind {
 | `JsonStringToArray` | A `string` value at a path the schema declares `array`, matching `^\s*\[.*\]\s*$` | Parse the string as JSON and substitute if the parse yields an array |
 | `ObjectToArray` | An empty `{}` at a path the schema declares `array` | Substitute `[]` |
 | `BareStringToArray` | A bare `string` at a path the schema declares `array` | Wrap in a singleton array `[input]` |
-| `MdLinkUnwrapped` | A markdown auto-link in a path-shaped field, of the form `[text](http(s)://text)` where the link text equals the URL stripped of protocol | Unwrap to the link text |
+| `MdLinkUnwrapped` | A markdown auto-link in a path-shaped field whose link text is degenerate w.r.t. the URL — either the text equals the URL with its protocol stripped (`[notes.md](http://notes.md)`), or the URL path ends in `/<text>` (`[notes.md](http://example.com/sub/notes.md)`) | Unwrap to the link text |
 
 Order matters: `JsonStringToArray` runs before `BareStringToArray`, otherwise `"[\"a\",\"b\"]"` would wrap into `["[\"a\",\"b\"]"]` instead of parsing to `["a","b"]`.
 
-Real markdown links where text and URL are semantically different pass through `MdLinkUnwrapped` untouched. The repair only fires on the degenerate auto-link case.
+Real markdown links where text and URL are semantically different pass through `MdLinkUnwrapped` untouched. The repair only fires on the degenerate auto-link case — either the text reproduces the URL minus its protocol, or the text is a trailing path segment of the URL (`[src/main.rs](https://example.com/src/main.rs)` → `src/main.rs`).
 
 ### Relational defaults
 
@@ -71,13 +71,13 @@ Declared at the top level of the schema:
   "type": "object",
   "dirge-hints": {
     "relational": [
-      { "fields": ["offset", "limit"], "default": { "offset": 0, "limit": 2000 } }
+      { "requires": ["offset", "limit"], "defaults": { "offset": 0, "limit": 2000 } }
     ]
   }
 }
 ```
 
-When some but not all named fields are present, the missing ones are filled from `default`, and a note describing the fill is added to the tool result.
+When some but not all named fields are present, the missing ones are filled from `defaults`, and a note describing the fill is added to the tool result.
 
 ### `contract_hint_for`
 

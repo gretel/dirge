@@ -194,7 +194,7 @@ fn todo_nudge_message(unfinished: usize) -> LoopMessage {
 /// non-empty source's messages (plus which source fired, for tracing/tests).
 ///
 /// At most ONE source contributes per finalization. The lower-priority gates
-/// (verifier, critic, todo) are each one-shot or bounded, so deferring one by
+/// (verifier, critic, code-review, goal, todo) are each one-shot or bounded, so deferring one by
 /// a turn is intentional: e.g. a red build surfaces the verifier nudge now and
 /// the critic runs at the *next* finalization once the build is fixed (the
 /// verifier won't fire twice). This is the single authority for finalization
@@ -207,7 +207,7 @@ async fn poll_finalization_follow_up(
     new_messages: &[LoopMessage],
     critic_done: &mut bool,
     code_review_reacts: &mut u8,
-    code_review_baseline: Option<&str>,
+    code_review_baseline: Option<&super::code_review::RunDiff>,
     emitted_advisories: &mut std::collections::HashSet<String>,
     goal_reacts: &mut u8,
     todo_nudges: &mut u8,
@@ -273,7 +273,7 @@ async fn poll_finalization_follow_up(
             .flatten();
         // Review only what THIS run changed: skip when the diff is identical to
         // the run-start baseline (nothing touched on disk this turn).
-        if let Some(diff) = run_delta_to_review(diff.as_deref(), code_review_baseline) {
+        if let Some(diff) = run_delta_to_review(diff.as_ref(), code_review_baseline) {
             let transcript = build_critic_transcript(new_messages);
             let findings =
                 super::code_review::run_code_review(review_fn, system_prompt, diff, &transcript)
@@ -1137,15 +1137,16 @@ pub async fn run_loop(
     // can tell what THIS run changed. Without a baseline it diffed the whole
     // dirty tree, so a read-only turn over pre-existing WIP triggered the judge
     // and could block the loop. Only needed when the reviewer is armed.
-    let code_review_baseline: Option<String> = if config.code_review_fn.is_some() {
-        let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        tokio::task::spawn_blocking(move || super::code_review::capture_run_diff(&repo))
-            .await
-            .ok()
-            .flatten()
-    } else {
-        None
-    };
+    let code_review_baseline: Option<super::code_review::RunDiff> =
+        if config.code_review_fn.is_some() {
+            let repo = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+            tokio::task::spawn_blocking(move || super::code_review::capture_run_diff(&repo))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
 
     // Goal gate: counts re-entries so a user-defined stop condition that
     // never resolves can't loop past MAX_GOAL_REACT.
@@ -1641,9 +1642,10 @@ pub async fn run_loop(
             //   >75% → normal fold
             //   ≤75% → carry on
             //
-            // `prompt_tokens` is None until usage tracking is wired
-            // into the stream pipeline (future phase). With None,
-            // decision defaults to None (carry on).
+            // `prompt_tokens` comes from the provider's usage report
+            // (`token_usage`); it is None only when the provider
+            // doesn't report usage, in which case the decision
+            // defaults to None (carry on).
             {
                 let decision = context_manager::decide_after_usage(
                     token_usage.map(|u| u.input_tokens),
@@ -1937,14 +1939,15 @@ pub async fn run_loop(
 
         // Outer-loop finalization poll (pi lines 256-262): the single
         // priority-ordered authority for follow-up interjections —
-        // hook → verifier → critic → todo, at most one per finalization.
+        // hook → verifier → critic → code-review → goal → todo, at most
+        // one per finalization.
         let (follow_up, source) = poll_finalization_follow_up(
             &config,
             &current_context.system_prompt,
             &new_messages,
             &mut critic_done,
             &mut code_review_reacts,
-            code_review_baseline.as_deref(),
+            code_review_baseline.as_ref(),
             &mut emitted_advisories,
             &mut goal_reacts,
             &mut todo_nudges,
@@ -1994,19 +1997,31 @@ fn run_made_tool_calls(new_messages: &[LoopMessage]) -> bool {
         .any(|m| matches!(m, LoopMessage::ToolResult(_)))
 }
 
-/// dirge-1g3v: the diff-aware reviewer engages only on what THIS run changed.
-/// Given the working-tree diff now (`current`) and the run-start baseline
-/// (`baseline`), return the diff to review, or `None` to skip. An identical
-/// diff means the turn touched nothing on disk (e.g. a read-only 'explain
-/// this' turn over pre-existing WIP), so the judge is skipped — as the gate's
-/// own comment intends ("no code changed on disk"). Without this, any
-/// `ToolResult` (read-only included) drove the judge over the entire dirty
+/// dirge-1g3v / dirge-8gdv: the diff-aware reviewer engages only on what THIS
+/// run changed. Given the working-tree diff now (`current`) and the run-start
+/// baseline (`baseline`), return the diff to review, or `None` to skip. An
+/// identical diff means the turn touched nothing on disk (e.g. a read-only
+/// 'explain this' turn over pre-existing WIP), so the judge is skipped — as
+/// the gate's own comment intends ("no code changed on disk"). Without this,
+/// any `ToolResult` (read-only included) drove the judge over the entire dirty
 /// tree, spending judge calls and blocking the loop up to `MAX_REVIEW_REACT`.
-fn run_delta_to_review<'a>(current: Option<&'a str>, baseline: Option<&str>) -> Option<&'a str> {
-    match current {
-        Some(diff) if Some(diff) != baseline => Some(diff),
-        _ => None,
-    }
+///
+/// dirge-8gdv: the changed-or-not decision keys on the UNcapped
+/// [`RunDiff::fingerprint`], NOT the size-capped text. When pre-existing WIP
+/// already exceeds [`MAX_DIFF_BYTES`], a length-preserving edit landing PAST
+/// the cap leaves the two capped strings byte-identical, which made the old
+/// capped-string comparison wrongly skip the reviewer. The bounded capped text
+/// still goes to the reviewer unchanged — only this equality check changed.
+fn run_delta_to_review<'a>(
+    current: Option<&'a super::code_review::RunDiff>,
+    baseline: Option<&super::code_review::RunDiff>,
+) -> Option<&'a str> {
+    let current = current?;
+    let changed = match baseline {
+        Some(b) => current.fingerprint != b.fingerprint,
+        None => true,
+    };
+    if changed { Some(&current.capped) } else { None }
 }
 
 /// One code-review engagement's outcome at finalization, split from the

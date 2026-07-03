@@ -588,7 +588,8 @@ fn build_escalation_stream_fn(
     chunk_timeout: std::time::Duration,
     loop_tools: &[std::sync::Arc<dyn crate::agent::agent_loop::LoopTool>],
 ) -> anyhow::Result<crate::agent::agent_loop::StreamFn> {
-    use crate::agent::agent_loop::loop_tool_to_rig_definition;
+    use crate::agent::agent_loop::{loop_tool_to_rig_definition, retrying_stream_fn};
+    use crate::agent::recovery::RecoveryPolicy;
     let client = create_role_client(alias, providers, default_auth)?;
     let model_name = entry
         .model
@@ -599,7 +600,15 @@ fn build_escalation_stream_fn(
         .iter()
         .map(|t| loop_tool_to_rig_definition(t.as_ref()))
         .collect();
-    Ok(model.build_stream_fn(tool_defs, chunk_timeout, Some(alias.to_string())))
+    // Wrap with retry (dirge-dppc): the escalation route fires exactly
+    // once after repair-exhaustion, so a transient 503/rate-limit on
+    // that single call would surface immediately and waste the call the
+    // user paid a second provider for. Mirror the default route's
+    // `RecoveryPolicy::default()` wrapping.
+    Ok(retrying_stream_fn(
+        model.build_stream_fn(tool_defs, chunk_timeout, Some(alias.to_string())),
+        RecoveryPolicy::default(),
+    ))
 }
 
 /// F6 tier 3: build a one-shot judge callback (`CriticFn`) over a shared

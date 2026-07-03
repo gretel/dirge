@@ -1152,15 +1152,19 @@ impl SessionDb {
         tool_call_id: Option<&str>,
         timestamp: &str,
     ) -> Result<i64, String> {
-        self.conn
-            .execute(
-                "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, tool_call_id, timestamp)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![session_id, role, content, tool_name, tool_calls, tool_call_id, timestamp],
-            )
-            .map_err(|e| format!("Failed to insert message: {e}"))?;
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| format!("Failed to begin insert transaction: {e}"))?;
 
-        let row_id = self.conn.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO messages (session_id, role, content, tool_name, tool_calls, tool_call_id, timestamp)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![session_id, role, content, tool_name, tool_calls, tool_call_id, timestamp],
+        )
+        .map_err(|e| format!("Failed to insert message: {e}"))?;
+
+        let row_id = tx.last_insert_rowid();
 
         // SESS-14: redact secrets before they reach the FTS5 index.
         // The auto-insert triggers were dropped in v6 so we own this
@@ -1175,26 +1179,29 @@ impl SessionDb {
         );
         let redacted = redact_for_fts(&combined);
 
-        self.conn
-            .execute(
-                "INSERT INTO messages_fts(rowid, content) VALUES (?1, ?2)",
-                params![row_id, redacted],
-            )
-            .map_err(|e| format!("Failed to insert into messages_fts: {e}"))?;
-        self.conn
-            .execute(
-                "INSERT INTO messages_fts_trigram(rowid, content) VALUES (?1, ?2)",
-                params![row_id, redacted],
-            )
-            .map_err(|e| format!("Failed to insert into messages_fts_trigram: {e}"))?;
+        tx.execute(
+            "INSERT INTO messages_fts(rowid, content) VALUES (?1, ?2)",
+            params![row_id, redacted],
+        )
+        .map_err(|e| format!("Failed to insert into messages_fts: {e}"))?;
+        tx.execute(
+            "INSERT INTO messages_fts_trigram(rowid, content) VALUES (?1, ?2)",
+            params![row_id, redacted],
+        )
+        .map_err(|e| format!("Failed to insert into messages_fts_trigram: {e}"))?;
 
-        self.conn
-            .execute(
-                "UPDATE sessions SET message_count = message_count + 1, last_active = ?1 WHERE id = ?2",
-                params![timestamp, session_id],
-            )
-            .map_err(|e| format!("Failed to update session message count: {e}"))?;
+        tx.execute(
+            "UPDATE sessions SET message_count = message_count + 1, last_active = ?1 WHERE id = ?2",
+            params![timestamp, session_id],
+        )
+        .map_err(|e| format!("Failed to update session message count: {e}"))?;
 
+        // dirge-f67u: commit all four effects together — a failure on
+        // any statement rolls back the whole insert, so a messages row
+        // is never left without its FTS projection (which would also
+        // corrupt the external-content index on delete).
+        tx.commit()
+            .map_err(|e| format!("Failed to commit message insert: {e}"))?;
         Ok(row_id)
     }
 }
