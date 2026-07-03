@@ -108,6 +108,40 @@ fn is_drive_root(s: &str) -> bool {
     b.len() == 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
+/// `C:\` — a drive letter, colon, and backslash: a drive-absolute Windows
+/// path, the only shape [`verbatim_extend`] prepends a drive verbatim prefix to.
+fn is_drive_absolute(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+}
+
+/// Re-apply the `\\?\` extended-length prefix to an absolute Windows path that
+/// exceeds MAX_PATH and lacks it. [`resolve_absolute`]'s ancestor walk reattaches
+/// a nonexistent tail onto dunce's de-verbatimized ancestor, which can push a
+/// new-file path back over 260 chars WITHOUT the prefix dunce would otherwise
+/// have kept; `std::fs` then fails on machines without the long-path opt-in
+/// (dirge-8gdv.3). Only over-limit drive-absolute (`C:\…`) and UNC
+/// (`\\server\share\…`) paths are touched; short, already-verbatim, and
+/// non-Windows-shaped paths (every Unix path) pass through unchanged, so this
+/// is a safe no-op off Windows. Classification is unaffected —
+/// [`normalize_for_prefix`] strips the prefix on both sides before comparing.
+fn verbatim_extend(path: String) -> String {
+    const MAX_PATH: usize = 260;
+    if path.len() <= MAX_PATH || path.starts_with(r"\\?\") {
+        return path;
+    }
+    if let Some(rest) = path.strip_prefix(r"\\") {
+        // UNC share: `\\server\share\…` -> `\\?\UNC\server\share\…`.
+        format!(r"\\?\UNC\{rest}")
+    } else if is_drive_absolute(&path) {
+        // Drive path: `C:\…` -> `\\?\C:\…`.
+        format!(r"\\?\{path}")
+    } else {
+        // Relative or an unexpected shape — not safe to extend.
+        path
+    }
+}
+
 pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {
     let p = Path::new(path);
     let joined = if p.is_absolute() {
@@ -151,7 +185,12 @@ pub(crate) fn resolve_absolute(path: &str, working_dir: &str) -> String {
                     for seg in tail.iter().rev() {
                         out.push(seg);
                     }
-                    return out.to_string_lossy().to_string();
+                    // dunce de-verbatimizes the existing ancestor, but the
+                    // reattached tail can push the result back over MAX_PATH
+                    // without the `\\?\` prefix dunce would have kept — a
+                    // brand-new deep file then fails to write on Windows
+                    // without the long-path opt-in (dirge-8gdv.3).
+                    return verbatim_extend(out.to_string_lossy().to_string());
                 }
                 match (ancestor.parent(), ancestor.file_name()) {
                     (Some(parent), Some(name)) => {
@@ -599,5 +638,36 @@ mod tests {
     fn validate_rejects_short_nonsense_paths() {
         assert!(validate_path("a").is_err());
         assert!(validate_path("xy").is_err());
+    }
+
+    // dirge-8gdv.3: string-only, so it runs on every platform even though it
+    // guards a Windows-only failure mode.
+    #[test]
+    fn verbatim_extend_reapplies_prefix_only_for_overlong_windows_paths() {
+        let long = "a".repeat(300);
+
+        // Over-limit drive path gains the `\\?\` prefix.
+        let drive = format!(r"C:\proj\{long}\file.rs");
+        assert_eq!(verbatim_extend(drive.clone()), format!(r"\\?\{drive}"));
+
+        // Over-limit UNC path gains the `\\?\UNC\` prefix.
+        let unc = format!(r"\\server\share\{long}\file.rs");
+        assert_eq!(
+            verbatim_extend(unc),
+            format!(r"\\?\UNC\server\share\{long}\file.rs")
+        );
+
+        // Short drive path is left alone.
+        let short = r"C:\proj\src\a.rs".to_string();
+        assert_eq!(verbatim_extend(short.clone()), short);
+
+        // Already-verbatim over-limit path is not double-prefixed.
+        let verbatim = format!(r"\\?\C:\proj\{long}\file.rs");
+        assert_eq!(verbatim_extend(verbatim.clone()), verbatim);
+
+        // A long Unix-shaped path (no drive, no UNC) passes through — the
+        // reason this helper is safe to call unconditionally.
+        let unix = format!("/home/user/{long}/file.rs");
+        assert_eq!(verbatim_extend(unix.clone()), unix);
     }
 }
