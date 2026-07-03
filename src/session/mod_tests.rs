@@ -185,6 +185,24 @@ fn session_serde_roundtrip_preserves_id_and_timestamp() {
     assert_eq!(restored.messages[0].timestamp, original_ts);
 }
 
+/// dirge-ovjk follow-up: `model_explicit` round-trips through save/load, and
+/// a pre-fix session file that lacks the field deserializes to `false` (the
+/// correct answer — it saved the unresolved default).
+#[test]
+fn session_model_explicit_persists_and_defaults_false() {
+    let mut s = Session::new("openai", "gpt-4o", 0);
+    s.model_explicit = true;
+    let restored: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+    assert!(restored.model_explicit);
+
+    // A pre-fix session file lacks the field entirely — drop it from an
+    // otherwise-valid serialization and confirm it loads as false.
+    let mut value = serde_json::to_value(&s).unwrap();
+    value.as_object_mut().unwrap().remove("model_explicit");
+    let legacy: Session = serde_json::from_value(value).unwrap();
+    assert!(!legacy.model_explicit);
+}
+
 /// `compress` inserts a synthetic system summary message; it must
 /// also get a fresh id + current timestamp like any other message.
 #[test]

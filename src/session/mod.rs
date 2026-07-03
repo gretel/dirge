@@ -266,6 +266,14 @@ pub struct Session {
     pub cumulative_cache_creation_tokens: u64,
     pub context_window: u64,
     pub model: CompactString,
+    /// dirge-ovjk follow-up: whether `model` was explicitly chosen (via
+    /// `--model` or a provider entry's `model`) rather than defaulted. Stored
+    /// so a resume can honor the saved model verbatim — including an explicit
+    /// `gpt-4o` under a Codex login — instead of re-applying the Codex-default
+    /// substitution to it. Defaulted `false` on deserialize, which is the
+    /// correct answer for pre-fix sessions (they saved the unresolved default).
+    #[serde(default)]
+    pub model_explicit: bool,
     pub provider: CompactString,
     pub working_dir: CompactString,
     #[serde(default)]
@@ -420,6 +428,9 @@ impl Session {
             cumulative_cache_creation_tokens: 0,
             context_window,
             model: CompactString::new(model),
+            // Fresh sessions have their explicit signal stamped by the startup
+            // resolver (dirge-ovjk follow-up); default false until then.
+            model_explicit: false,
             provider: CompactString::new(provider),
             working_dir: std::env::current_dir()
                 .map(|p| CompactString::new(p.to_string_lossy()))

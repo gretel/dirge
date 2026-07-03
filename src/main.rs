@@ -1167,37 +1167,27 @@ async fn main() -> anyhow::Result<()> {
         cfg.auth,
     )?;
 
-    // dirge-ovjk: now that the client is built we know whether it speaks the
-    // Codex subscription backend, and we still know whether the model was
-    // explicit. Resolve the effective model name here — the single place that
-    // has both facts — so an explicit `gpt-4o` under a Codex login is honored
-    // and a *defaulted* OpenAI id becomes the Codex default. This resolved
-    // name drives the startup agent build below AND is stored as the session's
-    // model, which every runtime `completion_model` call site reads; the
-    // per-client remap in `completion_model` is gone.
-    let model = CompactString::new(provider::resolve_model_name(
+    // dirge-ovjk (+ resume follow-ups): now that the client is built we know
+    // whether it speaks the Codex backend, and we still know whether the model
+    // was explicit. Resolve the effective startup model here — the single place
+    // that has both facts. On a plain resume the session's saved model wins
+    // (honoring an explicit `gpt-4o` and using a saved non-default model for
+    // the initial agent, not the CLI/config default); a `--model` override or a
+    // fresh start uses the CLI/config-resolved model. The resolved name drives
+    // the startup agent build below AND is stored as the session's model (read
+    // by every runtime `completion_model` call site), with the explicit flag
+    // persisted so the next resume repeats this faithfully.
+    let (resolved_model, resolved_explicit) = provider::resolve_startup_model(
         &client,
         &model,
         model_explicit,
-    ));
-    if resumed {
-        // A loaded session carries no explicit-vs-default signal. Resolve it as
-        // non-explicit, which reproduces the pre-fix Codex-default mapping for
-        // a session saved as the OpenAI default; a post-fix session saved the
-        // already-resolved name, so it passes through unchanged. Only when the
-        // shim actually remaps do we resize the context window to the new model.
-        let resolved = provider::resolve_model_name(&client, &session.model, false);
-        if resolved != session.model.as_str() {
-            session.context_window = cfg.resolve_context_window(&resolved);
-            session.model = CompactString::new(resolved);
-        }
-    } else {
-        // Fresh session: store the resolved name so every runtime rebuild that
-        // reads `session.model` gets the same already-correct id, and keep the
-        // context window in sync with it.
-        session.model = model.clone();
-        session.context_window = cfg.resolve_context_window(model.as_str());
-    }
+        cli.model.is_some(),
+        resumed.then(|| (session.model.as_str(), session.model_explicit)),
+    );
+    let model = CompactString::new(resolved_model);
+    session.model = model.clone();
+    session.model_explicit = resolved_explicit;
+    session.context_window = cfg.resolve_context_window(model.as_str());
 
     // dirge-ykeu Phase 4: pre-resolve user agent profiles into subagent
     // routes (model + system prompt) and install them process-globally so the

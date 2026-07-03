@@ -167,6 +167,50 @@ fn resolve_codex_default(is_codex: bool, requested: &str, explicit: bool) -> Str
     }
 }
 
+/// Decide the effective startup model name and its explicitness, then resolve
+/// the Codex default (dirge-ovjk follow-up). Consolidates the fresh / resume /
+/// `--model`-override cases:
+///   - resuming WITHOUT a `--model` override honors the session's saved
+///     `(model, explicit)` — so an explicit `gpt-4o` under Codex survives a
+///     resume, while a pre-fix session saved as the OpenAI default (its
+///     `explicit` deserializes to `false`) still maps to the Codex default;
+///   - a fresh start, or a `--model` override on resume, uses the
+///     CLI/config-resolved `(requested, requested_explicit)`.
+///
+/// Returns `(resolved_name, explicit)`. The caller stores both on the session,
+/// so the effective name drives the startup agent build AND the persisted
+/// `explicit` flag lets the next resume repeat the decision faithfully.
+pub(crate) fn resolve_startup_model(
+    client: &AnyClient,
+    requested: &str,
+    requested_explicit: bool,
+    cli_model_override: bool,
+    resumed_session: Option<(&str, bool)>,
+) -> (String, bool) {
+    resolve_startup_model_for(
+        client.is_codex(),
+        requested,
+        requested_explicit,
+        cli_model_override,
+        resumed_session,
+    )
+}
+
+/// Pure core of [`resolve_startup_model`].
+fn resolve_startup_model_for(
+    is_codex: bool,
+    requested: &str,
+    requested_explicit: bool,
+    cli_model_override: bool,
+    resumed_session: Option<(&str, bool)>,
+) -> (String, bool) {
+    let (name, explicit) = match resumed_session {
+        Some((saved, saved_explicit)) if !cli_model_override => (saved, saved_explicit),
+        _ => (requested, requested_explicit),
+    };
+    (resolve_codex_default(is_codex, name, explicit), explicit)
+}
+
 #[cfg(test)]
 mod resolve_model_name_tests {
     use super::*;
@@ -204,6 +248,60 @@ mod resolve_model_name_tests {
         assert_eq!(resolve_codex_default(false, "gpt-4o", false), "gpt-4o");
         assert_eq!(resolve_codex_default(false, "gpt-4o", true), "gpt-4o");
         assert_eq!(resolve_codex_default(false, "o3", false), "o3");
+    }
+
+    // --- startup / resume resolution (dirge-ovjk follow-ups) -------------
+
+    #[test]
+    fn fresh_start_resolves_from_the_cli_config_model() {
+        // No resumed session: use (requested, requested_explicit).
+        assert_eq!(
+            resolve_startup_model_for(true, "gpt-4o", false, false, None),
+            ("gpt-5.5".to_string(), false)
+        );
+        assert_eq!(
+            resolve_startup_model_for(true, "gpt-4o", true, false, None),
+            ("gpt-4o".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn resume_honors_an_explicit_saved_model_under_codex() {
+        // Follow-up #1: a session saved with an explicit gpt-4o keeps it on a
+        // plain resume — the shim must not revert the choice to gpt-5.5.
+        assert_eq!(
+            resolve_startup_model_for(true, "gpt-4o", false, false, Some(("gpt-4o", true))),
+            ("gpt-4o".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn resume_still_shims_a_pre_fix_default_codex_session() {
+        // A pre-fix session saved the unresolved OpenAI default; its explicit
+        // flag deserializes to false, so it still maps to the Codex default.
+        assert_eq!(
+            resolve_startup_model_for(true, "gpt-4o", false, false, Some(("gpt-4o", false))),
+            ("gpt-5.5".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn resume_honors_a_saved_non_default_model() {
+        // Follow-up #2: resuming without --model uses the session's own model,
+        // not the CLI/config default (`requested` here is a different id).
+        assert_eq!(
+            resolve_startup_model_for(false, "gpt-4o", false, false, Some(("o3", true))),
+            ("o3".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn model_flag_overrides_the_saved_model_on_resume() {
+        // A `--model` override this invocation wins over the saved session.
+        assert_eq!(
+            resolve_startup_model_for(true, "o3", true, true, Some(("gpt-4o", true))),
+            ("o3".to_string(), true)
+        );
     }
 }
 
