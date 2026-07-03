@@ -597,9 +597,8 @@ async fn main() -> anyhow::Result<()> {
     // timeouts install): the compaction decision + summarizer gate consult
     // it so an earlier checkpoint cadence applies from one place.
     crate::agent::agent_loop::context_manager::init_fold_threshold(cfg.compaction_fold_threshold);
-    // Working-context budget (default 100k): the compaction decision caps
-    // the effective window at this so the live context stays in the model's
-    // smart zone regardless of its advertised size.
+    // Working-context budget (default no cap — model window used as-is).
+    // Set `context_target` in config.json to cap the effective window.
     crate::agent::agent_loop::context_manager::init_context_target(cfg.context_target);
     // Honor an explicit `context_window` config override in the loop's
     // window math (it previously read only the built-in model table).
