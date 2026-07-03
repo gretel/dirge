@@ -68,6 +68,22 @@ The rig adapter (`rig_stream.rs` + `rig_stream_factory.rs`) supplies a `StreamFn
 
 `retry.rs::retrying_stream_fn` wraps a `StreamFn` to auto-retry transient network and rate-limit errors. Retry only fires before any text or tool-call delta commits; once content has streamed, an error passes through and the loop exits.
 
+## Compaction
+
+Compaction runs at the turn boundary, after each assistant response. `run.rs` calls `context_manager::decide_after_usage` with the provider's `prompt_tokens`; the decision engine and mechanism live in `src/agent/agent_loop/context_manager.rs` (decision) and `src/agent/compression.rs` (token estimator, per-result caps, summarizer) — those modules are the canonical reference. In summary:
+
+- **Input**: the provider's `prompt_tokens` from the usage report. When a provider reports no usage, the decision is `None` (carry on) — no fold is attempted.
+- **Budget ladder** — thresholds are fractions of the model's context window (`ctx_max`), in ascending pressure:
+  - `0.60` — tighten the per-tool-result cap to head off overflow before a fold is needed.
+  - `0.75` (`HISTORY_FOLD_THRESHOLD`) — normal fold: older history folds into a structured summary, keeping a 20% token tail.
+  - `0.78` (`HISTORY_FOLD_AGGRESSIVE_THRESHOLD`) — the normal fold didn't buy enough headroom, so halve the tail (10%).
+  - `0.80` (`FORCE_SUMMARY_THRESHOLD`) — exit the turn with a final summary (defense in depth).
+  - `0.90` (`TURN_START_FOLD_THRESHOLD`) — a turn-start *local* estimate, before the first API call (catches a terminal prior turn, a session restore, or a huge paste).
+- **Fold = prune + summarize**: oversized tool results are capped and tool output pruned without an LLM call, then the conversation middle is summarized via the configured `summarization_provider` (or the main model if none is set). An explicit `/compress` forces the pass regardless of ratio; reactive overflow recovery uses the same route, falling back to prune-only emergency compaction when no safe summarizer is configured.
+- **Snip override**: a pre-send snip that frees ≥10% of the window suppresses a *normal* fold; aggressive and force-summary folds always proceed.
+
+See [features.md](features.md) for the user-facing summary.
+
 ## Tool execution
 
 `execute_tool_calls` dispatches the batch of tool calls in a single assistant message. The batch runs sequentially if either:
@@ -75,7 +91,7 @@ The rig adapter (`rig_stream.rs` + `rig_stream_factory.rs`) supplies a `StreamFn
 - `LoopConfig.tool_execution` is `ToolExecutionMode::Sequential`, or
 - Any tool in the batch declares `execution_mode() == Some(ToolExecutionMode::Sequential)`.
 
-Otherwise the batch runs in parallel via `tokio::join_all`. Read-only tools (`read`, `grep`, `list_dir`, `find_files`) leave the default `Parallel`; mutating tools (`write`, `edit`, `bash`, `apply_patch`) declare `Sequential` so a batch containing any of them serializes.
+Otherwise the batch runs in parallel via `futures::join_all`. Read-only tools (`read`, `grep`, `list_dir`, `find_files`) leave the default `Parallel`; mutating tools (`write`, `edit`, `bash`, `apply_patch`) declare `Sequential` so a batch containing any of them serializes.
 
 In parallel mode, `tool_execution_end` events emit in completion order but the resulting `ToolResultMessage` items appear in source order in the context. Each tool dispatch threads through:
 

@@ -194,7 +194,7 @@ fn todo_nudge_message(unfinished: usize) -> LoopMessage {
 /// non-empty source's messages (plus which source fired, for tracing/tests).
 ///
 /// At most ONE source contributes per finalization. The lower-priority gates
-/// (verifier, critic, todo) are each one-shot or bounded, so deferring one by
+/// (verifier, critic, code-review, goal, todo) are each one-shot or bounded, so deferring one by
 /// a turn is intentional: e.g. a red build surfaces the verifier nudge now and
 /// the critic runs at the *next* finalization once the build is fixed (the
 /// verifier won't fire twice). This is the single authority for finalization
@@ -1642,9 +1642,10 @@ pub async fn run_loop(
             //   >75% → normal fold
             //   ≤75% → carry on
             //
-            // `prompt_tokens` is None until usage tracking is wired
-            // into the stream pipeline (future phase). With None,
-            // decision defaults to None (carry on).
+            // `prompt_tokens` comes from the provider's usage report
+            // (`token_usage`); it is None only when the provider
+            // doesn't report usage, in which case the decision
+            // defaults to None (carry on).
             {
                 let decision = context_manager::decide_after_usage(
                     token_usage.map(|u| u.input_tokens),
@@ -1938,7 +1939,8 @@ pub async fn run_loop(
 
         // Outer-loop finalization poll (pi lines 256-262): the single
         // priority-ordered authority for follow-up interjections —
-        // hook → verifier → critic → todo, at most one per finalization.
+        // hook → verifier → critic → code-review → goal → todo, at most
+        // one per finalization.
         let (follow_up, source) = poll_finalization_follow_up(
             &config,
             &current_context.system_prompt,
