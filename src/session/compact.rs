@@ -240,10 +240,21 @@ pub(crate) fn align_cut_to_user_boundary(messages: &[SessionMessage], cut_idx: u
 /// over-drains and destroys the verbatim tail; recompute the cut here in
 /// session space instead.
 pub(crate) fn compaction_cut_idx(session: &Session, keep_recent_tokens: u64) -> usize {
+    // Cap the kept tail at half the model's context window so a small-context
+    // model (whose whole session may be smaller than `keep_recent_tokens`)
+    // still retains a verbatim tail. `0` means "unknown" — don't clamp then,
+    // or we'd reintroduce the all-summarized bug.
+    let cap = if session.context_window > 0 {
+        session.context_window / 2
+    } else {
+        u64::MAX
+    };
+    let effective_keep = keep_recent_tokens.min(cap);
+
     let mut accumulated = 0u64;
     let mut cut_idx = session.messages.len();
     for (i, msg) in session.messages.iter().enumerate().rev() {
-        if accumulated >= keep_recent_tokens {
+        if accumulated >= effective_keep {
             cut_idx = i + 1;
             break;
         }
@@ -341,6 +352,38 @@ mod cut_tests {
                 .iter()
                 .any(|m| m.content.contains("recent answer")),
             "a loop-space index over-drains and loses the tail (the bug)"
+        );
+    }
+
+    /// On a small-context model (e.g. an 8k window) the whole session can
+    /// total fewer tokens than the 20_000 default `keep_recent_tokens`.
+    /// Without a clamp the accumulator never reaches the threshold, the loop
+    /// never trips, and `cut_idx` stays at `messages.len()` — dropping the
+    /// ENTIRE verbatim tail and replacing the whole conversation with just
+    /// the summary. Capping `keep_recent` at half the context window (only
+    /// when the window is known) guarantees a recent tail survives.
+    #[test]
+    fn compaction_cut_clamps_keep_recent_to_half_context_window_on_small_models() {
+        let mut s = Session::new("p", "m", 8_000);
+        // Four ~2500-token messages: total (~10k) sits well under the 20_000
+        // default keep_recent, but the recent tail (~5k) clears the 4_000
+        // clamp (half of 8_000).
+        s.add_message(MessageRole::User, &"a".repeat(10_000));
+        s.add_message(MessageRole::Assistant, &"b".repeat(10_000));
+        s.add_message(MessageRole::User, &"c".repeat(10_000));
+        s.add_message(MessageRole::Assistant, &"d".repeat(10_000));
+
+        let total: u64 = s.messages.iter().map(|m| m.estimated_tokens).sum();
+        assert!(
+            total < 20_000,
+            "fixture must sit under the default keep_recent (got {total})"
+        );
+
+        let cut = compaction_cut_idx(&s, 20_000);
+        assert!(
+            cut < s.messages.len(),
+            "small-context model must still keep a verbatim tail, got cut={cut} len={}",
+            s.messages.len()
         );
     }
 }
