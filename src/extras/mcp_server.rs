@@ -256,6 +256,17 @@ struct Envelope {
 #[cfg(unix)]
 struct ProcessGroupGuard {
     pgid: u32,
+    /// Disarmed once the leader has been reaped on the success path, so the
+    /// cancel-path drop (which fires while the leader still pins the pgid)
+    /// isn't mistaken for a still-live group. See dirge-8gdv.
+    armed: bool,
+}
+
+#[cfg(unix)]
+impl ProcessGroupGuard {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
 }
 
 #[cfg(unix)]
@@ -264,7 +275,7 @@ impl Drop for ProcessGroupGuard {
         // Never signal group 0 (dirge's OWN group — suicide) or 1 (everything
         // signalable). setsid() makes the child a leader with pgid == pid
         // (> 1), but guard defensively against a 0/1 slipping in.
-        if self.pgid <= 1 {
+        if self.pgid <= 1 || !self.armed {
             return;
         }
         // SAFETY: kill(2) with a negative pid targets the process group.
@@ -307,7 +318,10 @@ async fn run_child_killable(
     // the pgid; `child` then drops and `kill_on_drop` reaps the leader.
     let mut child = cmd.spawn()?;
     #[cfg(unix)]
-    let _pg_guard = child.id().map(|pid| ProcessGroupGuard { pgid: pid });
+    let mut _pg_guard = child.id().map(|pid| ProcessGroupGuard {
+        pgid: pid,
+        armed: true,
+    });
 
     // Drain both pipes concurrently with the wait so a child that fills a pipe
     // buffer can't deadlock (mirrors what `wait_with_output` does internally).
@@ -327,6 +341,15 @@ async fn run_child_killable(
         }
     };
     let (status, (), ()) = tokio::join!(child.wait(), read_out, read_err);
+
+    // Success path: `child.wait()` just reaped the leader, so the pgid may be
+    // recycled onto an unrelated group. Disarm the guard so its drop is a
+    // no-op here — only the cancel path (future dropped before this line)
+    // leaves it armed and fires the SIGKILL (dirge-8gdv).
+    #[cfg(unix)]
+    if let Some(g) = _pg_guard.as_mut() {
+        g.disarm();
+    }
 
     Ok(std::process::Output {
         status: status?,
@@ -652,6 +675,63 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
         assert!(gone, "grandchild (pid {gpid}) must be killed on cancel");
+    }
+
+    /// Spawn `sleep 30` in its OWN process group (`setsid`, pgid == pid) and
+    /// return the owning `Child` handle (kept alive so the test can reap it,
+    /// making liveness probes deterministic instead of relying on init).
+    #[cfg(unix)]
+    fn spawn_setsid_sleep() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30").stdin(std::process::Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        cmd.spawn().expect("spawn setsid sleep")
+    }
+
+    /// dirge-8gdv: on the success path `child.wait()` reaps the leader, so the
+    /// guard must NOT fire `kill(-pgid)` on drop afterward (the pgid may have
+    /// been recycled onto an unrelated group). A disarmed guard is a no-op;
+    /// an armed guard still SIGKILLs the group (cancel path intact).
+    #[cfg(unix)]
+    #[test]
+    fn process_group_guard_disarm_skips_kill() {
+        // Case A: a disarmed guard leaves the group alive.
+        let mut child_a = spawn_setsid_sleep();
+        let pid_a = child_a.id();
+        {
+            let mut guard = ProcessGroupGuard {
+                pgid: pid_a,
+                armed: true,
+            };
+            guard.disarm();
+        } // drop: disarmed → no signal
+        // SAFETY: signal 0 only probes for existence.
+        let alive = unsafe { libc::kill(pid_a as libc::pid_t, 0) } == 0;
+        assert!(alive, "disarmed guard must not kill pid {pid_a}");
+        let _ = child_a.kill();
+        let _ = child_a.wait();
+
+        // Case B: an armed guard SIGKILLs the group on drop (cancel path).
+        let mut child_b = spawn_setsid_sleep();
+        let pid_b = child_b.id();
+        {
+            let _guard = ProcessGroupGuard {
+                pgid: pid_b,
+                armed: true,
+            };
+        } // drop: armed → kill(-pgid)
+        // Reap the leader so the liveness probe is deterministic.
+        let _ = child_b.wait();
+        let dead = unsafe { libc::kill(pid_b as libc::pid_t, 0) } != 0;
+        assert!(dead, "armed guard must kill pid {pid_b} on drop");
     }
 
     #[test]
