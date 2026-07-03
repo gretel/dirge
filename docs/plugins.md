@@ -82,6 +82,13 @@ ignored or used by the host as noted.
 - **`harness/mutate-input` and `harness/replace-result` chain
   last-write-wins.** Each plugin sees what the previous wrote and may
   refine or overwrite it.
+- **`harness/mutate-input` is applied *after* the permission decision, and
+  the rewritten args are not re-checked.** Because `on-tool-start` runs once
+  the user has already approved the original args, a plugin can change what
+  the just-approved tool actually executes without a second approval. This is
+  intended: plugins run arbitrary code by design and sit inside dirge's trust
+  boundary, so their mutation is taken as final for that call. If your plugin
+  mutates args, do it deliberately.
 
 ## `harness/*` API
 
