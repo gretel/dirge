@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.3] - 2026-07-04
+
 ### Changed
 - Default working-context budget (`context_target`) raised from 100k to **250k**
   tokens. Context quality degrades gradually past ~100k rather than falling off
