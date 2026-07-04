@@ -853,29 +853,20 @@ fn is_user_msg(msg: &Value) -> bool {
 }
 
 /// Smallest index `>= idx` whose message is a user turn, clamped to
-/// `messages.len()` when none is found at or after `idx`.
+/// `messages.len()` when none is found at or after `idx`. Delegates the
+/// walk to `session::compact::snap_forward_to_user`; the `idx.min(len)`
+/// clamp is kept here — the generic is deliberately unclamped so the
+/// slash-side `align_cut_to_user_boundary` can share it — to preserve
+/// this helper's prior contract exactly.
 fn snap_forward_to_user(messages: &[Value], idx: usize) -> usize {
-    let n = messages.len();
-    let mut i = idx.min(n);
-    while i < n && !is_user_msg(&messages[i]) {
-        i += 1;
-    }
-    i
+    crate::session::compact::snap_forward_to_user(messages, idx.min(messages.len()), is_user_msg)
 }
 
 /// Largest index `<= idx` whose message is a user turn, or `0` when none
-/// is found at or before `idx`.
+/// is found at or before `idx`. Delegates to
+/// `session::compact::snap_backward_to_user`.
 fn snap_backward_to_user(messages: &[Value], idx: usize) -> usize {
-    let mut i = idx.min(messages.len().saturating_sub(1));
-    loop {
-        if is_user_msg(&messages[i]) {
-            return i;
-        }
-        if i == 0 {
-            return 0;
-        }
-        i -= 1;
-    }
+    crate::session::compact::snap_backward_to_user(messages, idx, is_user_msg)
 }
 
 /// Generate a new session id with a `compacted-` prefix to
