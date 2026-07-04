@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.1] - 2026-07-04
+
 ### Fixed
 - Mouse/selection breaking after switching away from and back to the terminal
   window now recovers automatically. Focus reporting is enabled, and on
