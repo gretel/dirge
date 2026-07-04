@@ -14,7 +14,7 @@
 //! one-shot "is this correct/complete" review; the goal gate persists
 //! across finalizations until the user's explicit stop condition holds.
 
-use super::critic::CriticFn;
+use super::critic::{CriticFn, run_judge, truncate_rules};
 use super::message::{LoopMessage, UserMessage};
 use super::verifier::VerificationStatus;
 
@@ -100,15 +100,10 @@ pub fn build_goal_prompt(
     verification: Option<VerificationStatus>,
 ) -> String {
     let rules = super::critic::strip_compaction_summary(rules);
-    let (rules, elided) = if rules.chars().count() > MAX_RULES_CHARS {
-        let head: String = rules.chars().take(MAX_RULES_CHARS).collect();
-        (head, "\n[…constraints truncated…]")
-    } else {
-        (rules.to_string(), "")
-    };
+    let rules = truncate_rules(rules, MAX_RULES_CHARS, "\n[…constraints truncated…]");
     format!(
         "{GOAL_PREAMBLE}\n\n\
-         === AGENT INSTRUCTIONS / CONSTRAINTS ===\n{rules}{elided}\n\n\
+         === AGENT INSTRUCTIONS / CONSTRAINTS ===\n{rules}\n\n\
          === STOP CONDITION ===\n{goal}\n\n\
          === TRANSCRIPT ===\n{transcript}{}\n\n\
          {GOAL_FORMAT}",
@@ -157,13 +152,13 @@ pub async fn run_goal_gate(
     verification: Option<VerificationStatus>,
 ) -> Vec<LoopMessage> {
     let prompt = build_goal_prompt(goal, rules, transcript, verification);
-    let response = match judge(prompt).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(target: "dirge::goal", error = %e, "goal-gate judge call failed; finalizing without it");
-            return Vec::new();
-        }
-    };
+    let response = run_judge!(
+        judge,
+        prompt,
+        "dirge::goal",
+        "goal-gate judge call failed; finalizing without it",
+        Vec::new()
+    );
     match parse_goal_verdict(&response) {
         Some(remaining) => vec![LoopMessage::User(UserMessage {
             content: format!(

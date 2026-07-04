@@ -152,6 +152,12 @@ pub fn before_hook_from_plugin_manager(pm: Arc<Mutex<PluginManager>>) -> BeforeT
             //    If parsing fails, log via tracing and proceed
             //    with the original args (defensive — same
             //    tolerance as before).
+            //
+            //    Applied here, in `on-tool-start`, which runs AFTER the
+            //    permission decision — so the rewritten args are NOT
+            //    re-checked against the approval. A plugin can change what a
+            //    just-approved tool actually runs. Intended: plugins are fully
+            //    trusted and their mutation is final for the call.
             let final_args = if let Some(mutated_json) = hook_result.mutate_input {
                 match serde_json::from_str::<serde_json::Value>(&mutated_json) {
                     Ok(v) => v,

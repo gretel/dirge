@@ -498,6 +498,18 @@ fn themed(c: Color) -> Color {
     apply_no_color(c, no_color())
 }
 
+/// Public chokepoint for the PAINT paths — the things that emit color but do
+/// NOT go through the theme accessors (and thus bypass [`themed`]): raw
+/// `Color::` literals painted directly by widgets, and the colors stored on
+/// chat [`LineEntry`](crate::ui::renderer::LineEntry)/`SourceBlock`s by the
+/// direct write path. Collapse such a color to the terminal default when
+/// `--no-color` is on. Theme accessors already route through [`themed`] and do
+/// not need to call this.
+#[inline]
+pub fn no_color_remap(c: Color) -> Color {
+    apply_no_color(c, no_color())
+}
+
 // Convenience accessors. Call sites use these instead of touching the
 // struct so renaming/restructuring fields in `Theme` doesn't ripple
 // across the codebase. Each routes through `themed()` so `--no-color`
@@ -628,6 +640,21 @@ mod tests {
             apply_no_color(Color::Rgb { r: 1, g: 2, b: 3 }, false),
             Color::Rgb { r: 1, g: 2, b: 3 }
         );
+    }
+
+    /// `no_color_remap` is the public paint-path chokepoint. In the default
+    /// (no-color OFF) state it's identity — colors pass through untouched. The
+    /// collapse-when-ON branch is already pinned by
+    /// `apply_no_color_collapses_only_when_enabled`; the global is set-once and
+    /// can't be toggled here (same constraint every other theme test has).
+    #[test]
+    fn no_color_remap_is_identity_when_disabled() {
+        assert_eq!(no_color_remap(Color::Green), Color::Green);
+        assert_eq!(
+            no_color_remap(Color::Rgb { r: 1, g: 2, b: 3 }),
+            Color::Rgb { r: 1, g: 2, b: 3 }
+        );
+        assert_eq!(no_color_remap(Color::Reset), Color::Reset);
     }
 
     /// `phosphor` and `plain` differ in their agent color — quick

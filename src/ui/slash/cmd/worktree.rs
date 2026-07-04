@@ -1,14 +1,15 @@
 //! Git worktree slash commands: /worktree, /wt-merge, /wt-exit.
 //!
-//! `/wt-merge` and `/wt-exit` defer their work via anyhow sentinel
-//! errors (`DEFER_WT_MERGE:` / `DEFER_WT_EXIT:`) that the outer
-//! event loop in `ui/mod.rs` parses — preserve those return paths
-//! exactly.
+//! `/wt-merge` and `/wt-exit` defer their work via
+//! [`SlashOutcome::DeferWtMerge`] / [`SlashOutcome::DeferWtExit`],
+//! carrying typed [`WtMerge`] / [`WtExit`] payloads that the outer
+//! event loop in `ui/mod.rs` consumes directly.
 
 use crate::ui::events::render_session;
-use crate::ui::slash::{SlashCtx, c_agent, c_error};
+use crate::ui::slash::cmd::agent;
+use crate::ui::slash::{SlashCtx, SlashOutcome, c_agent, c_error};
 
-use super::wt_defer::{pack_wt_exit, pack_wt_merge};
+use super::wt_defer::{WtExit, WtMerge};
 
 pub(crate) async fn cmd_worktree(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
     if parts.len() < 2 {
@@ -58,27 +59,7 @@ pub(crate) async fn cmd_worktree(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                 guard.set_working_dir(&ctx.session.working_dir);
             }
             ctx.context.reload();
-            let model = ctx.client.completion_model(ctx.session.model.to_string());
-            *ctx.agent = crate::provider::build_agent(
-                model,
-                ctx.cli,
-                ctx.cfg,
-                ctx.context,
-                ctx.permission.clone(),
-                ctx.ask_tx.clone(),
-                ctx.question_tx.clone(),
-                ctx.plan_tx.clone(),
-                ctx.bg_store.clone(),
-                #[cfg(feature = "lsp")]
-                ctx.lsp_manager.cloned(),
-                ctx.sandbox.clone(),
-                #[cfg(feature = "mcp")]
-                ctx.mcp_manager,
-                #[cfg(feature = "semantic")]
-                ctx.semantic_manager,
-                Some(ctx.session.id.to_string()),
-            )
-            .await;
+            agent::rebuild_agent(ctx).await;
             render_session(ctx.renderer, ctx.session, ctx.cli, ctx.cfg, ctx.context)?;
             ctx.renderer.write_line(
                 &format!("worktree created: branch '{}' at {}", name, path.display()),
@@ -93,13 +74,16 @@ pub(crate) async fn cmd_worktree(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
     Ok(())
 }
 
-pub(crate) async fn cmd_wt_merge(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
+pub(crate) async fn cmd_wt_merge(
+    ctx: &mut SlashCtx<'_>,
+    parts: &[&str],
+) -> anyhow::Result<SlashOutcome> {
     let info = match crate::extras::git_worktree::detect() {
         Some(i) => i,
         None => {
             ctx.renderer
                 .write_line("not in a git worktree", c_error())?;
-            return Ok(());
+            return Ok(SlashOutcome::Handled);
         }
     };
     let target = if parts.len() >= 2 {
@@ -112,7 +96,7 @@ pub(crate) async fn cmd_wt_merge(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
                     "no target branch specified and couldn't detect main/master",
                     c_error(),
                 )?;
-                return Ok(());
+                return Ok(SlashOutcome::Handled);
             }
         }
     };
@@ -126,22 +110,24 @@ pub(crate) async fn cmd_wt_merge(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyh
         ),
         c_agent(),
     )?;
-    Err(anyhow::anyhow!(pack_wt_merge(
-        &info.branch,
-        &target,
-        &main_path.to_string(),
-        &wt_path.to_string(),
-        &repo_name,
-    )))
+    Ok(SlashOutcome::DeferWtMerge(WtMerge {
+        branch: info.branch,
+        target,
+        main_path: main_path.to_string(),
+        wt_path: wt_path.to_string(),
+    }))
 }
 
-pub(crate) async fn cmd_wt_exit(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
+pub(crate) async fn cmd_wt_exit(
+    ctx: &mut SlashCtx<'_>,
+    parts: &[&str],
+) -> anyhow::Result<SlashOutcome> {
     let info = match crate::extras::git_worktree::detect() {
         Some(i) => i,
         None => {
             ctx.renderer
                 .write_line("not in a git worktree", c_error())?;
-            return Ok(());
+            return Ok(SlashOutcome::Handled);
         }
     };
     let force = parts.iter().skip(1).any(|p| *p == "--force" || *p == "-f");
@@ -161,7 +147,7 @@ pub(crate) async fn cmd_wt_exit(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyho
                     ),
                     c_error(),
                 )?;
-                return Ok(());
+                return Ok(SlashOutcome::Handled);
             }
             Ok(_) => {} // clean tree
             Err(e) => {
@@ -172,7 +158,7 @@ pub(crate) async fn cmd_wt_exit(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyho
                     ),
                     c_error(),
                 )?;
-                return Ok(());
+                return Ok(SlashOutcome::Handled);
             }
         }
     }
@@ -181,8 +167,8 @@ pub(crate) async fn cmd_wt_exit(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyho
         &format!("returning to main repo at {}", main_path),
         c_agent(),
     )?;
-    Err(anyhow::anyhow!(pack_wt_exit(
-        &main_path.to_string(),
-        &info.worktree_path.display().to_string(),
-    )))
+    Ok(SlashOutcome::DeferWtExit(WtExit {
+        main_path: main_path.to_string(),
+        wt_path: info.worktree_path.display().to_string(),
+    }))
 }

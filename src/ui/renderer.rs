@@ -137,14 +137,18 @@ pub const CHAT_FRAME_ROWS: u16 = 2;
 /// the side panels. Below this the chat is too narrow to spare any
 /// margin for the AGENT STATUS / SYSTEM gutters.
 ///
-/// dirge-8855: this is the REAL threshold, derived from the gutter math.
-/// A side panel needs ≥15 cols of centered-layout margin
-/// (`content_indent() >= 15`); since `content_width` caps at 120, a
-/// non-trivial gutter only appears once `line_width (= cols - 2)` exceeds
-/// 120, and `content_indent >= 15` ⇒ `line_width - 120 >= 30` ⇒
-/// `cols >= 152`. The old value of 100 was dead — the `content_indent`
-/// gate always bound first — and the README's "≥100 cols" was wrong.
-const PANEL_AUTO_MIN_COLS: u16 = 152;
+/// dirge-8855/dirge-tkth: the REAL threshold, derived from the gutter math
+/// so that when Auto turns the panels on, BOTH actually render — no reserved
+/// but blank gutter at the boundary.
+///
+/// With both panels shown and `content_width` capped at 120, the right panel
+/// width is the remainder `right = cols - (cols - 122)/2 - 122`. The RIGHT
+/// panel is the binding constraint (its draw floor `RIGHT_PANEL_MIN_W = 16`
+/// exceeds the left's 12): `right >= 16` first holds at `cols = 153`
+/// (at 152 `right = 15`, so the old 152 flipped Auto on but left the right
+/// gutter reserved-yet-unpainted). The `content_indent() >= 15` gate in the
+/// panel-visibility check is satisfied by 153 as well, so it no longer binds.
+pub(crate) const PANEL_AUTO_MIN_COLS: u16 = 153;
 
 /// Max rows the live shell box (`!cmd`/`!!cmd`) may occupy, so a chatty
 /// command never crowds out the whole chat. The painter clips the tail.
@@ -1125,6 +1129,7 @@ impl Renderer {
     /// only — visible the next time the user switches to that
     /// chat via Ctrl-N/P/X.
     pub fn write_line_to_chat(&mut self, idx: usize, text: &str, color: Color) -> io::Result<()> {
+        let color = crate::ui::theme::no_color_remap(color);
         if idx == self.active_chat {
             return self.write_line(text, color);
         }
@@ -2036,6 +2041,10 @@ impl Renderer {
     }
 
     pub fn write_line(&mut self, text: &str, color: Color) -> io::Result<()> {
+        // dirge-kk4i: --no-color must collapse stored chat colors too, not just
+        // theme-accessor colors. Remap at this chokepoint so the SourceBlock
+        // color is already the terminal default when --no-color is on.
+        let color = crate::ui::theme::no_color_remap(color);
         self.commit_partial();
         // dirge-qy3y: record as a width-independent source block (which renders
         // + appends the wrapped rows and seals any open stream) so it reflows
@@ -2055,6 +2064,7 @@ impl Renderer {
     /// narrowing resize either). One buffer row per `\n`-split line, so the
     /// chamber's `buffer_len()` index bookkeeping is unchanged vs `write_line`.
     pub fn write_line_raw(&mut self, text: &str, color: Color) -> io::Result<()> {
+        let color = crate::ui::theme::no_color_remap(color);
         self.commit_partial();
         self.commit_stream();
         let rows: Vec<LineEntry> = text

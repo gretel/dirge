@@ -346,49 +346,6 @@ fn is_anthropic_messages_payload(value: &serde_json::Value) -> bool {
             .is_some_and(serde_json::Value::is_boolean)
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
-fn prepend_claude_code_system(body: Bytes) -> Bytes {
-    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&body) else {
-        return body;
-    };
-    let Some(obj) = value.as_object_mut() else {
-        return body;
-    };
-
-    let claude_block = serde_json::json!({
-        "type": "text",
-        "text": CLAUDE_CODE_SYSTEM_PROMPT,
-    });
-
-    match obj.get_mut("system") {
-        // Already an array of content blocks: prepend unless it's already first.
-        Some(serde_json::Value::Array(items)) => {
-            if first_system_block_is_claude_code(items) {
-                return body;
-            }
-            items.insert(0, claude_block);
-        }
-        // A bare string system prompt: lift it into the array form behind the
-        // required Claude Code block.
-        Some(serde_json::Value::String(text)) => {
-            let existing = std::mem::take(text);
-            obj.insert(
-                "system".to_string(),
-                serde_json::json!([
-                    claude_block,
-                    { "type": "text", "text": existing },
-                ]),
-            );
-        }
-        // No system prompt at all.
-        _ => {
-            obj.insert("system".to_string(), serde_json::json!([claude_block]));
-        }
-    }
-
-    serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
-}
-
 fn prepend_claude_code_system_value(value: &mut serde_json::Value) {
     let Some(obj) = value.as_object_mut() else {
         return;
@@ -678,16 +635,12 @@ mod tests {
 
     #[test]
     fn prepends_claude_code_block_to_system_array() {
-        let body = Bytes::from(
-            serde_json::json!({
-                "system": [{ "type": "text", "text": "Real prompt." }],
-                "messages": []
-            })
-            .to_string(),
-        );
+        let mut value = serde_json::json!({
+            "system": [{ "type": "text", "text": "Real prompt." }],
+            "messages": []
+        });
 
-        let value: serde_json::Value =
-            serde_json::from_slice(&prepend_claude_code_system(body)).unwrap();
+        prepend_claude_code_system_value(&mut value);
 
         let system = value["system"].as_array().unwrap();
         assert_eq!(system.len(), 2);
@@ -697,12 +650,9 @@ mod tests {
 
     #[test]
     fn lifts_string_system_into_array_behind_claude_code_block() {
-        let body = Bytes::from(
-            serde_json::json!({ "system": "Real prompt.", "messages": [] }).to_string(),
-        );
+        let mut value = serde_json::json!({ "system": "Real prompt.", "messages": [] });
 
-        let value: serde_json::Value =
-            serde_json::from_slice(&prepend_claude_code_system(body)).unwrap();
+        prepend_claude_code_system_value(&mut value);
 
         let system = value["system"].as_array().unwrap();
         assert_eq!(system.len(), 2);
@@ -712,10 +662,9 @@ mod tests {
 
     #[test]
     fn adds_system_when_absent() {
-        let body = Bytes::from(serde_json::json!({ "messages": [] }).to_string());
+        let mut value = serde_json::json!({ "messages": [] });
 
-        let value: serde_json::Value =
-            serde_json::from_slice(&prepend_claude_code_system(body)).unwrap();
+        prepend_claude_code_system_value(&mut value);
 
         let system = value["system"].as_array().unwrap();
         assert_eq!(system.len(), 1);
@@ -724,18 +673,14 @@ mod tests {
 
     #[test]
     fn does_not_double_prepend_claude_code_block() {
-        let body = Bytes::from(
-            serde_json::json!({
-                "system": [
-                    { "type": "text", "text": CLAUDE_CODE_SYSTEM_PROMPT },
-                    { "type": "text", "text": "Real prompt." }
-                ]
-            })
-            .to_string(),
-        );
+        let mut value = serde_json::json!({
+            "system": [
+                { "type": "text", "text": CLAUDE_CODE_SYSTEM_PROMPT },
+                { "type": "text", "text": "Real prompt." }
+            ]
+        });
 
-        let value: serde_json::Value =
-            serde_json::from_slice(&prepend_claude_code_system(body)).unwrap();
+        prepend_claude_code_system_value(&mut value);
 
         let system = value["system"].as_array().unwrap();
         assert_eq!(system.len(), 2);

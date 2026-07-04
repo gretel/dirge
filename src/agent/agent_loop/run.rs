@@ -54,6 +54,7 @@ use super::storm::StormBreaker;
 use super::stream::{StreamFn, stream_assistant_response};
 use super::tool::AbortSignal;
 use super::types::{Context, LoopConfig};
+use crate::sync_util::LockExt;
 
 /// Phase 4 part 2: poll the configured `get_steering_messages`
 /// hook AND the file-touch tracker (when present), concatenating
@@ -2262,7 +2263,7 @@ pub(crate) fn apply_truncation_repair(
             } else {
                 format!("[{}]", tc.name)
             };
-            let mut sink = truncation_notes.lock().expect("truncation_notes poisoned");
+            let mut sink = truncation_notes.lock_ignore_poison();
             let entry = sink.entry(tc.id.clone()).or_default();
             for n in &r.notes {
                 entry.push(format!("{prefix} {n}"));

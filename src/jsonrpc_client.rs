@@ -1,0 +1,302 @@
+//! Generic request/response correlation over a framed JSON-RPC-style transport,
+//! shared by the LSP ([`crate::lsp::rpc::RpcClient`]) and DAP
+//! ([`crate::dap::client::DapRpc`]) clients.
+//!
+//! Both are mechanically the same stack: allocate a monotonic id, register a
+//! pending [`oneshot`] sender, write a framed request, and run a background
+//! read loop that routes each incoming frame either to a waiting request (by
+//! correlation id) or to a registered notification/event handler. They differ
+//! only in (a) how an incoming frame is classified as response vs notification,
+//! (b) the envelope shape of an outgoing request/notification, and (c) the
+//! concrete error type surfaced to callers. Those differences live in the
+//! [`Protocol`] impl; this module owns everything else — including the single
+//! drain-on-close path (dirge-syom) that used to be duplicated in both read
+//! loops.
+//!
+//! Built on [`crate::jsonrpc_framing`] for the wire format.
+
+use std::collections::HashMap;
+use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+
+use serde_json::Value;
+use tokio::io::{AsyncBufRead, AsyncWrite};
+use tokio::sync::{Mutex, oneshot};
+use tokio::task::JoinHandle;
+use tokio::time::timeout;
+
+use crate::jsonrpc_framing::{decode_frame, encode_frame};
+
+/// Cap on how long a single frame write to the peer may block. The per-request
+/// `timeout` only covers the *response* (`rx`); without this, a wedged peer
+/// that stops draining its stdin (full pipe) would block every caller on
+/// `writer.lock()` + `write_all` indefinitely, since the writer mutex is held
+/// across the await. On expiry the write future is dropped, releasing the lock.
+///
+/// Applied uniformly to LSP and DAP: for DAP this preserves the pre-existing
+/// [`crate::dap::client`] write cap, and for LSP it is a safe, bounded
+/// improvement over the previous unbounded write.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Concrete error type surfaced to a caller of a correlation client.
+/// Implemented by each protocol's own `RpcError` so callers keep matching their
+/// existing variants rather than a new shared enum.
+pub(crate) trait RpcErr: From<io::Error> + From<serde_json::Error> + Send + 'static {
+    /// Error returned when the transport closes before a response arrives, or
+    /// after the read loop has marked the client closed.
+    fn connection_closed() -> Self;
+    /// Error returned when a request or a frame write exceeds its deadline.
+    fn timeout(duration: Duration) -> Self;
+}
+
+/// How an incoming framed message should be routed by the read loop.
+pub(crate) enum Incoming<E> {
+    /// A response: resolve the pending request waiting on `id` with `result`.
+    Response { id: u64, result: Result<Value, E> },
+    /// A notification/event: dispatch `body` to the handler registered under
+    /// `key`.
+    Notify { key: String, body: Value },
+    /// A server→client request that the protocol wants acknowledged on the
+    /// wire. The generic writes `ack` as a framed reply. Only LSP produces
+    /// this today (it auto-acks reverse requests with a null result); DAP
+    /// classifies anything it doesn't model as [`Incoming::Ignore`].
+    ReverseRequest { ack: Value },
+    /// Drop the message.
+    Ignore,
+}
+
+/// Protocol-specific classification + envelope construction. The generic
+/// correlation client is parameterized by an impl of this trait.
+pub(crate) trait Protocol: 'static {
+    type Error: RpcErr;
+
+    /// Short name used as the tracing log prefix, e.g. `"lsp"`, `"dap"`.
+    fn name() -> &'static str;
+
+    /// Build an outgoing request envelope for `method`/`params`, stamped with
+    /// the generic-allocated correlation `id`.
+    fn build_request(id: u64, method: &str, params: Value) -> Value;
+
+    /// Build an outgoing notification envelope. `id` is allocated by the
+    /// generic so protocols whose notifications carry a sequence number (DAP,
+    /// which frames notifications as requests) can stamp it; protocols whose
+    /// notifications carry no id (LSP) simply ignore it.
+    fn build_notification(id: u64, method: &str, params: Value) -> Value;
+
+    /// Classify an incoming decoded message.
+    fn classify(msg: &Value) -> Incoming<Self::Error>;
+}
+
+type Pending<E> = HashMap<u64, oneshot::Sender<Result<Value, E>>>;
+type Handler = Arc<dyn Fn(Value) + Send + Sync>;
+
+/// Shared correlation state. Fields are `pub(crate)` so the thin LSP/DAP
+/// adapter structs — and their behavior-preservation tests — can reach the same
+/// fields they did before extraction (e.g. inspecting `pending`).
+pub(crate) struct Inner<E> {
+    pub(crate) next_id: AtomicU64,
+    pub(crate) pending: Mutex<Pending<E>>,
+    pub(crate) handlers: Mutex<HashMap<String, Handler>>,
+    pub(crate) writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    pub(crate) closed: AtomicBool,
+}
+
+/// Spawn the background read loop over `reader`/`writer` and return the shared
+/// [`Inner`] handle plus the reader's [`JoinHandle`] (it ends when the peer
+/// closes the stream).
+pub(crate) fn new<P, R, W>(
+    reader: R,
+    writer: W,
+) -> (Arc<Inner<P::Error>>, JoinHandle<io::Result<()>>)
+where
+    P: Protocol,
+    R: AsyncBufRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
+{
+    let inner = Arc::new(Inner::<P::Error> {
+        next_id: AtomicU64::new(1),
+        pending: Mutex::new(HashMap::new()),
+        handlers: Mutex::new(HashMap::new()),
+        writer: Mutex::new(Box::new(writer)),
+        closed: AtomicBool::new(false),
+    });
+    let task = tokio::spawn(read_loop::<P, R>(inner.clone(), reader));
+    (inner, task)
+}
+
+/// Send a request and await its response. Shared by the LSP/DAP adapters.
+///
+/// Tiny race window if a peer close interleaves with a request: the `closed`
+/// check + insert + write are not atomic against the read loop draining pending
+/// entries on EOF. In that case the request waits for its own timeout rather
+/// than failing instantly with `connection_closed()`. Callers should treat both
+/// terminations as terminal.
+pub(crate) async fn request<P, Params, R>(
+    inner: &Inner<P::Error>,
+    method: &str,
+    params: Params,
+    request_timeout: Duration,
+) -> Result<R, P::Error>
+where
+    P: Protocol,
+    Params: serde::Serialize,
+    R: serde::de::DeserializeOwned,
+{
+    if inner.closed.load(Ordering::SeqCst) {
+        return Err(P::Error::connection_closed());
+    }
+    let id = inner.next_id.fetch_add(1, Ordering::SeqCst);
+    let (tx, rx) = oneshot::channel();
+    inner.pending.lock().await.insert(id, tx);
+
+    let body = P::build_request(id, method, serde_json::to_value(params)?);
+    let bytes = serde_json::to_vec(&body)?;
+    let send_result = timeout(WRITE_TIMEOUT, async {
+        let mut writer = inner.writer.lock().await;
+        encode_frame(&mut *writer, &bytes).await
+    })
+    .await;
+    match send_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // Write failed — roll the pending entry back so we don't leak it
+            // (and so the id isn't resolved by a late response later).
+            inner.pending.lock().await.remove(&id);
+            return Err(P::Error::from(e));
+        }
+        Err(_) => {
+            // Write deadline elapsed (wedged peer / full pipe) — same rollback.
+            inner.pending.lock().await.remove(&id);
+            return Err(P::Error::timeout(WRITE_TIMEOUT));
+        }
+    }
+
+    let value = match timeout(request_timeout, rx).await {
+        Ok(Ok(result)) => result?,
+        Ok(Err(_)) => {
+            inner.pending.lock().await.remove(&id);
+            return Err(P::Error::connection_closed());
+        }
+        Err(_) => {
+            inner.pending.lock().await.remove(&id);
+            return Err(P::Error::timeout(request_timeout));
+        }
+    };
+    Ok(serde_json::from_value(value)?)
+}
+
+/// Fire-and-forget notification.
+pub(crate) async fn notify<P, Params>(
+    inner: &Inner<P::Error>,
+    method: &str,
+    params: Params,
+) -> Result<(), P::Error>
+where
+    P: Protocol,
+    Params: serde::Serialize,
+{
+    if inner.closed.load(Ordering::SeqCst) {
+        return Err(P::Error::connection_closed());
+    }
+    let id = inner.next_id.fetch_add(1, Ordering::SeqCst);
+    let body = P::build_notification(id, method, serde_json::to_value(params)?);
+    let bytes = serde_json::to_vec(&body)?;
+    match timeout(WRITE_TIMEOUT, async {
+        let mut writer = inner.writer.lock().await;
+        encode_frame(&mut *writer, &bytes).await
+    })
+    .await
+    {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(P::Error::from(e)),
+        Err(_) => Err(P::Error::timeout(WRITE_TIMEOUT)),
+    }
+}
+
+/// Register a handler for an incoming notification/event keyed by `method`.
+/// Replaces any previously-registered handler for the same key.
+pub(crate) async fn register_notification<E>(inner: &Inner<E>, method: &str, handler: Handler) {
+    inner
+        .handlers
+        .lock()
+        .await
+        .insert(method.to_string(), handler);
+}
+
+/// The single shared read loop. Pumps framed messages, classifies each via
+/// [`Protocol::classify`], and routes it. On EOF or a non-EOF decode error it
+/// marks the client closed and drains every pending waiter with
+/// `connection_closed()` (dirge-syom) so in-flight requests fail promptly
+/// instead of burning their full response timeout.
+pub(crate) async fn read_loop<P, R>(inner: Arc<Inner<P::Error>>, mut reader: R) -> io::Result<()>
+where
+    P: Protocol,
+    R: AsyncBufRead + Send + Unpin,
+{
+    let name = P::name();
+    let mut exit_err: Option<io::Error> = None;
+    loop {
+        let frame = match decode_frame(&mut reader).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                // Clean shutdown — peer closed.
+                break;
+            }
+            Err(e) => {
+                tracing::warn!("{name}: read loop aborting on decode error: {e}");
+                exit_err = Some(e);
+                break;
+            }
+        };
+        let msg: Value = match serde_json::from_slice(&frame) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("{name}: skipping non-JSON frame: {e}");
+                continue;
+            }
+        };
+        dispatch::<P>(&inner, msg).await;
+    }
+    // Stream closed — fail any pending requests and mark closed.
+    inner.closed.store(true, Ordering::SeqCst);
+    let mut pending = inner.pending.lock().await;
+    for (_, sender) in pending.drain() {
+        let _ = sender.send(Err(P::Error::connection_closed()));
+    }
+    drop(pending);
+    match exit_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+async fn dispatch<P: Protocol>(inner: &Arc<Inner<P::Error>>, msg: Value) {
+    match P::classify(&msg) {
+        Incoming::Response { id, result } => {
+            let sender = inner.pending.lock().await.remove(&id);
+            if let Some(sender) = sender {
+                let _ = sender.send(result);
+            }
+        }
+        Incoming::Notify { key, body } => {
+            // Clone the handler and release the lock before invoking, so a
+            // slow or re-entrant handler can't stall the read loop or deadlock
+            // by re-locking `handlers`.
+            let handler = inner.handlers.lock().await.get(&key).cloned();
+            if let Some(handler) = handler {
+                handler(body);
+            }
+        }
+        Incoming::ReverseRequest { ack } => {
+            if let Ok(bytes) = serde_json::to_vec(&ack) {
+                let mut writer = inner.writer.lock().await;
+                let _ = encode_frame(&mut *writer, &bytes).await;
+            }
+        }
+        Incoming::Ignore => {
+            tracing::warn!("{}: ignoring frame", P::name());
+        }
+    }
+}

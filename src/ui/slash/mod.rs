@@ -25,10 +25,36 @@ mod cmd;
 #[cfg(feature = "slash-completion")]
 mod completion;
 
-// Exposed for the DEFER_WT_* parse arms in ui/mod.rs; `cmd` itself stays
-// private to this module. Gated to match `cmd::wt_defer` (git-worktree).
-#[cfg(feature = "git-worktree")]
-pub(crate) use cmd::wt_defer::{parse_wt_exit, parse_wt_merge};
+/// Outcome of dispatching a slash command. `Handled` is a normal completion
+/// (the handler did its own rendering); the `Defer*` variants carry work the
+/// command can't do itself and hand back to the UI event loop in `ui/mod.rs`.
+///
+/// This replaces the former `Err(anyhow!("DEFER_...:payload"))` control-flow
+/// protocol, which matched on error-message prefixes and was non-exhaustive.
+#[derive(Debug)]
+pub(crate) enum SlashOutcome {
+    Handled,
+    /// `/compress` / `/compact`: run a compaction pass. `instructions` is the
+    /// raw trailing text (None when bare); the consumer normalizes empty /
+    /// `(none)` to a default compaction.
+    DeferCompress {
+        instructions: Option<String>,
+    },
+    /// `/learn`, `/prompt <name> <text>`: launch a streamed turn on `prompt`.
+    DeferPromptRun {
+        prompt: String,
+    },
+    /// `/btw <question>`: launch a turn on the user's question.
+    DeferBtw {
+        query: String,
+    },
+    /// `/wt-merge`: merge the worktree branch back into a target.
+    #[cfg(feature = "git-worktree")]
+    DeferWtMerge(cmd::wt_defer::WtMerge),
+    /// `/wt-exit`: leave the worktree and return to the main repo.
+    #[cfg(feature = "git-worktree")]
+    DeferWtExit(cmd::wt_defer::WtExit),
+}
 
 #[cfg(feature = "slash-completion")]
 pub use completion::{CompletionResult, format_completion_preview, ghost_suffix, try_complete};
@@ -347,6 +373,53 @@ pub(crate) fn prepare_compaction(
     })))
 }
 
+/// Rebuild the agent from its constituent parts — the single shared body
+/// every "rebuild after a config/session change" site routes through.
+/// Reads `session.model` for model resolution. `rebuild_agent(&mut
+/// SlashCtx)` is the SlashCtx-flavored wrapper; this bare-params form is
+/// for sites that aren't holding a SlashCtx (the compaction install path
+/// and `/wt-exit`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn rebuild_agent_parts(
+    agent: &mut AnyAgent,
+    client: &AnyClient,
+    session: &Session,
+    cli: &Cli,
+    cfg: &Config,
+    context: &mut ContextFiles,
+    permission: &Option<PermCheck>,
+    ask_tx: &Option<AskSender>,
+    question_tx: &Option<crate::agent::tools::question::QuestionSender>,
+    plan_tx: &Option<crate::agent::tools::plan::PlanSwitchSender>,
+    bg_store: &Option<crate::agent::tools::background::BackgroundStore>,
+    sandbox: &Sandbox,
+    #[cfg(feature = "mcp")] mcp_manager: Option<&McpClientManager>,
+    #[cfg(feature = "semantic")] semantic_manager: Option<&SemanticManager>,
+    #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
+) {
+    let model = client.completion_model(session.model.to_string());
+    *agent = crate::provider::build_agent(
+        model,
+        cli,
+        cfg,
+        context,
+        permission.clone(),
+        ask_tx.clone(),
+        question_tx.clone(),
+        plan_tx.clone(),
+        bg_store.clone(),
+        #[cfg(feature = "lsp")]
+        lsp_manager.cloned(),
+        sandbox.clone(),
+        #[cfg(feature = "mcp")]
+        mcp_manager,
+        #[cfg(feature = "semantic")]
+        semantic_manager,
+        Some(session.id.to_string()),
+    )
+    .await;
+}
+
 /// dirge-tv3p: the on-UI-thread INSTALL half — given the summary from the
 /// (off-thread) summarizer, rotate the session and rebuild the agent. Cheap
 /// relative to the LLM call. Refuses to install a summary larger than the
@@ -417,25 +490,25 @@ pub(crate) async fn install_compaction(
     // siblings silently; dirge prefers the explicit notification.
     let pruned_branches = session.compress_reporting(summary, cut_idx, tokens_before);
 
-    let model = client.completion_model(session.model.to_string());
-    *agent = crate::provider::build_agent(
-        model,
+    rebuild_agent_parts(
+        agent,
+        client,
+        session,
         cli,
         cfg,
         context,
-        permission.clone(),
-        ask_tx.clone(),
-        question_tx.clone(),
-        plan_tx.clone(),
-        bg_store.clone(),
-        #[cfg(feature = "lsp")]
-        lsp_manager.cloned(),
-        sandbox.clone(),
+        permission,
+        ask_tx,
+        question_tx,
+        plan_tx,
+        bg_store,
+        sandbox,
         #[cfg(feature = "mcp")]
         mcp_manager,
         #[cfg(feature = "semantic")]
         semantic_manager,
-        Some(session.id.to_string()),
+        #[cfg(feature = "lsp")]
+        lsp_manager,
     )
     .await;
 
@@ -516,7 +589,7 @@ pub async fn handle_slash(
     // command. Thread the actual manager through.
     #[cfg(feature = "lsp")] lsp_manager: Option<&std::sync::Arc<crate::lsp::manager::LspManager>>,
     plan_phase: &mut Option<crate::agent::plan::runtime::PlanPhaseHandle>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<SlashOutcome> {
     let parts: SmallVec<[&str; 3]> = split_command_parts(text);
     let mut ctx = SlashCtx {
         agent,
@@ -557,20 +630,15 @@ pub async fn handle_slash(
         "/mcp" => cmd::mcp::cmd_mcp(&mut ctx, &parts).await?,
         "/toggle" => cmd::toggle::cmd_toggle(&mut ctx, &parts).await?,
         "/compress" | "/compact" => {
-            // Deferred via sentinel — the outer event loop in
-            // `ui/mod.rs` parses the `DEFER_COMPRESS:` prefix and
-            // runs `handle_compress` with the freshly-built
-            // dependencies.
-            let instructions = if parts.len() > 1 {
-                Some(parts[1..].join(" "))
-            } else {
-                None
-            };
-            let instr_str = instructions.clone().unwrap_or_default();
-            return Err(anyhow::anyhow!("DEFER_COMPRESS:{}", instr_str));
+            // Deferred: the outer event loop in `ui/mod.rs` consumes the
+            // DeferCompress outcome and runs `handle_compress` with the
+            // freshly-built dependencies.
+            return Ok(SlashOutcome::DeferCompress {
+                instructions: compress_instructions(&parts),
+            });
         }
         "/loop" => cmd::loop_cmd::cmd_loop(&mut ctx, &parts, text).await?,
-        "/prompt" => cmd::prompt::cmd_prompt(&mut ctx, &parts).await?,
+        "/prompt" => return cmd::prompt::cmd_prompt(&mut ctx, &parts).await,
         "/agent" | "/agents" => cmd::agent::cmd_agent(&mut ctx, &parts).await?,
         "/plan" => cmd::plan::cmd_plan(&mut ctx, &parts, text).await?,
         "/plugins" => cmd::plugins::cmd_plugins(&mut ctx, &parts).await?,
@@ -581,7 +649,9 @@ pub async fn handle_slash(
         #[cfg(feature = "git-worktree")]
         "/wt-exit" => return cmd::worktree::cmd_wt_exit(&mut ctx, &parts).await,
         "/regen-prompts" => cmd::regen::cmd_regen_prompts(&mut ctx).await?,
-        "/quit" => return cmd::quit::cmd_quit(&mut ctx).await,
+        "/quit" => {
+            cmd::quit::cmd_quit(&mut ctx).await?;
+        }
         "/spec" => cmd::spec::cmd_spec(&mut ctx, &parts).await?,
         "/tasks" => cmd::tasks::cmd_tasks(&mut ctx).await?,
         "/cache" => cmd::cache::cmd_cache(&mut ctx).await?,
@@ -591,8 +661,8 @@ pub async fn handle_slash(
         "/clone" => cmd::clone::cmd_clone(&mut ctx, &parts).await?,
         "/panel" => cmd::panel::cmd_panel(&mut ctx, &parts).await?,
         "/display" => cmd::panel::cmd_display(&mut ctx, &parts).await?,
-        "/btw" => cmd::btw::cmd_btw(&mut ctx, &parts).await?,
-        "/learn" => cmd::learn::cmd_learn(&mut ctx, &parts).await?,
+        "/btw" => return cmd::btw::cmd_btw(&mut ctx, &parts).await,
+        "/learn" => return cmd::learn::cmd_learn(&mut ctx, &parts).await,
         "/code-review" => cmd::code_review::cmd_code_review(&mut ctx).await?,
         "/cd" => cmd::cd::cmd_cd(&mut ctx, text).await?,
         "/undo" => cmd::undo::cmd_undo(&mut ctx).await?,
@@ -628,7 +698,7 @@ pub async fn handle_slash(
                     ),
                     c_error(),
                 )?;
-                return Ok(());
+                return Ok(SlashOutcome::Handled);
             }
 
             // Fall through to plugin-registered commands. The process-global
@@ -673,7 +743,7 @@ pub async fn handle_slash(
                             )?;
                         }
                     }
-                    return Ok(());
+                    return Ok(SlashOutcome::Handled);
                 }
             }
             ctx.renderer.write_line(
@@ -682,7 +752,15 @@ pub async fn handle_slash(
             )?;
         }
     }
-    Ok(())
+    Ok(SlashOutcome::Handled)
+}
+
+/// `/compress [text...]`: the raw trailing text to feed the compaction pass,
+/// or `None` when bare (so the consumer applies a default). This is the
+/// payload of [`SlashOutcome::DeferCompress`]; the consumer normalizes empty
+/// / `(none)` exactly as it did on the old `DEFER_COMPRESS:` string.
+fn compress_instructions(parts: &[&str]) -> Option<String> {
+    (parts.len() > 1).then(|| parts[1..].join(" "))
 }
 
 /// Canonical list of built-in slash commands paired with their
@@ -822,6 +900,20 @@ mod tests {
     use super::*;
     use crate::session::compact::align_cut_to_user_boundary;
     use crate::session::{Session, SessionMessage};
+
+    #[test]
+    fn compress_instructions_joins_trailing_text() {
+        // `/compress focus text` -> DeferCompress { instructions: Some("focus text") }
+        let parts = ["/compress", "focus", "text"];
+        assert_eq!(compress_instructions(&parts).as_deref(), Some("focus text"));
+    }
+
+    #[test]
+    fn compress_instructions_is_none_when_bare() {
+        // Bare `/compress` -> DeferCompress { instructions: None }
+        let parts = ["/compress"];
+        assert_eq!(compress_instructions(&parts), None);
+    }
 
     #[test]
     fn preemptive_due_fires_in_the_85_to_100_band() {

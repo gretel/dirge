@@ -14,12 +14,45 @@
 //! owns the prompt, the verdict parsing, and the loop-message wiring so
 //! they're unit-testable without a model.
 
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
 use super::message::{LoopMessage, UserMessage};
 use super::verifier::VerificationStatus;
+
+/// Truncate `rules` to at most `max` CHARS (not bytes), appending `note`
+/// when truncation happens. Counting by chars stops a multibyte system prompt
+/// from tripping a byte-based cap and being needlessly shortened — the old
+/// per-site `.len() > MAX` gates truncated strings whose char count was
+/// already under the cap. Returns the input borrowed when within the cap.
+pub(crate) fn truncate_rules<'a>(rules: &'a str, max: usize, note: &str) -> Cow<'a, str> {
+    if rules.chars().count() > max {
+        let head: String = rules.chars().take(max).collect();
+        Cow::Owned(format!("{head}{note}"))
+    } else {
+        Cow::Borrowed(rules)
+    }
+}
+
+/// Run a judge-style completion, failing open on error. Centralizes the
+/// `Ok(r) => r, Err(e) => { warn + return default }` shape shared by the
+/// critic, goal-gate, and code-review passes. `target` must be a string
+/// literal (tracing callsite metadata is static); the expansion `return`s
+/// `default` from the enclosing function on error.
+macro_rules! run_judge {
+    ($judge:expr, $prompt:expr, $target:literal, $msg:literal, $default:expr) => {
+        match $judge($prompt).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(target: $target, error = %e, $msg);
+                return $default;
+            }
+        }
+    };
+}
+pub(crate) use run_judge;
 
 /// One-shot critic call: takes a fully-built prompt, returns the model's
 /// raw verdict text. Mirrors `compression::SummarizeFn` so the provider
@@ -149,11 +182,8 @@ pub fn build_prompt(
     let rules = strip_compaction_summary(rules).trim();
     let rules_block = if rules.is_empty() {
         "(no special constraints provided)".to_string()
-    } else if rules.len() > MAX_RULES_CHARS {
-        let head: String = rules.chars().take(MAX_RULES_CHARS).collect();
-        format!("{head}\n…(instructions truncated)")
     } else {
-        rules.to_string()
+        truncate_rules(rules, MAX_RULES_CHARS, "\n…(instructions truncated)").into_owned()
     };
     format!(
         "{CRITIC_FORMAT}\n\n\
@@ -207,13 +237,13 @@ pub async fn run_critic(
     verification: Option<VerificationStatus>,
 ) -> Vec<LoopMessage> {
     let prompt = build_prompt(rules, transcript, verification);
-    let response = match critic(prompt).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(target: "dirge::critic", error = %e, "critic call failed; finalizing without it");
-            return Vec::new();
-        }
-    };
+    let response = run_judge!(
+        critic,
+        prompt,
+        "dirge::critic",
+        "critic call failed; finalizing without it",
+        Vec::new()
+    );
     match parse_verdict(&response) {
         Some(issues) => vec![LoopMessage::User(UserMessage {
             content: format!(
@@ -229,6 +259,30 @@ pub async fn run_critic(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncate_rules_counts_chars_not_bytes() {
+        use std::borrow::Cow;
+        // ASCII within cap → borrowed, untouched.
+        assert!(matches!(
+            truncate_rules("abc", 10, "…(instructions truncated)"),
+            Cow::Borrowed(_)
+        ));
+        // ASCII over cap → truncated to `max` chars + note.
+        assert_eq!(
+            truncate_rules("abcdefghij", 4, "|NOTE").into_owned(),
+            "abcd|NOTE"
+        );
+        // 6 × 4-byte chars = 24 bytes but only 6 chars. A byte-based gate
+        // (`.len() > MAX`) would truncate this even though it's under the
+        // char cap; the helper must count chars and leave it untouched.
+        let mb = "🦀🦀🦀🦀🦀🦀";
+        assert_eq!(mb.len(), 24);
+        assert!(matches!(truncate_rules(mb, 10, "|NOTE"), Cow::Borrowed(_)));
+        // Multibyte over the CHAR cap → truncated to `max` chars + note.
+        let over = "🦀🦀🦀🦀"; // 4 chars, 16 bytes
+        assert_eq!(truncate_rules(over, 2, "|NOTE").into_owned(), "🦀🦀|NOTE");
+    }
 
     #[test]
     fn parse_complete_returns_none() {

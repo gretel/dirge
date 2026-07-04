@@ -771,7 +771,7 @@ fn cap_diff(diff: &str, max: usize) -> String {
 
 // ── Prompt + orchestration (R3) ───────────────────────────────────────
 
-use super::critic::CriticFn;
+use super::critic::{CriticFn, run_judge, truncate_rules};
 use super::message::{LoopMessage, UserMessage};
 
 /// Cap on the instructions/constraints block fed to the reviewer. Smaller
@@ -796,11 +796,8 @@ pub fn build_review_prompt(rules: &str, diff: &str, transcript: &str) -> String 
     let rules = super::critic::strip_compaction_summary(rules).trim();
     let rules_block = if rules.is_empty() {
         "(no special constraints provided)".to_string()
-    } else if rules.len() > MAX_RULES_CHARS {
-        let head: String = rules.chars().take(MAX_RULES_CHARS).collect();
-        format!("{head}\n…(instructions truncated)")
     } else {
-        rules.to_string()
+        truncate_rules(rules, MAX_RULES_CHARS, "\n…(instructions truncated)").into_owned()
     };
     let transcript = if transcript.trim().is_empty() {
         "(no transcript)"
@@ -874,13 +871,13 @@ async fn review_pass(
     transcript: &str,
 ) -> Vec<Finding> {
     let prompt = build_review_prompt(rules, diff, transcript);
-    let response = match review_fn(prompt).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(target: "dirge::code_review", error = %e, "reviewer call failed; finalizing without it");
-            return Vec::new();
-        }
-    };
+    let response = run_judge!(
+        review_fn,
+        prompt,
+        "dirge::code_review",
+        "reviewer call failed; finalizing without it",
+        Vec::new()
+    );
     let mut findings = parse_findings(&response);
     findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
     findings
@@ -893,13 +890,13 @@ async fn review_pass(
 /// silently dropping them.
 async fn verify_pass(review_fn: &CriticFn, diff: &str, candidates: &[Finding]) -> Vec<Finding> {
     let prompt = build_verify_prompt(candidates, diff);
-    let response = match review_fn(prompt).await {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(target: "dirge::code_review", error = %e, "verify pass failed; keeping unverified findings");
-            return candidates.to_vec();
-        }
-    };
+    let response = run_judge!(
+        review_fn,
+        prompt,
+        "dirge::code_review",
+        "verify pass failed; keeping unverified findings",
+        candidates.to_vec()
+    );
     // The verify contract is VERIFIED / FALSE_POSITIVE. Well-behaved
     // output omits dropped candidates, but a common shape re-lists each
     // candidate with an inline verdict while still carrying its severity

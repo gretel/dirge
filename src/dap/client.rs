@@ -1,34 +1,28 @@
 //! DAP client transport.
 //!
-//! Spawns a debug adapter process and communicates via Content-Length framed
-//! DAP messages over stdio. Request/response matching is done by `seq` /
-//! `request_seq` correlation — DAP uses its own message envelope, not
+//! Thin adapter over the shared [`crate::jsonrpc_client`] correlation core.
+//! This module supplies the DAP message classification and envelope shapes
+//! (`DapProtocol`); the read loop, pending-request matching, write timeout, and
+//! the drain-on-close path (dirge-syom) all live in the shared core. DAP
+//! correlates requests by `seq` / `request_seq` and uses its own envelope, not
 //! JSON-RPC 2.0.
 
-use std::collections::HashMap;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite};
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 
 use crate::dap::types::Capabilities;
-use crate::jsonrpc_framing::{decode_frame, encode_frame};
+use crate::jsonrpc_client::{self, Incoming, Inner, Protocol, RpcErr};
 
-/// Cap on how long a single frame write to the adapter may block. The
-/// per-request `timeout` only covers the *response* (`rx`); without this a
-/// wedged adapter that stops draining its stdin (full pipe) would block
-/// every caller on `writer.lock()` + `write_all` indefinitely, since the
-/// writer mutex is held across the await. On expiry the write future is
-/// dropped, releasing the lock.
-const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(test)]
+use crate::jsonrpc_framing::{decode_frame, encode_frame};
 
 // ---------------------------------------------------------------------------
 // DAP RPC — lightweight seq→request_seq correlation
@@ -49,49 +43,108 @@ pub enum RpcError {
     Serialize(#[from] serde_json::Error),
 }
 
-type Pending = HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>;
+impl RpcErr for RpcError {
+    fn connection_closed() -> Self {
+        RpcError::ConnectionClosed
+    }
+    fn timeout(duration: Duration) -> Self {
+        RpcError::Timeout(duration)
+    }
+}
 
 /// Notification handler: `Fn(event_body: Value)` called for each incoming
 /// event matching a registered `event_type`.
 pub type NotificationHandler = Box<dyn Fn(Value) + Send + Sync>;
 
-struct Inner {
-    next_seq: AtomicU64,
-    pending: Mutex<Pending>,
-    // Stored as `Arc` (the public `on_event` still takes a `Box` and converts
-    // via `Arc::from`) so `dispatch` can clone the handler and release the
-    // `handlers` lock BEFORE invoking it — a slow or re-entrant handler must
-    // not stall the read loop or deadlock by re-locking `handlers`.
-    handlers: Mutex<HashMap<String, Arc<dyn Fn(Value) + Send + Sync>>>,
-    writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
-    closed: std::sync::atomic::AtomicBool,
+/// DAP message classification + envelope shapes for the shared correlation
+/// client.
+struct DapProtocol;
+
+impl Protocol for DapProtocol {
+    type Error = RpcError;
+
+    fn name() -> &'static str {
+        "dap"
+    }
+
+    fn build_request(seq: u64, command: &str, arguments: Value) -> Value {
+        serde_json::json!({
+            "type": "request",
+            "seq": seq,
+            "command": command,
+            "arguments": arguments,
+        })
+    }
+
+    fn build_notification(seq: u64, command: &str, arguments: Value) -> Value {
+        // DAP has no dedicated notification envelope; fire-and-forget commands
+        // are framed as requests whose (unsolicited) response is ignored.
+        serde_json::json!({
+            "type": "request",
+            "seq": seq,
+            "command": command,
+            "arguments": arguments,
+        })
+    }
+
+    fn classify(msg: &Value) -> Incoming<RpcError> {
+        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match msg_type {
+            "response" => match msg.get("request_seq").and_then(|v| v.as_u64()) {
+                Some(seq) => Incoming::Response {
+                    id: seq,
+                    result: response_result(msg),
+                },
+                // No correlation id → can't match a waiter; drop it. The
+                // waiter then fails on its own timeout. Matches prior behavior.
+                None => Incoming::Ignore,
+            },
+            "event" => Incoming::Notify {
+                key: msg
+                    .get("event")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                body: msg.get("body").cloned().unwrap_or(Value::Null),
+            },
+            // Reverse requests from the adapter aren't handled; just drop them.
+            _ => Incoming::Ignore,
+        }
+    }
+}
+
+/// Extract the result/body from a DAP response envelope.
+fn response_result(msg: &Value) -> Result<Value, RpcError> {
+    if msg.get("success").and_then(|v| v.as_bool()) == Some(true) {
+        Ok(msg.get("body").cloned().unwrap_or(Value::Null))
+    } else {
+        let message = msg
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no message)")
+            .to_string();
+        Err(RpcError::Server(message))
+    }
 }
 
 /// Cheaply cloneable handle for issuing DAP requests and registering
 /// notification handlers.
 #[derive(Clone)]
 pub struct DapRpc {
-    inner: Arc<Inner>,
+    inner: Arc<Inner<RpcError>>,
 }
 
 impl DapRpc {
+    /// Create a client over a framed transport. Spawns a background task that
+    /// pumps incoming frames; the returned [`JoinHandle`] lets callers await
+    /// the reader's exit (it ends when the peer closes the stream).
     pub fn new<R, W>(reader: R, writer: W) -> (Self, JoinHandle<io::Result<()>>)
     where
         R: AsyncBufRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let inner = Arc::new(Inner {
-            next_seq: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
-            handlers: Mutex::new(HashMap::new()),
-            writer: Mutex::new(Box::new(writer)),
-            closed: std::sync::atomic::AtomicBool::new(false),
-        });
-        let rpc = DapRpc {
-            inner: inner.clone(),
-        };
-        let task = tokio::spawn(read_loop(inner, reader));
-        (rpc, task)
+        let (inner, task) = jsonrpc_client::new::<DapProtocol, R, W>(reader, writer);
+        (DapRpc { inner }, task)
     }
 
     /// Send a DAP request and await its response.
@@ -105,51 +158,13 @@ impl DapRpc {
         P: Serialize,
         R: serde::de::DeserializeOwned,
     {
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return Err(RpcError::ConnectionClosed);
-        }
-        let seq = self.inner.next_seq.fetch_add(1, Ordering::SeqCst);
-
-        let body = serde_json::json!({
-            "type": "request",
-            "seq": seq,
-            "command": command,
-            "arguments": serde_json::to_value(arguments)?,
-        });
-        let bytes = serde_json::to_vec(&body)?;
-
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().await.insert(seq, tx);
-
-        let send_result = timeout(WRITE_TIMEOUT, async {
-            let mut writer = self.inner.writer.lock().await;
-            encode_frame(&mut *writer, &bytes).await
-        })
-        .await;
-        match send_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                self.inner.pending.lock().await.remove(&seq);
-                return Err(RpcError::Io(e));
-            }
-            Err(_) => {
-                self.inner.pending.lock().await.remove(&seq);
-                return Err(RpcError::Timeout(WRITE_TIMEOUT));
-            }
-        }
-
-        let value = match timeout(request_timeout, rx).await {
-            Ok(Ok(result)) => result?,
-            Ok(Err(_)) => {
-                self.inner.pending.lock().await.remove(&seq);
-                return Err(RpcError::ConnectionClosed);
-            }
-            Err(_) => {
-                self.inner.pending.lock().await.remove(&seq);
-                return Err(RpcError::Timeout(request_timeout));
-            }
-        };
-        Ok(serde_json::from_value(value)?)
+        jsonrpc_client::request::<DapProtocol, P, R>(
+            &self.inner,
+            command,
+            arguments,
+            request_timeout,
+        )
+        .await
     }
 
     /// Fire-and-forget notification (DAP request without a response).
@@ -157,119 +172,14 @@ impl DapRpc {
     where
         P: Serialize,
     {
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return Err(RpcError::ConnectionClosed);
-        }
-        let seq = self.inner.next_seq.fetch_add(1, Ordering::SeqCst);
-        let body = serde_json::json!({
-            "type": "request",
-            "seq": seq,
-            "command": command,
-            "arguments": serde_json::to_value(arguments)?,
-        });
-        let bytes = serde_json::to_vec(&body)?;
-        match timeout(WRITE_TIMEOUT, async {
-            let mut writer = self.inner.writer.lock().await;
-            encode_frame(&mut *writer, &bytes).await
-        })
-        .await
-        {
-            Ok(r) => r?,
-            Err(_) => return Err(RpcError::Timeout(WRITE_TIMEOUT)),
-        }
-        Ok(())
+        jsonrpc_client::notify::<DapProtocol, P>(&self.inner, command, arguments).await
     }
 
     /// Register a handler for an incoming DAP event (e.g. "stopped", "output").
     pub async fn on_event(&self, event_type: &str, handler: NotificationHandler) {
         // Convert the boxed handler into an `Arc` (reuses the allocation) so
-        // `dispatch` can clone + drop the lock before calling it.
-        self.inner
-            .handlers
-            .lock()
-            .await
-            .insert(event_type.to_string(), Arc::from(handler));
-    }
-}
-
-async fn read_loop<R>(inner: Arc<Inner>, mut reader: R) -> io::Result<()>
-where
-    R: AsyncBufRead + Send + Unpin,
-{
-    // dirge-syom: capture a non-EOF decode error and fall through to the
-    // shared cleanup below rather than returning early. A malformed frame
-    // (bad Content-Length, oversized body) must still mark `closed` and drain
-    // pending with ConnectionClosed; otherwise in-flight waiters burn their
-    // full timeout and every later request stalls too.
-    let mut exit_err: Option<io::Error> = None;
-    loop {
-        let frame = match decode_frame(&mut reader).await {
-            Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
-            Err(e) => {
-                tracing::warn!("dap: read loop aborting on decode error: {e}");
-                exit_err = Some(e);
-                break;
-            }
-        };
-        let msg: Value = match serde_json::from_slice(&frame) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("dap: skipping non-JSON frame: {e}");
-                continue;
-            }
-        };
-        dispatch(&inner, msg).await;
-    }
-    inner.closed.store(true, Ordering::SeqCst);
-    let mut pending = inner.pending.lock().await;
-    for (_, sender) in pending.drain() {
-        let _ = sender.send(Err(RpcError::ConnectionClosed));
-    }
-    drop(pending);
-    match exit_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-async fn dispatch(inner: &Arc<Inner>, msg: Value) {
-    let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
-
-    match msg_type {
-        "response" => {
-            let request_seq = msg.get("request_seq").and_then(|v| v.as_u64());
-            if let Some(seq) = request_seq {
-                let sender = inner.pending.lock().await.remove(&seq);
-                if let Some(sender) = sender {
-                    let result = if msg.get("success").and_then(|v| v.as_bool()) == Some(true) {
-                        Ok(msg.get("body").cloned().unwrap_or(Value::Null))
-                    } else {
-                        let message = msg
-                            .get("message")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("(no message)")
-                            .to_string();
-                        Err(RpcError::Server(message))
-                    };
-                    let _ = sender.send(result);
-                }
-            }
-        }
-        "event" => {
-            let event_type = msg.get("event").and_then(|v| v.as_str()).unwrap_or("");
-            // Clone the handler Arc and release the lock before invoking, so a
-            // slow/blocking/re-entrant handler can't stall the read loop or
-            // deadlock by re-locking `handlers`.
-            let handler = inner.handlers.lock().await.get(event_type).cloned();
-            if let Some(handler) = handler {
-                let body = msg.get("body").cloned().unwrap_or(Value::Null);
-                handler(body);
-            }
-        }
-        _ => {
-            tracing::warn!("dap: unexpected message type {msg_type:?}, ignoring");
-        }
+        // the shared dispatch can clone + drop the lock before calling it.
+        jsonrpc_client::register_notification(&self.inner, event_type, Arc::from(handler)).await;
     }
 }
 

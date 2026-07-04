@@ -1,29 +1,22 @@
 //! JSON-RPC 2.0 request/response correlation over a framed transport.
 //!
-//! Built on top of [`crate::jsonrpc_framing`]. The client spawns a background
-//! task that pumps incoming frames and routes them:
-//! - responses (have `id`, no `method`) → resolve the matching pending request
-//! - notifications (have `method`, no `id`) → dispatch to registered handlers
-//! - server→client requests (have both `id` and `method`) → currently
-//!   acknowledged with a null result (we register no client capabilities for
-//!   this in v1)
-//!
-//! Outbound writes serialize through a mutex so multiple concurrent callers
-//! don't interleave frames on stdin.
+//! Thin adapter over the shared [`crate::jsonrpc_client`] correlation core.
+//! This module supplies the LSP message classification and envelope shapes
+//! (`LspProtocol`); the read loop, pending-request matching, write timeout, and
+//! the drain-on-close path (dirge-syom) all live in the shared core.
 
-use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncWrite};
-use tokio::sync::{Mutex, oneshot};
 use tokio::task::JoinHandle;
-use tokio::time::timeout;
 
+use crate::jsonrpc_client::{self, Incoming, Inner, Protocol, RpcErr};
+
+#[cfg(test)]
 use crate::jsonrpc_framing::{decode_frame, encode_frame};
 
 /// Failure surfaced to a pending request.
@@ -41,24 +34,91 @@ pub enum RpcError {
     Serialize(#[from] serde_json::Error),
 }
 
+impl RpcErr for RpcError {
+    fn connection_closed() -> Self {
+        RpcError::ConnectionClosed
+    }
+    fn timeout(duration: Duration) -> Self {
+        RpcError::Timeout(duration)
+    }
+}
+
 /// Handler invoked for an incoming notification. Synchronous for simplicity —
 /// dispatch into a channel inside the closure if work needs to happen async.
 pub type NotificationHandler = Box<dyn Fn(Value) + Send + Sync>;
 
-type Pending = HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>;
+/// LSP message classification + envelope shapes for the shared correlation
+/// client.
+struct LspProtocol;
 
-struct Inner {
-    next_id: AtomicU64,
-    pending: Mutex<Pending>,
-    handlers: Mutex<HashMap<String, NotificationHandler>>,
-    writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
-    closed: std::sync::atomic::AtomicBool,
+impl Protocol for LspProtocol {
+    type Error = RpcError;
+
+    fn name() -> &'static str {
+        "lsp"
+    }
+
+    fn build_request(id: u64, method: &str, params: Value) -> Value {
+        json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
+    }
+
+    fn build_notification(_id: u64, method: &str, params: Value) -> Value {
+        // LSP notifications carry no correlation id; the generic-allocated id
+        // is intentionally ignored.
+        json!({ "jsonrpc": "2.0", "method": method, "params": params })
+    }
+
+    fn classify(msg: &Value) -> Incoming<RpcError> {
+        // EXT-5: JSON-RPC spec permits string IDs; some servers (e.g.
+        // rust-analyzer's internal notifications, clangd diagnostics) use them.
+        // Numeric correlation accepts a JSON number OR a numeric string.
+        let id_value = msg.get("id").cloned();
+        let id_num = id_value.as_ref().and_then(|v| v.as_u64());
+        let id_str = id_value.as_ref().and_then(|v| v.as_str()).map(String::from);
+        let id = id_num.or_else(|| id_str.as_ref().and_then(|s| s.parse().ok()));
+        let method = msg.get("method").and_then(|v| v.as_str()).map(String::from);
+
+        match (id, method) {
+            (Some(id), None) => Incoming::Response {
+                id,
+                result: response_result(msg),
+            },
+            (None, Some(method)) => Incoming::Notify {
+                key: method,
+                body: msg.get("params").cloned().unwrap_or(Value::Null),
+            },
+            (Some(id), Some(_method)) => {
+                // Server→client request. We register no client-side request
+                // capabilities in v1, so acknowledge with a null result rather
+                // than let the server hang. The shared read loop writes `ack`.
+                Incoming::ReverseRequest {
+                    ack: json!({ "jsonrpc": "2.0", "id": id, "result": Value::Null }),
+                }
+            }
+            (None, None) => Incoming::Ignore,
+        }
+    }
+}
+
+/// Extract the result/error from an LSP response envelope.
+fn response_result(msg: &Value) -> Result<Value, RpcError> {
+    if let Some(err) = msg.get("error") {
+        let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
+        let message = err
+            .get("message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(no message)")
+            .to_string();
+        Err(RpcError::Server { code, message })
+    } else {
+        Ok(msg.get("result").cloned().unwrap_or(Value::Null))
+    }
 }
 
 /// JSON-RPC client. Cheap to clone (just an `Arc`).
 #[derive(Clone)]
 pub struct RpcClient {
-    inner: Arc<Inner>,
+    inner: Arc<Inner<RpcError>>,
 }
 
 impl RpcClient {
@@ -70,28 +130,15 @@ impl RpcClient {
         R: AsyncBufRead + Send + Unpin + 'static,
         W: AsyncWrite + Send + Unpin + 'static,
     {
-        let inner = Arc::new(Inner {
-            next_id: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
-            handlers: Mutex::new(HashMap::new()),
-            writer: Mutex::new(Box::new(writer)),
-            closed: std::sync::atomic::AtomicBool::new(false),
-        });
-        let client = RpcClient {
-            inner: inner.clone(),
-        };
-        let task = tokio::spawn(read_loop(inner, reader));
-        (client, task)
+        let (inner, task) = jsonrpc_client::new::<LspProtocol, R, W>(reader, writer);
+        (RpcClient { inner }, task)
     }
 
     /// Send a request and await its response. Errors on connection close,
     /// I/O failure, server-side error response, or `timeout` elapsing.
     ///
-    /// Tiny race window if a peer close interleaves with a request: the
-    /// `closed` check + insert + write are not atomic against the read loop
-    /// draining pending entries on EOF. In that case the request waits for
-    /// its own timeout rather than failing instantly with `ConnectionClosed`.
-    /// Callers should treat both terminations as terminal.
+    /// See [`crate::jsonrpc_client::request`] for the shared implementation and
+    /// its tiny peer-close race note.
     pub async fn request<P, R>(
         &self,
         method: &str,
@@ -102,42 +149,8 @@ impl RpcClient {
         P: Serialize,
         R: serde::de::DeserializeOwned,
     {
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return Err(RpcError::ConnectionClosed);
-        }
-        let id = self.inner.next_id.fetch_add(1, Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending.lock().await.insert(id, tx);
-
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method,
-            "params": serde_json::to_value(params)?,
-        });
-        let bytes = serde_json::to_vec(&body)?;
-        let send_result = {
-            let mut writer = self.inner.writer.lock().await;
-            encode_frame(&mut *writer, &bytes).await
-        };
-        if let Err(e) = send_result {
-            // Roll the pending entry back so we don't leak it.
-            self.inner.pending.lock().await.remove(&id);
-            return Err(RpcError::Io(e));
-        }
-
-        let value = match timeout(request_timeout, rx).await {
-            Ok(Ok(result)) => result?,
-            Ok(Err(_)) => {
-                self.inner.pending.lock().await.remove(&id);
-                return Err(RpcError::ConnectionClosed);
-            }
-            Err(_) => {
-                self.inner.pending.lock().await.remove(&id);
-                return Err(RpcError::Timeout(request_timeout));
-            }
-        };
-        Ok(serde_json::from_value(value)?)
+        jsonrpc_client::request::<LspProtocol, P, R>(&self.inner, method, params, request_timeout)
+            .await
     }
 
     /// Fire-and-forget notification. No id, no response.
@@ -145,133 +158,13 @@ impl RpcClient {
     where
         P: Serialize,
     {
-        if self.inner.closed.load(Ordering::SeqCst) {
-            return Err(RpcError::ConnectionClosed);
-        }
-        let body = json!({
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": serde_json::to_value(params)?,
-        });
-        let bytes = serde_json::to_vec(&body)?;
-        let mut writer = self.inner.writer.lock().await;
-        encode_frame(&mut *writer, &bytes).await?;
-        Ok(())
+        jsonrpc_client::notify::<LspProtocol, P>(&self.inner, method, params).await
     }
 
     /// Register a handler for an incoming server notification. Replaces any
     /// previously-registered handler for the same method.
     pub async fn on_notification(&self, method: &str, handler: NotificationHandler) {
-        self.inner
-            .handlers
-            .lock()
-            .await
-            .insert(method.to_string(), handler);
-    }
-}
-
-async fn read_loop<R>(inner: Arc<Inner>, mut reader: R) -> io::Result<()>
-where
-    R: AsyncBufRead + Send + Unpin,
-{
-    // dirge-syom: capture a non-EOF decode error and fall through to the
-    // shared cleanup below rather than returning early. A malformed frame
-    // (bad Content-Length, oversized body) must still mark `closed` and drain
-    // pending with ConnectionClosed; otherwise in-flight waiters burn their
-    // full timeout and every later request stalls too.
-    let mut exit_err: Option<io::Error> = None;
-    loop {
-        let frame = match decode_frame(&mut reader).await {
-            Ok(b) => b,
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                // Clean shutdown — peer closed.
-                break;
-            }
-            Err(e) => {
-                tracing::warn!("lsp: read loop aborting on decode error: {e}");
-                exit_err = Some(e);
-                break;
-            }
-        };
-        let msg: Value = match serde_json::from_slice(&frame) {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!("lsp: skipping non-JSON frame: {e}");
-                continue;
-            }
-        };
-        dispatch(&inner, msg).await;
-    }
-    // Stream closed — fail any pending requests and mark closed.
-    inner.closed.store(true, Ordering::SeqCst);
-    let mut pending = inner.pending.lock().await;
-    for (_, sender) in pending.drain() {
-        let _ = sender.send(Err(RpcError::ConnectionClosed));
-    }
-    drop(pending);
-    match exit_err {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
-async fn dispatch(inner: &Arc<Inner>, msg: Value) {
-    // EXT-5: JSON-RPC spec permits string IDs; some servers (e.g.
-    // rust-analyzer's internal notifications, clangd diagnostics)
-    // use them. Previously only u64 was handled, so string-ID
-    // responses were silently dropped and callers timed out.
-    let id_value = msg.get("id").cloned();
-    let id_num = id_value.as_ref().and_then(|v| v.as_u64());
-    let id_str = id_value.as_ref().and_then(|v| v.as_str()).map(String::from);
-    let method = msg.get("method").and_then(|v| v.as_str()).map(String::from);
-
-    match (
-        id_num.or_else(|| id_str.as_ref().and_then(|s| s.parse().ok())),
-        method,
-    ) {
-        (Some(id), None) => {
-            // Response to one of our requests.
-            let sender = inner.pending.lock().await.remove(&id);
-            if let Some(sender) = sender {
-                let result = if let Some(err) = msg.get("error") {
-                    let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-1);
-                    let message = err
-                        .get("message")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(no message)")
-                        .to_string();
-                    Err(RpcError::Server { code, message })
-                } else {
-                    Ok(msg.get("result").cloned().unwrap_or(Value::Null))
-                };
-                let _ = sender.send(result);
-            }
-        }
-        (None, Some(method)) => {
-            // Server-initiated notification.
-            let handlers = inner.handlers.lock().await;
-            if let Some(handler) = handlers.get(&method) {
-                let params = msg.get("params").cloned().unwrap_or(Value::Null);
-                handler(params);
-            }
-        }
-        (Some(id), Some(_method)) => {
-            // Server-to-client request. We don't advertise any client-side
-            // request capabilities yet; acknowledge with a null result so the
-            // server doesn't hang.
-            let response = json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": Value::Null,
-            });
-            if let Ok(bytes) = serde_json::to_vec(&response) {
-                let mut writer = inner.writer.lock().await;
-                let _ = encode_frame(&mut *writer, &bytes).await;
-            }
-        }
-        (None, None) => {
-            tracing::warn!("lsp: ignoring frame without id or method");
-        }
+        jsonrpc_client::register_notification(&self.inner, method, Arc::from(handler)).await;
     }
 }
 

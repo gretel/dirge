@@ -535,13 +535,16 @@ const HARNESS_INIT: &str = r#"
 # Registered renderer functions per plugin entry type.
 # (harness/register-renderer "bookmark" "fn-name") records a
 # (type, fn-name) pair the host looks up when displaying entries
-# of that type. Stored as `type|fn\n` (same convention as
-# harness-cmd-list).
+# of that type. Stored tab-separated with harness/-escape'd fields
+# (same convention as harness-msg-renderers-list) so a type
+# containing `|` or `\t` round-trips and last-wins dedup applies.
 (var harness-renderer-list "")
 (defn harness/register-renderer [type fn-name]
   (when (and (string? type) (string? fn-name))
     (set harness-renderer-list
-         (string harness-renderer-list type "|" fn-name "\n"))))
+         (string harness-renderer-list
+                 (harness/-escape type) "\t"
+                 (harness/-escape fn-name) "\n"))))
 
 # Output buffer for a renderer invocation. The host clears it
 # before calling the renderer, then reads back the accumulated

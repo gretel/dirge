@@ -438,11 +438,14 @@ impl IssueStore {
     /// Substring search over title + body (case-insensitive), newest first.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<Issue>, String> {
         let conn = self.conn.lock_ignore_poison();
-        let like = format!("%{}%", query.trim());
+        // Escape LIKE metacharacters (`%`, `_`, and the escape char `\`) so a
+        // query like `100%` is a literal substring, not "match anything".
+        let like = format!("%{}%", escape_like(query.trim()));
         let mut stmt = conn
             .prepare(&format!(
                 "SELECT {COLS} FROM issues
-                 WHERE title LIKE ?1 COLLATE NOCASE OR body LIKE ?1 COLLATE NOCASE
+                 WHERE title LIKE ?1 ESCAPE '\\' COLLATE NOCASE
+                    OR body  LIKE ?1 ESCAPE '\\' COLLATE NOCASE
                  ORDER BY updated_at DESC LIMIT ?2"
             ))
             .map_err(|e| format!("search: {e}"))?;
@@ -454,20 +457,32 @@ impl IssueStore {
     }
 }
 
+/// Escape SQL LIKE metacharacters for use with a `\` ESCAPE clause: the
+/// escape char first, then `%` and `_`, so they match literally.
+fn escape_like(s: &str) -> String {
+    s.replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn store() -> IssueStore {
+        // A process-wide counter guarantees a unique dir even when two tests
+        // enter store() within the same clock nanosecond — the SystemTime
+        // suffix alone let parallel tests collide on one DB and pollute each
+        // other (the source of the flaky board_* failures).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "dirge-issue-test-{}-{}",
+            "dirge-issue-test-{}-{}-{}",
             std::process::id(),
-            // monotonic-ish unique suffix without Date::now in workflows (this
-            // is a normal test, so SystemTime is fine here)
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         std::fs::create_dir_all(&dir).unwrap();
         IssueStore::open_at(&dir.join("state.db")).unwrap()
@@ -568,6 +583,23 @@ mod tests {
         s.create("Unrelated", "nope", None, None).unwrap();
         let hits = s.search("auth", 10).unwrap();
         assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn search_treats_like_metacharacters_as_literals() {
+        let s = store();
+        s.create("100% done", "", None, None).unwrap();
+        s.create("foo_bar", "", None, None).unwrap();
+        s.create("fooXbar", "", None, None).unwrap();
+        s.create("plain", "", None, None).unwrap();
+        // `%` must be a literal, not "match anything".
+        let pct = s.search("100%", 10).unwrap();
+        assert_eq!(pct.len(), 1);
+        assert_eq!(pct[0].title, "100% done");
+        // `_` must be a literal, not a single-char wildcard.
+        let us = s.search("foo_bar", 10).unwrap();
+        assert_eq!(us.len(), 1);
+        assert_eq!(us[0].title, "foo_bar");
     }
 
     #[test]

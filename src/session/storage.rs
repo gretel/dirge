@@ -1328,6 +1328,103 @@ mod tests {
         );
     }
 
+    /// dirge-g1ze/-4kgk/-f67u: a compaction fold that rotates the session id
+    /// (the production `context_compacted` handler) must survive save ->
+    /// `load_session_tip`. Resuming the original (origin) id hops the fold
+    /// chain forward to the tip and recovers the folded summary + the
+    /// verbatim kept tail, with the right message count, and the origin/chain
+    /// id still resolves to the tip. A unique origin keeps the shared
+    /// per-process session dir scan from colliding with other tests.
+    #[test]
+    fn fold_persist_resume_roundtrip() {
+        use crate::session::{MessageRole, Session};
+
+        let origin = format!("origin-{}", uuid::Uuid::new_v4().simple());
+
+        // Root of the chain: origin unset (effective_origin == own id), the
+        // full original message list, older timestamp. This is the file a fold
+        // leaves behind on disk.
+        let mut root = Session::new("p", "m", 128_000);
+        root.id = compact_str::CompactString::new(origin.clone());
+        root.add_message(MessageRole::User, "the original ask");
+        root.add_message(MessageRole::Assistant, "first reply");
+        root.add_message(MessageRole::User, "follow up");
+        root.add_message(MessageRole::Assistant, "second reply");
+        root.add_message(MessageRole::User, "recent question");
+        root.add_message(MessageRole::Assistant, "recent answer");
+        root.updated_at = compact_str::CompactString::new("2026-01-01T00:00:00+00:00");
+        save_session(&mut root).expect("save root");
+
+        // The fold, mirroring the production handler: compress first, THEN
+        // capture the origin, THEN rotate id + set origin_id, THEN save under
+        // the new id. first_kept_index=2 drains [u1, a1]; the kept tail is
+        // [u2, a2, u3, a3] plus the injected summary at index 0.
+        let tip_id = format!("compacted-{}", uuid::Uuid::new_v4().simple());
+        let mut tip = root.clone();
+        tip.compress("FOLDED SUMMARY OF EARLY TURNS".to_string(), 2, 100);
+        assert_eq!(
+            tip.effective_origin(),
+            origin,
+            "origin_id unset means id is still the origin"
+        );
+        tip.origin_id = Some(compact_str::CompactString::new(origin.clone()));
+        tip.id = compact_str::CompactString::new(tip_id.clone());
+        tip.updated_at = compact_str::CompactString::new("2026-06-01T00:00:00+00:00");
+        save_session(&mut tip).expect("save tip");
+
+        // Resume the ORIGINAL id — load_session_tip must hop forward to the tip.
+        let resumed = load_session_tip(&origin).expect("resume");
+        assert_eq!(
+            resumed.id.as_str(),
+            tip_id,
+            "resuming the origin must resolve to the chain tip"
+        );
+        assert_eq!(
+            resumed.effective_origin(),
+            origin,
+            "the tip carries the conversation origin forward"
+        );
+
+        // Folded summary is message[0] (a System entry).
+        assert_eq!(resumed.messages[0].role, MessageRole::System);
+        assert!(
+            resumed.messages[0]
+                .content
+                .contains("FOLDED SUMMARY OF EARLY TURNS"),
+            "summary must survive the round-trip, got: {:?}",
+            resumed.messages[0].content
+        );
+
+        // Summary + the 4 kept tail messages; the verbatim recent turn is
+        // intact and the folded-out head did not leak back in.
+        assert_eq!(
+            resumed.messages.len(),
+            5,
+            "summary + 4 kept tail messages, got {}",
+            resumed.messages.len()
+        );
+        assert!(
+            resumed
+                .messages
+                .iter()
+                .any(|m| m.content.contains("recent answer")),
+            "the kept tail must retain the verbatim recent turn"
+        );
+        assert!(
+            !resumed
+                .messages
+                .iter()
+                .any(|m| m.content.contains("the original ask")),
+            "the folded-out head must not reappear after reload"
+        );
+
+        assert_eq!(resumed.compactions.len(), 1);
+        assert_eq!(resumed.compactions[0].summarized_count, 2);
+
+        cleanup_session(&origin);
+        cleanup_session(&tip_id);
+    }
+
     /// Tree + message_store round-trip (fork/clone/switch surfaces
     /// the same branches after reload).
     #[test]

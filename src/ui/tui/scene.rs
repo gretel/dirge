@@ -16,7 +16,7 @@ use ratatui::style::{Color as RColor, Style};
 use super::bottom::{AvatarSpec, BottomBody, BottomStrip};
 use super::chat::{ChatPane, crossterm_to_ratatui};
 use super::frame::{ChatBotFrame, TopFrame};
-use super::layout::Layout;
+use super::layout::{LEFT_PANEL_MIN_W, Layout, RIGHT_PANEL_MIN_W};
 use super::panels::{LeftPanel, RightPanel};
 use crate::ui::renderer::{
     LeftPanelInfo, LineEntry, PanelData, PanelMode, SelectionRange, SubagentStatusRow,
@@ -101,7 +101,7 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     f.render_widget(TopFrame::new(&layout).style(frame_style), area);
 
     // Left panel — idle card or subagent list. Skip on narrow terminals.
-    if scene.show_left_panel && layout.left_panel.width >= 12 {
+    if scene.show_left_panel && layout.left_panel.width >= LEFT_PANEL_MIN_W {
         f.render_widget(
             LeftPanel::new(scene.left_info, scene.subagents).border_style(frame_style),
             layout.left_panel,
@@ -118,7 +118,7 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
     f.render_widget(chat, area);
 
     // Right panel — stacked sub-panels. Skip on narrow terminals.
-    if scene.show_right_panel && layout.right_panel.width >= 16 {
+    if scene.show_right_panel && layout.right_panel.width >= RIGHT_PANEL_MIN_W {
         #[allow(unused_variables)]
         let is_debug = scene.right_panel_mode == PanelMode::Debug;
         #[cfg(feature = "dap")]
@@ -216,6 +216,28 @@ pub fn render_frame(scene: &Scene, f: &mut Frame<'_>) {
             .saturating_add(layout.input_box.height)
             .saturating_sub(2);
         f.set_cursor_position((cursor_x.min(cursor_x_max), cursor_y.min(cursor_y_max)));
+    }
+
+    // dirge-kk4i: --no-color is the LAST paint step. Widgets and the stored
+    // SourceBlock colors paint directly with raw Color:: literals that bypass
+    // theme::themed(); this single post-render pass over the whole frame buffer
+    // collapses EVERY cell's fg+bg to the terminal default. Skipped entirely
+    // when no_color() is off so the common case pays nothing. (The theme
+    // accessors and write_line/write_line_raw already remap their own colors;
+    // this catches everything else — panels, frames, markdown, borders.)
+    if crate::ui::theme::no_color() {
+        strip_colors(f.buffer_mut());
+    }
+}
+
+/// Pure core of the `--no-color` frame pass (dirge-kk4i): reset every cell's
+/// foreground AND background to the terminal default. Split out of
+/// [`render_frame`] so it's unit-testable without the set-once `no_color()`
+/// global — [`render_frame`] calls it with the whole frame buffer.
+fn strip_colors(buf: &mut ratatui::buffer::Buffer) {
+    for cell in buf.content.iter_mut() {
+        cell.fg = RColor::Reset;
+        cell.bg = RColor::Reset;
     }
 }
 
@@ -400,6 +422,31 @@ mod tests {
             })
             .collect();
         assert!(status_row.starts_with("ready"));
+    }
+
+    /// dirge-kk4i: `--no-color` must collapse EVERY painted cell's fg+bg to the
+    /// terminal default — including colors that bypassed `theme::themed()` (raw
+    /// `Color::` literals, stored SourceBlock colors). This drives the pure
+    /// `strip_colors` core directly because the `no_color()` global is set-once
+    /// and can't be toggled in a unit test.
+    #[test]
+    fn strip_colors_resets_every_cell_fg_and_bg() {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 2));
+        // Simulate widgets that painted colors directly, bypassing themed().
+        buf[(0, 0)].fg = RColor::Red;
+        buf[(1, 0)].bg = RColor::Blue;
+        buf[(4, 1)].fg = RColor::Rgb(1, 2, 3);
+        buf[(4, 1)].bg = RColor::Green;
+
+        strip_colors(&mut buf);
+
+        for cell in buf.content.iter() {
+            assert_eq!(cell.fg, RColor::Reset, "fg not reset to default");
+            assert_eq!(cell.bg, RColor::Reset, "bg not reset to default");
+        }
     }
 
     /// A configured (non-Reset) theme background fills every cell's bg;
@@ -683,6 +730,43 @@ mod tests {
         assert!(
             region_has_content(&b, right_only.right_panel),
             "right should draw"
+        );
+    }
+
+    /// dirge-tkth: the Auto-mode show threshold (`PANEL_AUTO_MIN_COLS`)
+    /// must agree with the per-panel draw minima, so Auto never reserves a
+    /// gutter it then refuses to paint. At exactly the threshold BOTH
+    /// panels clear their draw floors; one column below it the right panel
+    /// is too narrow to draw — the blank-gutter boundary the threshold
+    /// must sit above.
+    #[test]
+    fn auto_threshold_agrees_with_panel_draw_minima() {
+        use crate::ui::renderer::PANEL_AUTO_MIN_COLS;
+        // At the threshold: both panels satisfy their draw minima.
+        let at = Layout::with_panels(PANEL_AUTO_MIN_COLS, 30, 1, true, true);
+        assert!(
+            at.left_panel.width >= LEFT_PANEL_MIN_W,
+            "left panel {} < {} at threshold {} cols",
+            at.left_panel.width,
+            LEFT_PANEL_MIN_W,
+            PANEL_AUTO_MIN_COLS
+        );
+        assert!(
+            at.right_panel.width >= RIGHT_PANEL_MIN_W,
+            "right panel {} < {} at threshold {} cols",
+            at.right_panel.width,
+            RIGHT_PANEL_MIN_W,
+            PANEL_AUTO_MIN_COLS
+        );
+        // One column below: the right panel falls under its draw floor —
+        // if Auto showed here it would reserve a blank gutter.
+        let below = Layout::with_panels(PANEL_AUTO_MIN_COLS - 1, 30, 1, true, true);
+        assert!(
+            below.right_panel.width < RIGHT_PANEL_MIN_W,
+            "right panel {} >= {} at {} cols; threshold has slack and a blank-gutter zone exists",
+            below.right_panel.width,
+            RIGHT_PANEL_MIN_W,
+            PANEL_AUTO_MIN_COLS - 1
         );
     }
 

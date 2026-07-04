@@ -218,6 +218,50 @@ pub(crate) fn compress_reporting(
     sibling_pruned_count
 }
 
+/// Smallest index `>= idx` whose item satisfies `is_user`, clamped to
+/// `items.len()` when none is found at or after `idx`.
+///
+/// NOTE: `idx` itself is NOT clamped — `idx > len` returns `idx` (a cut
+/// past the end stays past the end). That is the contract
+/// `align_cut_to_user_boundary` relies on; a caller that wants a clamped
+/// start (the loop-space `compression` walks) applies `idx.min(len)`
+/// itself before calling. Keeping the clamp out of the generic lets both
+/// the unclamped slash-side walk and the clamped loop-side walk share
+/// one implementation while reproducing their exact prior behavior.
+pub(crate) fn snap_forward_to_user<T>(
+    items: &[T],
+    idx: usize,
+    is_user: impl Fn(&T) -> bool,
+) -> usize {
+    let n = items.len();
+    let mut i = idx;
+    while i < n && !is_user(&items[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Largest index `<= idx` whose item satisfies `is_user`, or `0` when
+/// none is found at or before `idx`. `idx` is clamped to the last valid
+/// index first. Panics on an empty slice (matches the prior loop-side
+/// impl; both call sites guard `n == 0` before calling).
+pub(crate) fn snap_backward_to_user<T>(
+    items: &[T],
+    idx: usize,
+    is_user: impl Fn(&T) -> bool,
+) -> usize {
+    let mut i = idx.min(items.len().saturating_sub(1));
+    loop {
+        if is_user(&items[i]) {
+            return i;
+        }
+        if i == 0 {
+            return 0;
+        }
+        i -= 1;
+    }
+}
+
 /// Smallest index `>= cut_idx` whose message is a User turn, clamped to
 /// `messages.len()` when none is found at or after `cut_idx`. Cutting the
 /// session on a user boundary guarantees the kept tail never begins with an
@@ -225,11 +269,7 @@ pub(crate) fn compress_reporting(
 /// as the loop-space `compression::compute_compress_window`. Snapping FORWARD
 /// only ever keeps a whole recent turn, never half of a tool_use↔result pair.
 pub(crate) fn align_cut_to_user_boundary(messages: &[SessionMessage], cut_idx: usize) -> usize {
-    let mut i = cut_idx;
-    while i < messages.len() && messages[i].role != MessageRole::User {
-        i += 1;
-    }
-    i
+    snap_forward_to_user(messages, cut_idx, |m| m.role == MessageRole::User)
 }
 
 /// Compute the SESSION-SPACE compaction cut: the index of the first message
@@ -455,5 +495,66 @@ mod cut_tests {
             s.total_estimated_tokens, recompute,
             "total_estimated_tokens drifted from the canonical message sum after a fold"
         );
+    }
+}
+
+/// Direct unit tests on the role-generic boundary snappers, over a tiny
+/// fake item type (`bool`; `true` == a user turn). These pin the shared
+/// semantics both `align_cut_to_user_boundary` and `compression`'s
+/// `snap_{forward,backward}_to_user` delegate to.
+#[cfg(test)]
+mod snap_boundary_tests {
+    use super::{snap_backward_to_user, snap_forward_to_user};
+
+    fn is_user(b: &bool) -> bool {
+        *b
+    }
+
+    #[test]
+    fn forward_finds_first_user_at_or_after_idx() {
+        // [F, T, F, T]
+        let items = [false, true, false, true];
+        assert_eq!(snap_forward_to_user(&items, 0, is_user), 1);
+        assert_eq!(snap_forward_to_user(&items, 1, is_user), 1);
+        assert_eq!(snap_forward_to_user(&items, 2, is_user), 3);
+    }
+
+    #[test]
+    fn forward_no_user_clamps_to_len() {
+        let items = [false, false];
+        assert_eq!(snap_forward_to_user(&items, 0, is_user), items.len());
+    }
+
+    #[test]
+    fn forward_idx_equals_len_clamps_to_len() {
+        let items = [false, true];
+        assert_eq!(
+            snap_forward_to_user(&items, items.len(), is_user),
+            items.len()
+        );
+    }
+
+    #[test]
+    fn forward_idx_past_end_returns_idx_unclamped() {
+        // idx > len is NOT clamped — a cut past the end stays past the end.
+        // (align_cut_to_user_boundary relies on this; clamping callers
+        // apply idx.min(len) themselves.)
+        let items = [false, true];
+        assert_eq!(snap_forward_to_user(&items, 5, is_user), 5);
+    }
+
+    #[test]
+    fn backward_finds_last_user_at_or_before_idx() {
+        let items = [false, true, false, true];
+        assert_eq!(snap_backward_to_user(&items, 2, is_user), 1);
+        assert_eq!(snap_backward_to_user(&items, 3, is_user), 3);
+        // past end → clamp to last valid index, then back to nearest user
+        assert_eq!(snap_backward_to_user(&items, 9, is_user), 3);
+    }
+
+    #[test]
+    fn backward_no_user_returns_zero() {
+        let items = [false, false];
+        assert_eq!(snap_backward_to_user(&items, 1, is_user), 0);
     }
 }

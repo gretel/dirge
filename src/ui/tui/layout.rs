@@ -13,6 +13,20 @@ use ratatui::layout::Rect;
 /// the remaining space symmetrically.
 pub const CHAT_CONTENT_MAX_W: u16 = 120;
 
+/// Minimum column width at which the left panel (idle card / subagent
+/// list) renders legibly. Below this `render_frame` skips the left panel
+/// even when Auto mode reserved space for it, so callers must not reserve
+/// a left panel narrower than this. See `PANEL_AUTO_MIN_COLS` in
+/// `renderer`.
+pub const LEFT_PANEL_MIN_W: u16 = 12;
+
+/// Minimum column width at which the right panel (stacked sub-panels)
+/// renders legibly. Below this `render_frame` skips the right panel even
+/// when Auto mode reserved space for it. The right panel is the binding
+/// constraint on the Auto-mode show threshold (16 > 12): see
+/// `PANEL_AUTO_MIN_COLS` in `renderer`.
+pub const RIGHT_PANEL_MIN_W: u16 = 16;
+
 /// Maximum input editor row count (matches the legacy
 /// `MAX_INPUT_VISIBLE_LINES`). Layout consumers are expected to
 /// clamp at this value before passing `input_rows`.

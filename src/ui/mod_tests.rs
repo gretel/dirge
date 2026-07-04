@@ -727,19 +727,19 @@ fn memory_skill_list_safe_during_agent() {
 // ============================================================
 
 #[test]
-fn scroll_snap_typing_and_down_snap_but_command_combos_dont() {
+fn scroll_snap_only_down_jumps_typing_leaves_scroll_alone() {
     use crossterm::event::KeyEvent;
     let none = KeyModifiers::NONE;
 
-    // Plain typing → snap to bottom AND still insert the char.
+    // Typing does NOT snap — you can read history while composing.
     assert_eq!(
         scroll_snap_for(&KeyEvent::new(KeyCode::Char('a'), none)),
-        Some(ScrollSnap::TypeThrough)
+        None
     );
-    // Shift+char (a capital) is still typing.
+    // Shift+char (a capital) is still typing — still no snap.
     assert_eq!(
         scroll_snap_for(&KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
-        Some(ScrollSnap::TypeThrough)
+        None
     );
     // Plain Down → jump to bottom and consume the key.
     assert_eq!(
