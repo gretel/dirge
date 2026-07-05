@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.18.4] - 2026-07-05
+
 ### Fixed
 - The agent no longer silently halts after a failed tool call. When the model's
   last action was a rejected/errored tool call and it then stopped with a
