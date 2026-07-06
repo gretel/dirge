@@ -4,6 +4,34 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.8] - 2026-07-06
+
+### Added
+- Prompt-injection scanning of untrusted tool results (file reads, MCP, web
+  search). Detects role-override, summarisation-survival (instructions crafted
+  to persist through compaction), link-exfiltration, and invisible-Unicode /
+  Unicode-tag-block smuggling. Advisory by default (flagged content is fenced
+  as untrusted data); opt-in hard-block via the `injection_scan` config
+  (`off`/`advisory`/`block`). Read-scanning matches only the prompt-injection
+  patterns, so ordinary source is not fenced (dirge-5ig9).
+- Critic `ABSTAIN` verdict: when the spec and evidence don't let the critic
+  establish correctness, it now asks the model to add a focused test (or state
+  the missing detail) rather than false-passing or wrongly claiming the work is
+  unfinished (dirge-ahyh).
+- Opt-in open-issues finalization gate: nudges when this session left issues
+  open, via the existing issue store (session-scoped, not the global backlog).
+  Config `open_issues_gate` (`off`/`advisory`/`blocking`, default off); the
+  blocking mode is bounded so it can't trap the loop (dirge-ksjl).
+- Recurrence-weighted memory salience graduation: when the same learning has
+  been stored as near-duplicate entries, the curator boosts the representative
+  entry's salience so it's retained and surfaced. Non-destructive (nothing is
+  merged or deleted) and recorded in a ledger so a cluster graduates once.
+  Config `memory_graduation` (default on) (dirge-4nix).
+
+### Changed
+- Internal: `CodeReviewMode` generalized to a reusable `GateMode` primitive
+  shared by the finalization gates (dirge-hsvw).
+
 ## [0.18.7] - 2026-07-06
 
 ### Fixed
