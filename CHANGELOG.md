@@ -4,6 +4,25 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.13] - 2026-07-07
+
+### Fixed
+- Render-loop CPU waste (three fixes from a repaint-loop audit):
+  - A no-op or duplicate terminal resize no longer triggers a full scrollback
+    re-render. crossterm — and terminals that fire a resize event on focus and
+    other non-size changes — emit resizes with unchanged dimensions; each was
+    doing a full markdown re-parse + re-wrap of the whole scrollback. Resizes
+    now carry the new dimensions and rebuild only when the size actually
+    changed (dirge-8p0h).
+  - The terminal size is cached instead of re-`open()`ing `/dev/tty` ~8× per
+    paint (via panel visibility / width / layout probes). It's refreshed at the
+    top of each paint and on resize — the size only changes on resize
+    (dirge-jisr).
+  - Ambient panel data (session tokens, git, tool activity) is recomputed at
+    most every 100ms instead of on every event-loop iteration; during token
+    streaming the loop wakes 50–200×/s, so the per-token recompute was pure
+    waste. Keystrokes, paints, and the input editor are unchanged (dirge-b14h).
+
 ## [0.18.12] - 2026-07-07
 
 ### Fixed
