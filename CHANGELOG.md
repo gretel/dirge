@@ -4,6 +4,18 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.18.11] - 2026-07-07
+
+### Fixed
+- Throttle the full terminal re-assert to break a FocusGained feedback loop. On
+  terminals that echo a focus event when the re-assert escape sequence is sent,
+  the `FocusGained → force_terminal_reassert → …` recovery could re-trigger
+  itself in a tight loop — rebuilding the ratatui backend, writing to
+  `/dev/tty`, and dirtying a frame every iteration — spinning the event loop and
+  causing visible jank. `force_terminal_reassert` now no-ops if it fired within
+  the last 500ms, which is imperceptible for a genuine refocus or Ctrl+L but
+  stops the loop. Thanks @allen-munsch (#606).
+
 ## [0.18.10] - 2026-07-06
 
 ### Fixed
