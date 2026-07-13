@@ -4,9 +4,18 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.5] - 2026-07-13
 
 ### Fixed
+- AltGr-composed characters (`@ # [ ] { }` on the Italian, German, Spanish, …
+  layouts) could not be typed or pasted into the input box on Windows. Windows
+  reports AltGr as Ctrl+Alt, so those keystrokes arrived with both modifiers
+  set and the editor's text-insertion path — which ignored anything Ctrl- or
+  Alt-modified — dropped them. Pasting lost the same characters because the
+  Windows console backend delivers a paste as synthesized keystrokes. `@`
+  needing AltGr also meant the `@`-file picker could never open. The editor now
+  folds an AltGr-composed printable character back to plain text before
+  dispatch; real Ctrl/Alt keybindings are unaffected (GH #659).
 - The input box was unreadable on a light terminal: the composer text is white
   and relied on the theme's dark background fill, which `plain` (and any
   light/`reset` background) doesn't paint, so it vanished against a light
