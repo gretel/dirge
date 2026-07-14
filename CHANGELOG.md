@@ -4,7 +4,10 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.19.6] - 2026-07-14
+
+### Added
+- `animations_enabled` config toggle to turn off UI animations (#664).
 
 ### Fixed
 - The TODOS panel went empty after a compaction fold or a resume and did not
@@ -15,6 +18,34 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   scoped by the stable lineage origin (so it survives folds/resumes), and
   starting an issue (`issue start` / an update to `in_progress`) claims it for
   the current conversation so a picked-up issue appears (GH #663).
+- Redacted secrets stayed searchable in the session transcript index: the v6
+  FTS redaction rebuild cleared the external-content index with a plain
+  `DELETE`, which left phantom postings, so secrets in folded `tool_calls`
+  remained matchable. It now uses the FTS5 `'delete-all'` command
+  (dirge-vpma.4).
+- Opening the composer in an external editor (Ctrl+G) destroyed text and image
+  pastes held in the buffer; they are preserved and re-attached now
+  (dirge-vpma.5).
+- A corrupt project `config.json` could be rewritten with only the sandbox
+  keys, dropping the rest of the configuration (dirge-vpma.6).
+- Resizing the terminal could wipe a background subagent's transcript because
+  inactive-chat writes skipped their source buffer (dirge-vpma.7).
+- Setting one DAP breakpoint replaced the file's whole breakpoint set (DAP
+  replace semantics), so adding or removing one dropped the rest; incoming
+  breakpoints now merge with the cached set (dirge-vpma.12).
+- `--loop-max N` ran N-1 iterations (and zero for `N=1`) (dirge-vpma.15).
+- Ctrl+K killed to the end of the whole buffer instead of the end of the line
+  (dirge-vpma.16).
+- Deleting a session removed only a single file, leaving fold-chain rotations
+  resumable; the whole lineage is removed now (dirge-vpma.13).
+- Three P1 crash / data-loss bugs: a shell-exit drain race could start a second
+  agent run; restoring after removing a chat could overwrite surviving history;
+  and the checkpoint-reuse fold spliced snapshots at the wrong index (#665,
+  dirge-vpma.1/.2/.3).
+- Further Wavescope entropy-audit correctness fixes across the compaction hook
+  path, stream-abort racing, plugin session adoption, and rewind bucketing
+  (dirge-vpma.8/.9/.10/.11/.14/.19).
+- External-editor buffers now open with the markdown filetype (#662).
 
 ### Changed
 - The TODOS panel now marks the issue the agent is actively on: the
