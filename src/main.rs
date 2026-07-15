@@ -1277,6 +1277,7 @@ async fn main() -> anyhow::Result<()> {
                 // the unchanged btw path; `Some` selects the tooled fork.
                 let tool_allow = agent::tools::task::resolve_subagent_allow(&def.subagent);
                 let max_turns = agent::tools::task::resolve_subagent_max_turns(&def.subagent);
+                let timeout = agent::tools::task::resolve_subagent_timeout(&def.subagent);
                 (
                     def.name.clone(),
                     agent::tools::task::SubagentRoute {
@@ -1284,6 +1285,8 @@ async fn main() -> anyhow::Result<()> {
                         preamble: def.prompt.clone(),
                         tool_allow,
                         max_turns,
+                        timeout,
+                        tier: def.subagent.tier.clone(),
                     },
                 )
             })
@@ -1685,6 +1688,47 @@ async fn main() -> anyhow::Result<()> {
                         .await;
                     }
                 }
+            }
+        }
+
+        let coordinator_strategy = cfg.resolve_subagent_dispatch_strategy();
+        if coordinator_strategy != config::SubagentDispatchStrategy::Off {
+            let profiles = agent::tools::task::resolve_coordinator_profiles(&context.agent_defs);
+            let missing_readonly = profiles.readonly.is_empty();
+            let missing_readwrite = profiles.readwrite.is_empty();
+            let tools_disabled = cli.resolve_no_tools(&cfg);
+            if tools_disabled || missing_readonly || missing_readwrite {
+                let found = context
+                    .agent_defs
+                    .iter()
+                    .map(|definition| {
+                        format!("{} ({:?})", definition.name, definition.subagent.tier)
+                    })
+                    .collect::<Vec<_>>();
+                let diagnostic = format!(
+                    "subagent_dispatch_strategy=full requires both coordinator tiers and enabled tools. found: {}; missing: {}{}",
+                    if found.is_empty() {
+                        "none".to_string()
+                    } else {
+                        found.join(", ")
+                    },
+                    if missing_readonly { "readonly" } else { "" },
+                    if missing_readwrite {
+                        if missing_readonly {
+                            ", readwrite"
+                        } else {
+                            "readwrite"
+                        }
+                    } else {
+                        ""
+                    },
+                );
+                if coordinator_strategy == config::SubagentDispatchStrategy::Full {
+                    anyhow::bail!(diagnostic);
+                }
+                eprintln!("warning: {diagnostic}; disabling coordinator mode");
+            } else if let Some(store) = bg_store.as_ref() {
+                store.enable_coordinator_with_profiles(coordinator_strategy, profiles);
             }
         }
 

@@ -20,7 +20,47 @@ use uuid::Uuid;
 use crate::agent::agent_loop::tool::AbortSignal;
 use crate::agent::tools::background::{BackgroundStore, TaskState};
 use crate::agent::tools::{AskSender, PermCheck, ToolError, check_perm};
+use crate::config::SubagentWriteIsolation;
 use crate::provider::AnyModel;
+use crate::sandbox::Sandbox;
+
+fn writer_worktree_enabled(
+    is_writer: bool,
+    isolation: SubagentWriteIsolation,
+    is_microvm: bool,
+) -> Result<bool, &'static str> {
+    if !is_writer || isolation == SubagentWriteIsolation::Serialize {
+        return Ok(false);
+    }
+    if is_microvm {
+        return match isolation {
+            SubagentWriteIsolation::Worktree => {
+                Err("worktree write isolation is unavailable in microVM sandbox mode")
+            }
+            SubagentWriteIsolation::Auto => Ok(false),
+            SubagentWriteIsolation::Serialize => Ok(false),
+        };
+    }
+    Ok(true)
+}
+
+#[cfg(feature = "git-worktree")]
+fn create_writer_worktree(
+    task_id: &str,
+) -> Result<crate::extras::git_worktree::WorktreeInfo, String> {
+    let repo = std::env::current_dir()
+        .map_err(|e| format!("failed to resolve current directory: {e}"))?
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize current repository: {e}"))?;
+    if crate::extras::git_worktree::repo_is_dirty(&repo)? {
+        return Err("current repository has uncommitted changes".to_string());
+    }
+    let parent = repo
+        .parent()
+        .ok_or_else(|| "current repository has no parent directory".to_string())?;
+    let name = format!("dirge-task-{task_id}");
+    crate::extras::git_worktree::create_at(&repo, parent, &name, &name)
+}
 
 /// dirge-ov2 Phase D: subagent chat-window event. Sent by `TaskTool`
 /// when it spawns / completes a subagent so the UI loop can surface
@@ -342,6 +382,26 @@ pub fn resolve_subagent_max_turns(p: &crate::context::agent_defs::SubagentToolPo
     p.max_turns.unwrap_or(SUBAGENT_DEFAULT_MAX_TURNS)
 }
 
+/// Per-subagent timeout honoring profile configuration, clamped to a bounded
+/// interval so a typo cannot create either immediate failures or stuck tasks.
+pub fn resolve_subagent_timeout(
+    p: &crate::context::agent_defs::SubagentToolPolicy,
+) -> std::time::Duration {
+    const DEFAULT_SECS: u64 = 600;
+    const MIN_SECS: u64 = 30;
+    const MAX_SECS: u64 = 3600;
+    let raw = p.timeout_secs.unwrap_or(DEFAULT_SECS);
+    let secs = raw.clamp(MIN_SECS, MAX_SECS);
+    if secs != raw {
+        tracing::warn!(
+            timeout_secs = raw,
+            resolved_timeout_secs = secs,
+            "subagent timeout is outside the supported range; clamping"
+        );
+    }
+    std::time::Duration::from_secs(secs)
+}
+
 /// dirge-ykeu Phase 4: a pre-resolved subagent routing for one agent profile.
 /// Built once at startup (in `main`, where the client + config + registry are
 /// all available) so `TaskTool` needs neither the client nor the config to
@@ -361,6 +421,44 @@ pub struct SubagentRoute {
     /// Per-subagent turn cap. Honors a profile `subagent.max_turns` override
     /// else [`SUBAGENT_DEFAULT_MAX_TURNS`]. Only consumed on the tooled path.
     pub max_turns: usize,
+    pub timeout: std::time::Duration,
+    pub tier: crate::context::agent_defs::SubagentToolTier,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoordinatorProfile {
+    pub name: String,
+    pub description: Option<String>,
+    pub tier: crate::context::agent_defs::SubagentToolTier,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CoordinatorProfiles {
+    pub readonly: Vec<CoordinatorProfile>,
+    pub readwrite: Vec<CoordinatorProfile>,
+}
+
+pub fn resolve_coordinator_profiles(
+    agent_defs: &crate::context::agent_defs::AgentRegistry,
+) -> CoordinatorProfiles {
+    let mut profiles = CoordinatorProfiles::default();
+    for definition in agent_defs.iter() {
+        let profile = CoordinatorProfile {
+            name: definition.name.clone(),
+            description: definition.description.clone(),
+            tier: definition.subagent.tier.clone(),
+        };
+        match &profile.tier {
+            crate::context::agent_defs::SubagentToolTier::Readonly => {
+                profiles.readonly.push(profile)
+            }
+            crate::context::agent_defs::SubagentToolTier::ReadWrite => {
+                profiles.readwrite.push(profile)
+            }
+            crate::context::agent_defs::SubagentToolTier::Toolless => {}
+        }
+    }
+    profiles
 }
 
 /// Process-global map of profile name → routing. Set once at interactive
@@ -585,6 +683,8 @@ pub struct TaskTool {
     pub ask_tx: Option<AskSender>,
     model: AnyModel,
     bg_store: BackgroundStore,
+    sandbox: Sandbox,
+    write_isolation: SubagentWriteIsolation,
     /// dirge-ov2: send-side of the subagent-chat-event channel.
     /// `Option` so `--no-tools` paths / tests can omit the UI sink
     /// without forcing every TaskTool builder to manufacture one.
@@ -597,12 +697,16 @@ impl TaskTool {
         ask_tx: Option<AskSender>,
         model: AnyModel,
         bg_store: BackgroundStore,
+        sandbox: Sandbox,
+        write_isolation: SubagentWriteIsolation,
     ) -> Self {
         Self {
             permission,
             ask_tx,
             model,
             bg_store,
+            sandbox,
+            write_isolation,
             chat_sink: None,
         }
     }
@@ -650,7 +754,10 @@ impl TaskTool {
         route_preamble: Option<String>,
         allowed: Vec<String>,
         max_turns: usize,
+        timeout: std::time::Duration,
         background: bool,
+        is_writer: bool,
+        retry_of: Option<String>,
         prompt: String,
         agent_name: Option<String>,
     ) -> Result<String, ToolError> {
@@ -674,7 +781,79 @@ impl TaskTool {
                 )));
             }
             let task_id = Uuid::new_v4().to_string();
-            self.bg_store.insert(task_id.clone());
+            let coordinator_dispatch = self.bg_store.coordinator_strategy().is_some();
+            if coordinator_dispatch {
+                self.bg_store
+                    .insert_coordinator_dispatch(
+                        task_id.clone(),
+                        prompt.clone(),
+                        is_writer,
+                        retry_of.as_deref(),
+                    )
+                    .map_err(ToolError::Msg)?;
+            } else {
+                self.bg_store.insert_for_dispatch(task_id.clone());
+            }
+
+            // Coordinator ReadWrite agents may be rooted in a dedicated
+            // worktree. Auto preserves serialization when any prerequisite is
+            // unavailable; explicit Worktree reports that failure.
+            let rooted_worktree = if coordinator_dispatch {
+                match writer_worktree_enabled(
+                    is_writer,
+                    self.write_isolation,
+                    self.sandbox.is_microvm(),
+                ) {
+                    Ok(false) => None,
+                    Ok(true) => {
+                        #[cfg(feature = "git-worktree")]
+                        match create_writer_worktree(&task_id) {
+                            Ok(info) => {
+                                let main_git_dir = info.main_repo_path.join(".git");
+                                if let Err(error) = self.bg_store.set_coordinator_dispatch_worktree(
+                                    &task_id,
+                                    info.branch,
+                                    info.worktree_path.display().to_string(),
+                                ) {
+                                    self.bg_store
+                                        .notify(&task_id, TaskState::Failed(error.clone()));
+                                    return Err(ToolError::Msg(error));
+                                }
+                                Some((info.worktree_path, main_git_dir))
+                            }
+                            Err(error) if self.write_isolation == SubagentWriteIsolation::Auto => {
+                                None
+                            }
+                            Err(error) => {
+                                self.bg_store
+                                    .notify(&task_id, TaskState::Failed(error.clone()));
+                                return Err(ToolError::Msg(error));
+                            }
+                        }
+                        #[cfg(not(feature = "git-worktree"))]
+                        {
+                            if self.write_isolation == SubagentWriteIsolation::Auto {
+                                None
+                            } else {
+                                let error =
+                                    "worktree write isolation requires the git-worktree feature"
+                                        .to_string();
+                                self.bg_store
+                                    .notify(&task_id, TaskState::Failed(error.clone()));
+                                return Err(ToolError::Msg(error));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let error = error.to_string();
+                        self.bg_store
+                            .notify(&task_id, TaskState::Failed(error.clone()));
+                        return Err(ToolError::Msg(error));
+                    }
+                }
+            } else {
+                None
+            };
             self.bg_store.notify_started(&task_id);
             self.emit_chat(SubagentChatEvent::Spawn {
                 id: task_id.clone(),
@@ -691,8 +870,12 @@ impl TaskTool {
             let allowed_for_task = allowed.clone();
             let model_for_task = route_model.clone();
             let abort_for_task = abort.clone();
+            let permission_for_task = self.permission.clone();
+            let ask_tx_for_task = self.ask_tx.clone();
+            let sandbox_for_task = self.sandbox.clone();
+            let rooted_worktree_for_task = rooted_worktree.clone();
 
-            const SUBAGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+            let route_timeout = timeout;
             let store_for_task = store.clone();
             let handle = tokio::spawn(async move {
                 let child_sid = format!("sub-{}", crate::agent::runner::uuid_v4_simple());
@@ -700,14 +883,44 @@ impl TaskTool {
                     .as_deref()
                     .unwrap_or(SUBAGENT_DEFAULT_PREAMBLE)
                     .to_string();
-                let runner = agent.spawn_subagent_runner(
-                    prompt.clone(),
-                    system_prompt,
-                    &allowed_for_task,
-                    &child_sid,
-                    max_turns,
-                    model_for_task.as_ref(),
-                );
+                let runner = if let Some((worktree, main_git_dir)) = rooted_worktree_for_task {
+                    let root = match crate::agent::tools::ToolRoot::new(&worktree) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            store_for_task
+                                .notify(&tid_for_task, TaskState::Failed(error.to_string()));
+                            return;
+                        }
+                    };
+                    let tools = crate::agent::builder::build_rooted_writer_tools(
+                        root,
+                        permission_for_task,
+                        ask_tx_for_task,
+                        sandbox_for_task,
+                        crate::sandbox::SandboxExecutionRoot {
+                            worktree,
+                            main_git_dir,
+                        },
+                    )
+                    .await;
+                    agent.spawn_subagent_runner_with_tools(
+                        prompt.clone(),
+                        system_prompt,
+                        tools,
+                        &child_sid,
+                        max_turns,
+                        model_for_task.as_ref(),
+                    )
+                } else {
+                    agent.spawn_subagent_runner(
+                        prompt.clone(),
+                        system_prompt,
+                        &allowed_for_task,
+                        &child_sid,
+                        max_turns,
+                        model_for_task.as_ref(),
+                    )
+                };
                 let abort_watcher = spawn_abort_watcher(
                     abort_for_task.clone(),
                     runner.task.abort_handle(),
@@ -723,7 +936,7 @@ impl TaskTool {
                     }
                 };
                 let drained = drain_subagent_runner(runner, &tid_for_task, emit);
-                let outer = tokio::time::timeout(SUBAGENT_TIMEOUT, drained).await;
+                let outer = tokio::time::timeout(route_timeout, drained).await;
                 let aborted = abort_for_task.is_cancelled();
                 let (state, chat_event) = match outer {
                     Ok(Ok(text)) => (TaskState::Completed(text), None),
@@ -747,8 +960,7 @@ impl TaskTool {
                         }
                     }
                     Err(_) => {
-                        let msg =
-                            format!("subagent timed out after {}s", SUBAGENT_TIMEOUT.as_secs());
+                        let msg = format!("subagent timed out after {}s", route_timeout.as_secs());
                         (
                             TaskState::Failed(msg.clone()),
                             Some(SubagentChatEvent::Failed {
@@ -807,15 +1019,19 @@ impl TaskTool {
 
             let _cleanup = SubagentCleanup::new(task_id.clone(), abort_watcher);
 
-            let result = drain_subagent_runner(runner, &task_id, |ev| self.emit_chat(ev)).await;
+            let result = tokio::time::timeout(
+                timeout,
+                drain_subagent_runner(runner, &task_id, |ev| self.emit_chat(ev)),
+            )
+            .await;
             let aborted = abort.is_cancelled();
             match result {
-                Ok(text) => {
+                Ok(Ok(text)) => {
                     let outcome =
                         crate::agent::tools::output_relay::relay_if_large("task", text, "");
                     Ok(outcome.text)
                 }
-                Err(e) => {
+                Ok(Err(e)) => {
                     if aborted {
                         self.emit_chat(SubagentChatEvent::Aborted { id: task_id });
                         Err(ToolError::Msg("Subagent aborted by user".to_string()))
@@ -826,6 +1042,14 @@ impl TaskTool {
                         });
                         Err(ToolError::Msg(format!("Subagent error: {e}")))
                     }
+                }
+                Err(_) => {
+                    let message = format!("Subagent timed out after {}s", timeout.as_secs());
+                    self.emit_chat(SubagentChatEvent::Failed {
+                        id: task_id,
+                        error: message.clone(),
+                    });
+                    Err(ToolError::Msg(message))
                 }
             }
         }
@@ -842,6 +1066,8 @@ pub struct Args {
     /// or `config.json` `agents`). Omit for the default subagent.
     #[serde(default)]
     pub agent: Option<String>,
+    #[serde(default)]
+    pub retry_of: Option<String>,
 }
 
 impl Tool for TaskTool {
@@ -865,6 +1091,10 @@ impl Tool for TaskTool {
                 "background": {
                     "type": "boolean",
                     "description": "Run asynchronously (default: false). When true, returns a task_id immediately. The result is delivered automatically as a <system-reminder> on your next turn — do NOT poll task_status."
+                },
+                "retry_of": {
+                    "type": "string",
+                    "description": "Coordinator-only: retry one failed background task once."
                 }
             },
             "required": ["prompt"]
@@ -939,8 +1169,18 @@ impl Tool for TaskTool {
         // the model asked for a specific persona). `tool_allow` is `Some`
         // when the profile opted its subagent into tools (v1: readonly tier);
         // that selects the tooled fork below instead of the tool-less one-shot.
-        let (route_model, route_preamble, tool_allow, max_turns) = match args.agent.as_deref() {
-            None => (None, None, None, SUBAGENT_DEFAULT_MAX_TURNS),
+        let (route_model, route_preamble, tool_allow, max_turns, timeout, tier) = match args
+            .agent
+            .as_deref()
+        {
+            None => (
+                None,
+                None,
+                None,
+                SUBAGENT_DEFAULT_MAX_TURNS,
+                std::time::Duration::from_secs(600),
+                crate::context::agent_defs::SubagentToolTier::Toolless,
+            ),
             Some(name) => {
                 if !subagent_routes_available() {
                     return Err(ToolError::Msg(format!(
@@ -949,7 +1189,14 @@ impl Tool for TaskTool {
                     )));
                 }
                 match subagent_route(name) {
-                    Some(r) => (r.model, r.preamble, r.tool_allow, r.max_turns),
+                    Some(r) => (
+                        r.model,
+                        r.preamble,
+                        r.tool_allow,
+                        r.max_turns,
+                        r.timeout,
+                        r.tier,
+                    ),
                     None => {
                         return Err(ToolError::Msg(format!(
                             "unknown agent profile '{}'. Available: {}.",
@@ -961,6 +1208,25 @@ impl Tool for TaskTool {
             }
         };
 
+        let background = args.background.unwrap_or(false);
+        let is_writer = matches!(
+            tier,
+            crate::context::agent_defs::SubagentToolTier::ReadWrite
+        );
+        if args.retry_of.is_some() && !background {
+            return Err(ToolError::Msg("retry_of requires background=true".into()));
+        }
+        if self.bg_store.coordinator_strategy()
+            == Some(crate::config::SubagentDispatchStrategy::Full)
+            && !background
+            && !matches!(tier, crate::context::agent_defs::SubagentToolTier::Toolless)
+        {
+            return Err(ToolError::Msg(
+                "full coordinator mode requires tier-routed subagents to use background=true"
+                    .into(),
+            ));
+        }
+
         // Tooled subagent (v1 readonly tier): fork a filtered runner off the
         // live agent. Everything below this branch is the unchanged tool-less
         // `btw_query` path, so the dirge-mifq regression stays green.
@@ -971,7 +1237,10 @@ impl Tool for TaskTool {
                     route_preamble,
                     allowed,
                     max_turns,
-                    args.background.unwrap_or(false),
+                    timeout,
+                    background,
+                    is_writer,
+                    args.retry_of,
                     args.prompt,
                     args.agent,
                 )
@@ -997,7 +1266,18 @@ impl Tool for TaskTool {
                 )));
             }
             let task_id = Uuid::new_v4().to_string();
-            self.bg_store.insert(task_id.clone());
+            if self.bg_store.coordinator_strategy().is_some() {
+                self.bg_store
+                    .insert_coordinator_dispatch(
+                        task_id.clone(),
+                        args.prompt.clone(),
+                        is_writer,
+                        args.retry_of.as_deref(),
+                    )
+                    .map_err(ToolError::Msg)?;
+            } else {
+                self.bg_store.insert_for_dispatch(task_id.clone());
+            }
             self.bg_store.notify_started(&task_id);
 
             // dirge-ov2 Phase D: announce the subagent so the UI
@@ -1022,15 +1302,7 @@ impl Tool for TaskTool {
             let abort_for_task = abort.clone();
             let preamble_for_task = route_preamble.clone();
 
-            // Cap the background subagent at 10 minutes. Without a
-            // timeout, a stuck subagent (provider hang, runaway
-            // multi-turn) would keep the task in `Running` state
-            // forever, hold its model/network handle open, and
-            // never deliver a system-reminder to the next turn.
-            // 10 min matches the rough upper bound for a coherent
-            // single-prompt LLM task; anything longer is the
-            // subagent loop misbehaving.
-            const SUBAGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+            let route_timeout = timeout;
             let store_for_task = store.clone();
             let tid_for_task = tid.clone();
             let handle = tokio::spawn(async move {
@@ -1059,7 +1331,7 @@ impl Tool for TaskTool {
                         }
                     }
                 };
-                let outer = tokio::time::timeout(SUBAGENT_TIMEOUT, raced).await;
+                let outer = tokio::time::timeout(route_timeout, raced).await;
                 let (state, chat_event) = match outer {
                     Ok(Ok(Ok(text))) => (
                         TaskState::Completed(text.clone()),
@@ -1089,8 +1361,7 @@ impl Tool for TaskTool {
                         )
                     }
                     Err(_) => {
-                        let msg =
-                            format!("subagent timed out after {}s", SUBAGENT_TIMEOUT.as_secs(),);
+                        let msg = format!("subagent timed out after {}s", route_timeout.as_secs(),);
                         (
                             TaskState::Failed(msg.clone()),
                             SubagentChatEvent::Failed {
@@ -1245,7 +1516,30 @@ mod tests {
             None,
             AnyModel::OpenRouter(model),
             BackgroundStore::new(),
+            Sandbox::new(crate::sandbox::SandboxMode::Off),
+            SubagentWriteIsolation::Serialize,
         )
+    }
+
+    #[test]
+    fn writer_worktree_policy_respects_mode_and_sandbox() {
+        assert_eq!(
+            writer_worktree_enabled(false, SubagentWriteIsolation::Worktree, false),
+            Ok(false)
+        );
+        assert_eq!(
+            writer_worktree_enabled(true, SubagentWriteIsolation::Serialize, false),
+            Ok(false)
+        );
+        assert_eq!(
+            writer_worktree_enabled(true, SubagentWriteIsolation::Auto, false),
+            Ok(true)
+        );
+        assert_eq!(
+            writer_worktree_enabled(true, SubagentWriteIsolation::Auto, true),
+            Ok(false)
+        );
+        assert!(writer_worktree_enabled(true, SubagentWriteIsolation::Worktree, true).is_err());
     }
 
     #[test]
@@ -1435,6 +1729,7 @@ mod tests {
                 allow: leaky.iter().map(|s| s.to_string()).collect(), // try to smuggle
                 deny: Vec::new(),
                 max_turns: None,
+                timeout_secs: None,
             };
             let resolved = resolve_subagent_allow(&policy)
                 .unwrap_or_else(|| panic!("{tier:?} should yield a tool set"));
@@ -1719,6 +2014,8 @@ mod tests {
                 preamble: Some("You are a reviewer.".to_string()),
                 tool_allow: None,
                 max_turns: SUBAGENT_DEFAULT_MAX_TURNS,
+                timeout: std::time::Duration::from_secs(600),
+                tier: crate::context::agent_defs::SubagentToolTier::Toolless,
             },
         );
         set_subagent_routes(routes);

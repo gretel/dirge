@@ -81,6 +81,16 @@ impl Tool for TaskStatusTool {
         check_perm(&self.permission, &self.ask_tx, "task_status", &args.task_id).await?;
         let wait = args.wait.unwrap_or(false);
 
+        if let Some(generation) = self
+            .bg_store
+            .task_is_awaiting_coordinator_delivery(&args.task_id)
+        {
+            return Ok(format!(
+                "Task {} belongs to active coordinator batch {}; its result will be delivered at batch reconciliation.",
+                args.task_id, generation
+            ));
+        }
+
         if wait {
             // Hard cap so a stuck subagent (e.g. LLM hang) can't hold the
             // parent turn open forever. The agent should rely on the
@@ -196,6 +206,25 @@ mod tests {
             .unwrap();
         assert!(result.contains("state: completed"));
         assert!(result.contains("result text"));
+    }
+
+    #[tokio::test]
+    async fn coordinator_batch_hides_terminal_task_payload_until_delivery() {
+        let store = BackgroundStore::new();
+        store.enable_coordinator(crate::config::SubagentDispatchStrategy::Full);
+        store.insert_coordinated("first".to_string());
+        store.insert_coordinated("second".to_string());
+        store.notify("first", TaskState::Completed("secret result".to_string()));
+
+        let result = TaskStatusTool::new(store)
+            .call(TaskStatusArgs {
+                task_id: "first".to_string(),
+                wait: Some(true),
+            })
+            .await
+            .unwrap();
+        assert!(result.contains("coordinator batch"));
+        assert!(!result.contains("secret result"));
     }
 
     #[tokio::test]
