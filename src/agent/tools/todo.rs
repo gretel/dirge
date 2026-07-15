@@ -4,9 +4,11 @@
 //! Historically this was a throwaway in-memory checklist separate from the
 //! `issue` tool. The two have been consolidated: a todo IS an issue. Each
 //! `write_todo_list` call upserts its items into the project's `issues` table
-//! (see [`crate::extras::issue_db`]), scoped to the current session, so bulk
-//! planning gains the full issue lifecycle (open / in_progress / blocked /
-//! done / cancelled) and the model can rely on which items are still open.
+//! (see [`crate::extras::issue_db`]), scoped to the current session. Items go
+//! onto the ACTIVE work queue (you get nudged to finish them); omitting an item
+//! does NOT auto-close it — restate it as completed/cancelled. `issue create`,
+//! by contrast, files to the passive backlog (unassigned, not nudged) for later
+//! pickup via `issue start`.
 //!
 //! [`TODO_LIST`] is no longer the source of truth — it's a fast in-memory
 //! mirror of this session's live board that the right-pane panel and the
@@ -135,7 +137,7 @@ impl Tool for WriteTodoList {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         ToolDefinition {
             name: "write_todo_list".to_string(),
-            description: "Lay out or update a structured plan for a COMPLEX, MULTI-STEP task. Each item is a tracked issue on your persistent board (the same board the `issue` tool and /issues use), scoped to this session. Listing an item creates it or updates a matching one by title; statuses follow the issue lifecycle (pending|in_progress|completed|cancelled, plus blocked). Items you omit are NOT auto-closed — to finish one, restate it with status completed (or cancelled); the loop nudges you to finish or close open items before ending a turn. Use the `issue` tool for incremental single-item edits or cross-session work. Skip this for trivial single-step work; use `task` to delegate independent work to a background subagent.".to_string(),
+            description: "Lay out or update a structured plan for a COMPLEX, MULTI-STEP task. Each item is a tracked issue on your persistent board (the same board the `issue` tool and /issues use), scoped to this session. Listing an item creates it or updates a matching one by title (matched case/whitespace-insensitively); statuses follow the issue lifecycle (pending|in_progress|completed|cancelled, plus blocked). Items you omit are NOT auto-closed — to finish one, restate it with status completed (or cancelled), or close it by id with the `issue` tool (action=close). The loop nudges you to finish or close open items before ending a turn. Use the `issue` tool for incremental single-item edits or cross-session work. Skip this for trivial single-step work; use `task` to delegate independent work to a background subagent.".to_string(),
             parameters: serde_json::json!({
                 "type": "object",
                 "properties": {

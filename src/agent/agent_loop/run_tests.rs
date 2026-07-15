@@ -3714,6 +3714,7 @@ async fn finalization_hook_short_circuits_lower_gates() {
         None,
         None,
         &mut 0u8,
+        &mut 0u8, // track_nudges
         &review_emit,
     )
     .await;
@@ -3833,6 +3834,7 @@ async fn finalization_all_gates_silent_yields_none() {
         None,
         None,
         &mut 0u8,
+        &mut 0u8, // track_nudges
         &review_emit,
     )
     .await;
@@ -3875,6 +3877,7 @@ async fn finalization_goal_unmet_reenters_and_counts() {
         None,
         None,
         &mut 0u8,
+        &mut 0u8, // track_nudges
         &review_emit,
     )
     .await;
@@ -3915,6 +3918,7 @@ async fn finalization_goal_met_finalizes() {
         None,
         None,
         &mut 0u8,
+        &mut 0u8, // track_nudges
         &review_emit,
     )
     .await;
@@ -3956,6 +3960,7 @@ async fn finalization_goal_bound_stops_reentry() {
         None,
         None,
         &mut 0u8,
+        &mut 0u8, // track_nudges
         &review_emit,
     )
     .await;
@@ -3994,6 +3999,7 @@ async fn finalization_goal_without_judge_is_inert() {
         None,
         None,
         &mut 0u8,
+        &mut 0u8, // track_nudges
         &review_emit,
     )
     .await;
@@ -4021,7 +4027,7 @@ async fn open_issues_gate_off_is_inert() {
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
     let sid = "open-issues-off-sess";
     store
-        .create("wire up telemetry", "", None, Some(sid))
+        .create("wire up telemetry", "", None, Some(sid), None)
         .unwrap();
 
     let (msgs, source) = poll_finalization_follow_up(
@@ -4040,6 +4046,7 @@ async fn open_issues_gate_off_is_inert() {
         Some(db_path.as_path()),
         Some(sid),
         &mut open_issues_nudges,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -4069,10 +4076,10 @@ async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
     let sid = "open-issues-blocking-sess";
     store
-        .create("wire up telemetry", "", None, Some(sid))
+        .create("wire up telemetry", "", None, Some(sid), None)
         .unwrap();
     store
-        .create("add metrics dashboard", "", None, Some(sid))
+        .create("add metrics dashboard", "", None, Some(sid), None)
         .unwrap();
 
     let (msgs, source) = poll_finalization_follow_up(
@@ -4091,6 +4098,7 @@ async fn open_issues_gate_blocking_with_session_open_issues_nudges() {
         Some(db_path.as_path()),
         Some(sid),
         &mut open_issues_nudges,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -4129,7 +4137,7 @@ async fn open_issues_gate_blocking_has_bound() {
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
     let sid = "open-issues-bound-sess";
     store
-        .create("wire up telemetry", "", None, Some(sid))
+        .create("wire up telemetry", "", None, Some(sid), None)
         .unwrap();
 
     let (msgs, source) = poll_finalization_follow_up(
@@ -4148,6 +4156,7 @@ async fn open_issues_gate_blocking_has_bound() {
         Some(db_path.as_path()),
         Some(sid),
         &mut open_issues_nudges,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -4192,6 +4201,7 @@ async fn open_issues_gate_zero_open_session_issues_is_inert() {
         Some(db_path.as_path()),
         Some(sid),
         &mut open_issues_nudges,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -4230,6 +4240,7 @@ async fn open_issues_gate_missing_db_is_inert() {
         None, // no db
         Some("some-sess"),
         &mut open_issues_nudges,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -4256,7 +4267,7 @@ async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
     let sid = "open-issues-advisory-sess";
     store
-        .create("wire up telemetry", "", None, Some(sid))
+        .create("wire up telemetry", "", None, Some(sid), None)
         .unwrap();
 
     let (msgs, source) = poll_finalization_follow_up(
@@ -4275,6 +4286,7 @@ async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
         Some(db_path.as_path()),
         Some(sid),
         &mut open_issues_nudges,
+        &mut 0u8,
         &review_emit,
     )
     .await;
@@ -4296,6 +4308,52 @@ async fn open_issues_gate_advisory_emits_notice_but_does_not_reenter() {
     }
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── track-work advisory (R3): edited files but no active todo ──────────────
+
+/// An assistant turn whose only content is a single call to `tool`.
+fn assistant_calling(tool: &str) -> LoopMessage {
+    LoopMessage::Assistant(AssistantMessage::new(
+        vec![ContentBlock::ToolCall {
+            id: "tc1".into(),
+            name: tool.into(),
+            arguments: serde_json::json!({}),
+        }],
+        StopReason::ToolUse,
+    ))
+}
+
+#[test]
+fn turn_made_file_edits_detects_edit_tools_only() {
+    assert!(turn_made_file_edits(&[assistant_calling("edit")]));
+    assert!(turn_made_file_edits(&[assistant_calling("write")]));
+    assert!(turn_made_file_edits(&[assistant_calling("apply_patch")]));
+    // Read-only / execute-only turns are not "file edits".
+    assert!(!turn_made_file_edits(&[assistant_calling("read")]));
+    assert!(!turn_made_file_edits(&[assistant_calling("bash")]));
+    assert!(!turn_made_file_edits(&[]));
+}
+
+/// The advisory fires only when a real session made file edits with an empty
+/// active list and the one-shot budget is unspent. Pure — no global mirror.
+#[test]
+fn should_advise_untracked_work_gate() {
+    // Fires: session + edits + empty list + budget available.
+    assert!(should_advise_untracked_work(Some("s"), 0, 0, true));
+    // No file edits this turn → nothing to track.
+    assert!(!should_advise_untracked_work(Some("s"), 0, 0, false));
+    // Active todos already exist → the ordinary todo nudge covers it.
+    assert!(!should_advise_untracked_work(Some("s"), 0, 2, true));
+    // No session (e.g. --no-session / a fork) → never advise.
+    assert!(!should_advise_untracked_work(None, 0, 0, true));
+    // One-shot: budget spent.
+    assert!(!should_advise_untracked_work(
+        Some("s"),
+        MAX_TRACK_NUDGES,
+        0,
+        true
+    ));
 }
 
 fn temp_dir(suffix: &str) -> std::path::PathBuf {
@@ -4428,9 +4486,8 @@ async fn failure_then_success_injects_no_checkpoint() {
     );
 }
 
-// dirge-x6yi: the turn-start issue-board reminder does synchronous rusqlite
-// I/O (open + query). run_agent_loop now hands it to spawn_blocking so a
-// contended/locked state.db can't stall the loop task. The extracted reader
+// dirge-x6yi: the turn-start issue-board reminder now produces separate
+// Active / Backlog sections via `board_reminder_split`. The extracted reader
 // keeps the same behavior — a real board yields the reminder, a missing db
 // yields None without panicking.
 #[test]
@@ -4447,15 +4504,27 @@ fn issue_board_reminder_block_reads_board_and_tolerates_missing_db() {
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = dir.join("state.db");
 
+    // Unassigned (passive) issue: appears under Backlog section.
     let store = crate::extras::issue_db::IssueStore::open_at(&db_path).unwrap();
-    store.create("wire up telemetry", "", None, None).unwrap();
+    store
+        .create("wire up telemetry", "", None, None, None)
+        .unwrap();
 
-    let block =
-        super::issue_board_reminder_block(&db_path).expect("a non-empty board yields a reminder");
+    let block = super::issue_board_reminder_block(&db_path, Some("sess-1"))
+        .expect("a non-empty board yields a reminder");
+    // Passive issue → Backlog section, not Active.
+    assert!(
+        block.contains("Backlog"),
+        "passive issue must be in Backlog section: {block}"
+    );
+    assert!(
+        !block.contains("Active work queue"),
+        "no active issues → no Active section: {block}"
+    );
     assert!(block.contains("wire up telemetry"), "{block}");
 
     // Missing db → best-effort None, no panic.
-    assert!(super::issue_board_reminder_block(&dir.join("nope.db")).is_none());
+    assert!(super::issue_board_reminder_block(&dir.join("nope.db"), Some("sess-1")).is_none());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

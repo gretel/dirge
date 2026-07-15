@@ -137,6 +137,10 @@ const MAX_TODO_NUDGES: u8 = 3;
 /// forever if it can't or won't close the remaining issues.
 const MAX_OPEN_ISSUES_NUDGES: u8 = 2;
 
+/// One-shot: fire at most once per run when the model edits files but has
+/// no active todo — a gap the normal unfinished-todo nudge can't cover.
+const MAX_TRACK_NUDGES: u8 = 1;
+
 /// Consecutive errored tool results before the failure tracker injects a
 /// recovery checkpoint. Tuned low — the tool-repair literature finds the
 /// gains from corrective reflection concentrate over the first few
@@ -311,6 +315,8 @@ async fn poll_finalization_follow_up(
     issue_db_path: Option<&std::path::Path>,
     session_id: Option<&str>,
     open_issues_nudges: &mut u8,
+    // dirge-track: file-edits-without-todos advisory — one-shot per run.
+    track_nudges: &mut u8,
     emit: &mpsc::Sender<LoopEvent>,
 ) -> (Vec<LoopMessage>, FollowUpSource) {
     // 1. Caller hook (pi lines 256-262) — highest priority.
@@ -617,6 +623,21 @@ async fn poll_finalization_follow_up(
             }
         }
     }
+    // dirge-track: file-edits-without-todos advisory — fires at most once per
+    // run when the model edited files this turn but has no active todo tracked.
+    if should_advise_untracked_work(
+        session_id,
+        *track_nudges,
+        crate::agent::tools::todo::unfinished_count(),
+        turn_made_file_edits(new_messages),
+    ) {
+        *track_nudges += 1;
+        let _ = emit
+            .send(LoopEvent::SystemNotice {
+                content: "You modified files this turn but have no active todo. If this task isn't finished, add it with write_todo_list and mark it in_progress so it stays your tracked priority (and gets closed when done).".to_string(),
+            })
+            .await;
+    }
     (Vec::new(), FollowUpSource::None)
 }
 
@@ -698,20 +719,26 @@ const MAX_CONSECUTIVE_COMPACTION_FAILURES: u32 = 3;
 /// when the task matches fewer exemplars.
 const EXEMPLAR_TOP_K: usize = 3;
 
-/// Max live issues surfaced in the turn-start board reminder. The rest are
-/// summarized as a "+N more" hint so a large backlog can't flood context.
-const ISSUE_BOARD_TOP_N: usize = 7;
+/// Max live ACTIVE issues surfaced in the turn-start "Active work queue" section.
+/// The rest get a "+N more" hint so a large active board can't flood context.
+const ACTIVE_TOP_N: usize = 7;
 
-/// dirge-x6yi: open the issue DB and build the turn-start board reminder.
-/// This is synchronous rusqlite I/O (open + query), so `run_agent_loop`
-/// hands it to `spawn_blocking` — a contended/locked `state.db` must not
-/// stall the whole loop task (mirrors the pre-recall search path). Returns
-/// `None` on any failure (missing/locked db, empty board); the reminder is
-/// best-effort context, never fatal.
-fn issue_board_reminder_block(db_path: &std::path::Path) -> Option<String> {
+/// Max live BACKLOG issues surfaced in the turn-start "Backlog" section.
+const BACKLOG_TOP_N: usize = 5;
+
+/// dirge-x6yi: open the issue DB and build the turn-start board reminder with
+/// separate active / backlog sections. This is synchronous rusqlite I/O (open +
+/// query), so `run_agent_loop` hands it to `spawn_blocking` — a contended/locked
+/// `state.db` must not stall the whole loop task (mirrors the pre-recall search
+/// path). Returns `None` on any failure (missing/locked db, empty board); the
+/// reminder is best-effort context, never fatal.
+fn issue_board_reminder_block(
+    db_path: &std::path::Path,
+    session_id: Option<&str>,
+) -> Option<String> {
     crate::extras::issue_db::IssueStore::open_at(db_path)
         .ok()?
-        .board_reminder(ISSUE_BOARD_TOP_N)
+        .board_reminder_split(session_id, ACTIVE_TOP_N, BACKLOG_TOP_N)
         .ok()
         .flatten()
 }
@@ -1341,9 +1368,12 @@ pub async fn run_agent_loop(
         let db_path = std::env::current_dir()
             .map(|c| crate::extras::dirge_paths::ProjectPaths::new(&c).session_db_path())
             .unwrap_or_else(|_| std::path::PathBuf::from(".dirge/sessions/state.db"));
+        let sid = config.session_id.clone();
         // dirge-x6yi: run the blocking open+query off the loop task.
-        if let Ok(Some(block)) =
-            tokio::task::spawn_blocking(move || issue_board_reminder_block(&db_path)).await
+        if let Ok(Some(block)) = tokio::task::spawn_blocking(move || {
+            issue_board_reminder_block(&db_path, sid.as_deref())
+        })
+        .await
         {
             let msg = LoopMessage::User(super::message::UserMessage::text(block));
             context.messages.push(loop_message_to_value(&msg));
@@ -1524,6 +1554,9 @@ pub async fn run_loop(
 
     // dirge-ksjl: open-issues gate counter (bounded by MAX_OPEN_ISSUES_NUDGES).
     let mut open_issues_nudges: u8 = 0;
+
+    // dirge-track: file-edits-without-tracked-todos advisory (one-shot).
+    let mut track_nudges: u8 = 0;
 
     // Compute the issue db path once for both the issue-board reminder and
     // the open-issues gate. Fail-open: absent db → None, gate is inert.
@@ -2386,6 +2419,7 @@ pub async fn run_loop(
             issue_db_path.as_deref(),
             config.session_id.as_deref(),
             &mut open_issues_nudges,
+            &mut track_nudges,
             emit,
         )
         .await;
@@ -2422,6 +2456,39 @@ pub async fn run_loop(
 /// inline so `run.rs` doesn't reach into `tools` for tiny helpers.
 fn extract_tool_calls_from(msg: &AssistantMessage) -> Vec<super::tools::ToolCall> {
     super::tools::extract_tool_calls(msg)
+}
+
+/// Pure decision for the untracked-work advisory (dirge-track): fire when a
+/// real session made file edits this turn but is tracking no active todo, and
+/// the one-shot budget isn't spent. Split out from `poll_finalization_follow_up`
+/// so the gate is unit-testable without the process-global TODO_LIST mirror
+/// that `unfinished_count()` reads. When `unfinished > 0` the ordinary todo
+/// nudge already covers it, so this only handles the empty-list gap.
+fn should_advise_untracked_work(
+    session_id: Option<&str>,
+    track_nudges: u8,
+    unfinished: usize,
+    made_file_edits: bool,
+) -> bool {
+    session_id.is_some() && track_nudges < MAX_TRACK_NUDGES && unfinished == 0 && made_file_edits
+}
+
+/// Did any assistant turn this finalization cycle contain a file-edit tool
+/// call (write, edit, apply_patch, etc.)? Read-only / execute-only turns
+/// (read, grep, bash, etc.) return false.
+fn turn_made_file_edits(new_messages: &[LoopMessage]) -> bool {
+    for msg in new_messages {
+        if let LoopMessage::Assistant(a) = msg {
+            for tc in extract_tool_calls_from(a) {
+                if crate::permission::engine::tool_operation(&tc.name)
+                    == crate::permission::engine::types::Operation::Edit
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 /// Did this run actually use tools? Gates the F6 critic so pure Q&A turns
