@@ -268,6 +268,7 @@ pub async fn build_rooted_writer_tools(
     }
 
     let cache = ToolCache::new();
+    let shell_store = tools::bg_shell::BackgroundShellStore::new();
     let mut writer_tools: Vec<Arc<dyn LoopTool>> = Vec::new();
 
     writer_tools.push(
@@ -380,13 +381,13 @@ pub async fn build_rooted_writer_tools(
         wrap(
             tools::BashTool::with_cache(permission, ask_tx, sandbox, cache)
                 .with_execution_root(Some(execution_root))
-                .with_shell_store(Some(tools::bg_shell::global())),
+                .with_shell_store(Some(shell_store.clone())),
             Some(ToolExecutionMode::Sequential),
         )
         .await,
     );
-    writer_tools.push(wrap(tools::BashOutputTool::new(tools::bg_shell::global()), None).await);
-    writer_tools.push(wrap(tools::KillShellTool::new(tools::bg_shell::global()), None).await);
+    writer_tools.push(wrap(tools::BashOutputTool::new(shell_store.clone()), None).await);
+    writer_tools.push(wrap(tools::KillShellTool::new(shell_store), None).await);
 
     writer_tools
 }

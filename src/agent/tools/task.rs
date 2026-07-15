@@ -840,14 +840,26 @@ impl TaskTool {
                     match create_writer_worktree(&task_id) {
                         Ok(info) => {
                             let main_git_dir = info.main_repo_path.join(".git");
-                            let base_commit =
-                                crate::extras::git_worktree::head_commit(&info.main_repo_path)
-                                    .map_err(ToolError::Msg)?;
+                            let base_commit = match crate::extras::git_worktree::head_commit(
+                                &info.main_repo_path,
+                            ) {
+                                Ok(commit) => commit,
+                                Err(error) => {
+                                    let _ = crate::extras::git_worktree::remove_worktree_if_clean(
+                                        &info,
+                                    );
+                                    self.bg_store
+                                        .notify(&task_id, TaskState::Failed(error.clone()));
+                                    return Err(ToolError::Msg(error));
+                                }
+                            };
                             if let Err(error) = self.bg_store.set_coordinator_dispatch_worktree(
                                 &task_id,
                                 info.branch.clone(),
                                 info.worktree_path.display().to_string(),
                             ) {
+                                let _ =
+                                    crate::extras::git_worktree::remove_worktree_if_clean(&info);
                                 self.bg_store
                                     .notify(&task_id, TaskState::Failed(error.clone()));
                                 return Err(ToolError::Msg(error));
@@ -857,6 +869,10 @@ impl TaskTool {
                             Some((info, main_git_dir, base_commit))
                         }
                         Err(_) if self.write_isolation == SubagentWriteIsolation::Auto => {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                "worktree writer isolation unavailable; falling back to serialized parent checkout"
+                            );
                             if let Err(error) = self
                                 .bg_store
                                 .set_coordinator_dispatch_isolated(&task_id, false)
@@ -876,6 +892,10 @@ impl TaskTool {
                     #[cfg(not(feature = "git-worktree"))]
                     {
                         if self.write_isolation == SubagentWriteIsolation::Auto {
+                            tracing::warn!(
+                                task_id = %task_id,
+                                "git-worktree support is unavailable; falling back to serialized parent checkout"
+                            );
                             if let Err(error) = self
                                 .bg_store
                                 .set_coordinator_dispatch_isolated(&task_id, false)
@@ -934,46 +954,65 @@ impl TaskTool {
                         .unwrap_or(SUBAGENT_DEFAULT_PREAMBLE)
                         .to_string()
                 };
-                let runner =
-                    if let Some((info, main_git_dir, _)) = rooted_worktree_for_task.as_ref() {
-                        let worktree = info.worktree_path.clone();
-                        let root = match crate::agent::tools::ToolRoot::new(&worktree) {
-                            Ok(root) => root,
-                            Err(error) => {
-                                store_for_task
-                                    .notify(&tid_for_task, TaskState::Failed(error.to_string()));
-                                return;
+                let runner = if let Some((info, main_git_dir, base_commit)) =
+                    rooted_worktree_for_task.as_ref()
+                {
+                    let worktree = info.worktree_path.clone();
+                    let root = match crate::agent::tools::ToolRoot::new(&worktree) {
+                        Ok(root) => root,
+                        Err(error) => {
+                            let state = TaskState::Failed(error.to_string());
+                            let commits = crate::extras::git_worktree::worktree_commits_since(
+                                info,
+                                base_commit,
+                            )
+                            .unwrap_or_default();
+                            let dirty = crate::extras::git_worktree::worktree_is_dirty(info)
+                                .unwrap_or(true);
+                            let retained = dirty || !commits.is_empty();
+                            if !retained {
+                                let _ = crate::extras::git_worktree::remove_worktree_if_clean(info);
                             }
-                        };
-                        let tools = crate::agent::builder::build_rooted_writer_tools(
-                            root,
-                            permission_for_task,
-                            ask_tx_for_task,
-                            sandbox_for_task,
-                            crate::sandbox::SandboxExecutionRoot {
-                                worktree,
-                                main_git_dir: main_git_dir.clone(),
-                            },
-                        )
-                        .await;
-                        agent.spawn_subagent_runner_with_tools(
-                            prompt.clone(),
-                            system_prompt,
-                            tools,
-                            &child_sid,
-                            max_turns,
-                            model_for_task.as_ref(),
-                        )
-                    } else {
-                        agent.spawn_subagent_runner(
-                            prompt.clone(),
-                            system_prompt,
-                            &allowed_for_task,
-                            &child_sid,
-                            max_turns,
-                            model_for_task.as_ref(),
-                        )
+                            store_for_task.set_coordinator_dispatch_worktree_outcome(
+                                &tid_for_task,
+                                commits,
+                                dirty,
+                                retained,
+                            );
+                            store_for_task.unregister_writer_worktree(&tid_for_task);
+                            store_for_task.notify(&tid_for_task, state);
+                            return;
+                        }
                     };
+                    let tools = crate::agent::builder::build_rooted_writer_tools(
+                        root,
+                        permission_for_task,
+                        ask_tx_for_task,
+                        sandbox_for_task,
+                        crate::sandbox::SandboxExecutionRoot {
+                            worktree,
+                            main_git_dir: main_git_dir.clone(),
+                        },
+                    )
+                    .await;
+                    agent.spawn_subagent_runner_with_tools(
+                        prompt.clone(),
+                        system_prompt,
+                        tools,
+                        &child_sid,
+                        max_turns,
+                        model_for_task.as_ref(),
+                    )
+                } else {
+                    agent.spawn_subagent_runner(
+                        prompt.clone(),
+                        system_prompt,
+                        &allowed_for_task,
+                        &child_sid,
+                        max_turns,
+                        model_for_task.as_ref(),
+                    )
+                };
                 let abort_watcher = spawn_abort_watcher(
                     abort_for_task.clone(),
                     runner.task.abort_handle(),
@@ -997,7 +1036,7 @@ impl TaskTool {
                         let aborted_msg = "aborted by user".to_string();
                         if aborted {
                             (
-                                TaskState::Failed(aborted_msg.clone()),
+                                TaskState::Cancelled(aborted_msg.clone()),
                                 Some(SubagentChatEvent::Aborted {
                                     id: tid_for_task.clone(),
                                 }),
@@ -1433,7 +1472,7 @@ impl Tool for TaskTool {
                         // dirge-781c: aborted via /kill.
                         let msg = "aborted by user".to_string();
                         (
-                            TaskState::Failed(msg.clone()),
+                            TaskState::Cancelled(msg.clone()),
                             SubagentChatEvent::Aborted {
                                 id: tid_for_task.clone(),
                             },

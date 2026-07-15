@@ -127,6 +127,12 @@ impl Tool for TaskStatusTool {
                                 args.task_id, err
                             ));
                         }
+                        TaskState::Cancelled(reason) => {
+                            return Ok(format!(
+                                "task_id: {}\nstate: cancelled\n\nreason: {}",
+                                args.task_id, reason
+                            ));
+                        }
                     },
                     None => {
                         return Err(ToolError::Msg(format!(
@@ -147,6 +153,10 @@ impl Tool for TaskStatusTool {
                     TaskState::Failed(err) => Ok(format!(
                         "task_id: {}\nstate: failed\n\nerror: {}",
                         args.task_id, err
+                    )),
+                    TaskState::Cancelled(reason) => Ok(format!(
+                        "task_id: {}\nstate: cancelled\n\nreason: {}",
+                        args.task_id, reason
                     )),
                 },
                 None => Err(ToolError::Msg(format!(

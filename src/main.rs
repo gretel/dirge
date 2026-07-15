@@ -1705,8 +1705,13 @@ async fn main() -> anyhow::Result<()> {
                         format!("{} ({:?})", definition.name, definition.subagent.tier)
                     })
                     .collect::<Vec<_>>();
+                let strategy_name = match coordinator_strategy {
+                    config::SubagentDispatchStrategy::Optional => "optional",
+                    config::SubagentDispatchStrategy::Full => "full",
+                    config::SubagentDispatchStrategy::Off => "off",
+                };
                 let diagnostic = format!(
-                    "subagent_dispatch_strategy=full requires both coordinator tiers and enabled tools. found: {}; missing: {}{}",
+                    "subagent_dispatch_strategy={strategy_name} requires both coordinator tiers and enabled tools. found: {}; missing: {}{}",
                     if found.is_empty() {
                         "none".to_string()
                     } else {

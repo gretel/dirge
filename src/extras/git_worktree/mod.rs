@@ -207,7 +207,9 @@ pub fn worktree_commits_since(info: &WorktreeInfo, base: &str) -> Result<Vec<Str
 
 #[allow(dead_code)]
 pub fn remove_worktree_if_clean(info: &WorktreeInfo) -> Result<bool, String> {
-    if worktree_is_dirty(info)? {
+    if worktree_is_dirty(info)?
+        || !worktree_commits_since(info, &head_commit(&info.main_repo_path)?)?.is_empty()
+    {
         return Ok(false);
     }
     remove_worktree(&info.main_repo_path, &info.worktree_path)?;
@@ -518,6 +520,24 @@ mod merge_tests {
         assert!(
             err.contains("uncommitted"),
             "error names the dirty state: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn committed_worktree_is_retained_by_clean_only_removal() {
+        let (info, root) = setup();
+        write(&info.worktree_path.join("committed.txt"), "retain me\n");
+        git(&info.worktree_path, &["add", "."]);
+        git(&info.worktree_path, &["commit", "-m", "retain worktree"]);
+
+        assert!(
+            !remove_worktree_if_clean(&info).expect("retention check succeeds"),
+            "committed worktree must remain available for salvage"
+        );
+        assert!(
+            info.worktree_path.exists(),
+            "committed checkout is retained"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

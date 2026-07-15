@@ -56,7 +56,7 @@ Isolated writers may run concurrently, subject to the four-subagent cap. Seriali
 
 A worktree requires the `git-worktree` feature, a canonical Git session repository, a clean parent working tree according to `git status --porcelain`, supported sandbox mode, and successful worktree creation. Ignored scratch files do not make that porcelain status dirty. The clean-parent requirement prevents writers from missing uncommitted parent changes because linked worktrees begin at committed `HEAD`.
 
-Names are safe single components, for example `dirge/subagent-<task8>` and `dirge-wt-<task8>`. Creation validates repository, branch, and directory inputs, uses argument vectors and Git `--` separators where supported, and cleans up a newly created worktree if later setup fails.
+Names use a safe full task UUID: `dirge-task-<task-uuid>` for both the branch and sibling worktree directory. Creation validates repository, branch, and directory inputs, uses argument vectors and Git `--` separators where supported, and cleans up a newly created worktree if later setup fails.
 
 MicroVM does not support isolated writers: `auto` warns and serializes, `worktree` rejects, and `serialize` remains shared-checkout behavior.
 
@@ -78,13 +78,13 @@ The writer preamble identifies the root and branch, prohibits parent-checkout mo
 
 Rust never auto-merges writer branches. The coordinator retains committed worktrees for reconciliation and merges valid branches through normal Git tools after resolving conflicts against the retained plan. Reviewers inspect the integrated parent tree only after that merge.
 
-Clean worktrees without useful committed work may be removed best-effort. Failed, timed-out, and cancelled worktrees are removed only when clean. Dirty worktrees remain for salvage, and `cancel_all()` performs clean-only cleanup. Crash leftovers are recoverable with `git worktree prune`.
+Clean worktrees without useful committed work may be removed best-effort. Failed, timed-out, and cancelled worktrees are removed only when clean and contain no commits. Dirty worktrees and clean committed worktrees remain for salvage, and `cancel_all()` performs the same retention-aware cleanup. Crash leftovers are recoverable with `git worktree prune`.
 
 The single terminal reconciliation continuation includes every dispatch's original prompt and outcome, retry status, output-relay reference when applicable, and writer branch, path, commits, clean/dirty state, and retained salvage path. Before the next dispatch, repair, merge, or verification decision, the coordinator creates an internal status summary covering completed work, failures, remaining requirements, required verification, and the next action.
 
 ## Verification
 
-The runtime contract is covered by focused checks for configuration tolerance; profile resolution and activation; timeout and route metadata; generation barriers and synthetic failures; retry limits; writer exclusion and isolation fallback; worktree validation and clean-only cleanup; rooted path and Bash confinement; permission scoping; Bwrap commit behavior with an unchanged parent source tree; and reconciliation metadata.
+The runtime has focused checks for configuration tolerance; profile resolution and activation; timeout and route metadata; generation barriers and synthetic failures; retry limits; writer exclusion and isolation fallback; worktree validation and clean-only cleanup; rooted path and Bash confinement; permission scoping; Bwrap commit behavior with an unchanged parent source tree; and reconciliation metadata. Run the relevant checks below when changing those areas.
 
 Run the relevant checks, including:
 
