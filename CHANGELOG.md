@@ -4,6 +4,23 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.7] - 2026-07-14
+
+### Fixed
+- LSP servers (rust-analyzer and friends), MCP servers, DAP adapters, and
+  background shells were orphaned when dirge itself was killed by a signal —
+  SIGTERM (`kill`), SIGHUP (terminal or tab closed), or SIGINT. They are
+  spawned with `setsid` so terminal-delivered signals never reach them, and
+  the `kill(-pgid)` that reaps them only runs from a guard's `Drop`, which a
+  signal exit skips. A leaked rust-analyzer kept indexing the workspace and
+  held 1 GB+ of RAM. dirge now tracks every detached child process group and,
+  on SIGINT/SIGTERM/SIGHUP, kills them all, restores the terminal, and exits
+  (dirge-6klk).
+- LSP servers were SIGKILLed on shutdown without the `shutdown`/`exit`
+  handshake, so they never got to flush or persist state. dirge now sends the
+  handshake on the normal teardown path, falling back to the group kill
+  (dirge-8m69).
+
 ## [0.19.6] - 2026-07-14
 
 ### Added
