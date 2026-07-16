@@ -3677,18 +3677,35 @@ pub async fn run_interactive(
                                     renderer.write_line(&format!("[plugin] {}", err), c_error())?;
                                 }
                                 // Apply a prepare-next-run model swap on-loop (agent
-                                // rebuild) before the tail runs.
+                                // rebuild) before the tail runs. dirge-m6ut: the
+                                // client swap happens FIRST, while `&mut client` is
+                                // still free — after this `make_agent_build_deps!`
+                                // borrows the (possibly new) client immutably.
                                 #[cfg(feature = "plugin")]
                                 if let Some(next_model) = result.next_model {
-                                    let mut ctx = make_run_ctx!();
-                                    run_handlers::done::apply_next_model(
-                                        &mut ctx,
-                                        &mut agent,
-                                        context,
-                                        &make_agent_build_deps!(),
+                                    match run_handlers::done::prepare_next_model_client(
+                                        &mut client,
+                                        &mut renderer,
+                                        session,
+                                        cfg,
                                         &next_model,
-                                    )
-                                    .await?;
+                                    )? {
+                                        run_handlers::done::NextModelAction::Skip => {}
+                                        run_handlers::done::NextModelAction::Apply {
+                                            swapped_provider,
+                                        } => {
+                                            let mut ctx = make_run_ctx!();
+                                            run_handlers::done::apply_next_model(
+                                                &mut ctx,
+                                                &mut agent,
+                                                context,
+                                                &make_agent_build_deps!(),
+                                                &next_model,
+                                                swapped_provider,
+                                            )
+                                            .await?;
+                                        }
+                                    }
                                 }
                                 let mut ctx = make_run_ctx!();
                                 #[cfg(feature = "loop")]
