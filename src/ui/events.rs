@@ -157,6 +157,40 @@ pub(crate) fn finalization_nudge_body(content: &str) -> Option<&str> {
     .find_map(|tag| trimmed.strip_prefix(tag).map(str::trim_start))
 }
 
+/// Resolve the `(provider, model)` pair the banner should display, preferring
+/// the session's live values and falling back to CLI/config resolution only
+/// when the session carries neither (dirge-cfaw). Kept pure and separate so the
+/// precedence is unit-testable without a `Renderer`.
+fn banner_provider_model(
+    session: &Session,
+    cli: &Cli,
+    cfg: &Config,
+) -> (compact_str::CompactString, compact_str::CompactString) {
+    let provider = if session.provider.is_empty() {
+        cli.resolve_provider(cfg)
+    } else {
+        session.provider.clone()
+    };
+    let model = if session.model.is_empty() {
+        let config_model = cfg
+            .resolve_role(crate::config::ConfigRole::Default)
+            .and_then(|(_, e)| e.model);
+        if cli.model.is_none() && config_model.is_none() {
+            // dirge-j3jd: resolve the alias's provider TYPE so a custom alias
+            // doesn't fall back to the OpenRouter default model id.
+            compact_str::CompactString::new(crate::provider::default_model_for_alias(
+                &provider,
+                &cfg.providers_map(),
+            ))
+        } else {
+            cli.resolve_model(cfg)
+        }
+    } else {
+        session.model.clone()
+    };
+    (provider, model)
+}
+
 pub fn render_session(
     renderer: &mut Renderer,
     session: &Session,
@@ -165,20 +199,14 @@ pub fn render_session(
     context: &ContextFiles,
 ) -> anyhow::Result<()> {
     renderer.clear_content()?;
-    let provider = cli.resolve_provider(cfg);
-    let config_model = cfg
-        .resolve_role(crate::config::ConfigRole::Default)
-        .and_then(|(_, e)| e.model);
-    let model = if cli.model.is_none() && config_model.is_none() {
-        // dirge-j3jd: resolve the alias's provider TYPE so a custom alias
-        // doesn't fall back to the OpenRouter default model id.
-        compact_str::CompactString::new(crate::provider::default_model_for_alias(
-            &provider,
-            &cfg.providers_map(),
-        ))
-    } else {
-        cli.resolve_model(cfg)
-    };
+    // dirge-cfaw: the banner reflects the SESSION's live provider/model, not a
+    // fresh CLI/config re-resolution. The session is the source of truth after
+    // a `/model` switch (which can hop providers) and on resume (which adopts
+    // the saved provider); re-resolving here showed the config default instead
+    // — e.g. `deepseek/deepseek-v4-pro` right after switching to glm. Fall back
+    // to CLI/config only if the session somehow carries no provider/model
+    // (defaults are empty strings), so a degenerate session still renders.
+    let (provider, model) = banner_provider_model(session, cli, cfg);
     // Top padding rows. Without this, when the user scrolls all the
     // way up, the banner's top border `╭───╮` sits pressed against
     // the terminal's top edge, which reads as "cut off." Two blank
@@ -522,6 +550,38 @@ mod tests {
 
     fn make_session() -> Session {
         Session::new("openrouter", "gpt-5", 200_000)
+    }
+
+    /// dirge-cfaw: the banner reads the session's live provider/model, so a
+    /// `/model` cross-provider switch or a resumed session is reflected —
+    /// instead of a fresh CLI/config re-resolution that ignored both.
+    #[test]
+    fn banner_prefers_session_provider_and_model() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::parse_from::<_, &str>(["dirge"]);
+        let cfg = crate::config::Config::default();
+        // Session was switched to glm/glm-4.6; CLI/config carry neither.
+        let mut session = Session::new("glm", "glm-4.6", 200_000);
+        session.provider = compact_str::CompactString::new("glm");
+        session.model = compact_str::CompactString::new("glm-4.6");
+        let (provider, model) = banner_provider_model(&session, &cli, &cfg);
+        assert_eq!(provider, "glm");
+        assert_eq!(model, "glm-4.6");
+    }
+
+    /// A session that carries no provider/model (empty defaults) still renders
+    /// by falling back to CLI/config resolution rather than showing blanks.
+    #[test]
+    fn banner_falls_back_when_session_has_no_provider_model() {
+        use clap::Parser;
+        let cli = crate::cli::Cli::parse_from::<_, &str>(["dirge"]);
+        let cfg = crate::config::Config::default();
+        let mut session = Session::new("", "", 200_000);
+        session.provider = compact_str::CompactString::new("");
+        session.model = compact_str::CompactString::new("");
+        let (provider, model) = banner_provider_model(&session, &cli, &cfg);
+        assert!(!provider.is_empty(), "provider should fall back, not blank");
+        assert!(!model.is_empty(), "model should fall back, not blank");
     }
 
     #[test]

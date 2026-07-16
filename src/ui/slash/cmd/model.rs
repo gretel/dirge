@@ -7,6 +7,7 @@ use crate::sync_util::LockExt;
 use compact_str::CompactString;
 
 use crate::config::ProviderEntry;
+use crate::provider::{ModelSwitch, resolve_model_switch};
 use crate::ui::slash::cmd::agent;
 use crate::ui::slash::{SlashCtx, c_agent, c_error, c_result};
 
@@ -30,24 +31,6 @@ fn configured_models(
         .collect();
     rows.sort();
     rows
-}
-
-/// If `model` is the model pinned by a configured provider *other than*
-/// `active`, return that provider's alias — signalling that `/model <model>`
-/// should switch the live client to it, not just rename the model on the
-/// active provider. Returns `None` for a free-form id or a model on the active
-/// provider (keep the current client).
-fn cross_provider_target(
-    providers: &HashMap<String, ProviderEntry>,
-    active: &str,
-    model: &str,
-) -> Option<String> {
-    providers
-        .iter()
-        .find(|(alias, entry)| {
-            entry.model.as_deref() == Some(model) && !alias.eq_ignore_ascii_case(active)
-        })
-        .map(|(alias, _)| alias.clone())
 }
 
 pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow::Result<()> {
@@ -77,34 +60,57 @@ pub(crate) async fn cmd_model(ctx: &mut SlashCtx<'_>, parts: &[&str]) -> anyhow:
     } else {
         let new_model = CompactString::new(parts[1].trim());
 
-        // If the chosen model is one a *different* configured provider pins,
-        // switch the live client to that provider too — otherwise we'd send its
-        // model name to the active provider's endpoint (e.g. an ollama model to
-        // GLM, which 400s). Free-form ids and same-provider models keep the
-        // current client. The `/model` list shows `model · alias` rows, so this
-        // makes selecting a listed cross-provider model actually route there.
+        // Decide whether the chosen id routes to a *different* provider. An
+        // exact pin on another provider, or a free-form id whose family maps to
+        // a configured provider (e.g. `glm-4.6` while on deepseek), swaps the
+        // live client — otherwise we'd POST that id to the active endpoint and
+        // 404/401. Same-provider and unclassifiable ids keep the current client
+        // (dirge-cfaw).
         let providers = ctx.cfg.providers_map();
-        let target_alias = cross_provider_target(
+        let switch = resolve_model_switch(
             &providers,
             ctx.session.provider.as_str(),
             new_model.as_str(),
         );
 
         let mut switched_to: Option<String> = None;
-        if let Some(alias) = target_alias {
-            match crate::provider::create_client_with_auth(&alias, None, &providers, ctx.cfg.auth) {
-                Ok(new_client) => {
-                    *ctx.client = new_client;
-                    switched_to = Some(alias);
-                }
-                Err(e) => {
-                    ctx.renderer.write_line(
-                        &format!("could not switch to provider '{alias}': {e}"),
-                        c_error(),
-                    )?;
-                    return Ok(());
+        match switch {
+            ModelSwitch::Switch(alias) => {
+                match crate::provider::create_client_with_auth(
+                    &alias,
+                    None,
+                    &providers,
+                    ctx.cfg.auth,
+                ) {
+                    Ok(new_client) => {
+                        *ctx.client = new_client;
+                        switched_to = Some(alias);
+                    }
+                    Err(e) => {
+                        ctx.renderer.write_line(
+                            &format!("could not switch to provider '{alias}': {e}"),
+                            c_error(),
+                        )?;
+                        return Ok(());
+                    }
                 }
             }
+            ModelSwitch::NoProviderForFamily(family) => {
+                // The id looks like a `{family}` model but no provider of that
+                // kind is configured. Renaming it onto the active client would
+                // just point the session at a model that can't work, so refuse
+                // the switch and keep the session functional — telling the user
+                // how to make it routable (mirrors the plugin-swap skip).
+                ctx.renderer.write_line(
+                    &format!(
+                        "'{new_model}' matches the {family} model family, but no {family} provider is configured — keeping model '{}' on '{}'. Add a provider of type {family} to config.json to switch to it.",
+                        ctx.session.model, ctx.session.provider,
+                    ),
+                    c_error(),
+                )?;
+                return Ok(());
+            }
+            ModelSwitch::Keep => {}
         }
 
         ctx.session.model = new_model.clone();
@@ -167,34 +173,6 @@ mod tests {
             model: model.map(str::to_string),
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn cross_provider_target_finds_other_providers_model() {
-        let providers = HashMap::from([
-            ("glm".to_string(), entry(Some("glm-5.2"))),
-            ("ollama".to_string(), entry(Some("vibe-thinker:latest"))),
-        ]);
-        // Active = glm; picking ollama's model routes to the ollama provider.
-        assert_eq!(
-            cross_provider_target(&providers, "glm", "vibe-thinker:latest").as_deref(),
-            Some("ollama")
-        );
-    }
-
-    #[test]
-    fn cross_provider_target_none_for_active_providers_model() {
-        let providers = HashMap::from([
-            ("glm".to_string(), entry(Some("glm-5.2"))),
-            ("ollama".to_string(), entry(Some("vibe-thinker:latest"))),
-        ]);
-        // The model belongs to the active provider → no client swap.
-        assert_eq!(cross_provider_target(&providers, "glm", "glm-5.2"), None);
-        // A free-form id no provider pins → no swap (rename on current client).
-        assert_eq!(
-            cross_provider_target(&providers, "glm", "some-other-model"),
-            None
-        );
     }
 
     #[test]

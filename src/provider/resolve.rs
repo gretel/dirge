@@ -87,6 +87,161 @@ pub fn parse_provider(name: &str) -> Option<ProviderKind> {
     }
 }
 
+/// Infer the provider a model id belongs to from its name, for `/model`
+/// cross-provider routing (dirge-cfaw). `/model <id>` used to only swap the
+/// live client when `<id>` exactly matched another provider's pinned `model`;
+/// a free-form id (`glm-4.6`, a version bump, a typo) was renamed on the
+/// ACTIVE client instead and its first turn 404/401'd against the wrong
+/// endpoint. Mapping the id's family lets the command route it to a
+/// configured provider of that kind.
+///
+/// Only the well-known cloud families with unambiguous prefixes are matched.
+/// Local / self-hosted names (`llama3`, `vibe-thinker:latest`, a bare custom
+/// alias) are intentionally `None` — they carry no reliable provider signal,
+/// so the caller keeps the current client rather than guessing wrong.
+/// OpenRouter's `vendor/model` ids resolve to the vendor's family (the slash
+/// prefix is stripped) so e.g. `deepseek/deepseek-v4` still reads as DeepSeek.
+pub fn model_family(model: &str) -> Option<ProviderKind> {
+    let id = model.trim().to_ascii_lowercase();
+    // Strip an OpenRouter-style `vendor/` prefix to classify by the model
+    // itself, not the routing vendor.
+    let bare = id.rsplit('/').next().unwrap_or(id.as_str());
+    if bare.starts_with("glm-") {
+        Some(ProviderKind::Glm)
+    } else if bare.starts_with("deepseek") {
+        Some(ProviderKind::DeepSeek)
+    } else if bare.starts_with("claude-") {
+        Some(ProviderKind::Anthropic)
+    } else if bare.starts_with("gemini-") {
+        Some(ProviderKind::Gemini)
+    } else if bare.starts_with("gpt-")
+        || bare.starts_with("chatgpt")
+        || bare.starts_with("codex")
+        || is_openai_o_series(bare)
+    {
+        Some(ProviderKind::OpenAI)
+    } else {
+        None
+    }
+}
+
+/// True for OpenAI reasoning-series ids: `o` followed by a digit, optionally
+/// with a suffix (`o1`, `o3`, `o4-mini`). Kept narrow so unrelated names that
+/// merely start with `o` (`ollama`, `opus`) don't false-match.
+fn is_openai_o_series(bare: &str) -> bool {
+    let mut chars = bare.chars();
+    matches!(chars.next(), Some('o')) && matches!(chars.next(), Some(c) if c.is_ascii_digit())
+}
+
+/// What switching to a given model id should do to the live client, given the
+/// active provider and the configured providers (dirge-cfaw). Consumed by
+/// `/model` and by the plugin `prepare-next-run` swap.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ModelSwitch {
+    /// Keep the current client — the id belongs to the active provider (or
+    /// carries no cross-provider signal). Just rename the model.
+    Keep,
+    /// Rebuild the client against this configured provider alias, then rename.
+    Switch(String),
+    /// The id's family maps to a provider kind with NO configured provider.
+    /// Renaming on the active client would send it to the wrong endpoint, so
+    /// the caller should warn instead. Carries the human family name.
+    NoProviderForFamily(String),
+}
+
+/// Decide how switching to `model` routes, given the active provider alias and
+/// the configured `providers`.
+///
+/// Precedence:
+///   1. An EXACT pin on another provider's `model` → switch to it. Highest
+///      confidence: the user declared that id belongs to that provider.
+///   2. Otherwise infer the id's family ([`model_family`]):
+///      - unclassifiable, or same kind as the active provider → `Keep` (the
+///        active client already speaks this family; just rename).
+///      - a different kind with a configured provider of that kind → switch to
+///        that provider (the free-form-id fix — `glm-4.6` from deepseek routes
+///        to the `glm` provider instead of 404'ing against deepseek).
+///      - a different kind with NO configured provider → `NoProviderForFamily`
+///        so the caller can warn instead of silently mis-routing.
+pub fn resolve_model_switch(
+    providers: &HashMap<String, ProviderEntry>,
+    active: &str,
+    model: &str,
+) -> ModelSwitch {
+    // 1. Exact pin on a different provider wins.
+    if let Some(alias) = providers.iter().find_map(|(alias, entry)| {
+        (entry.model.as_deref() == Some(model) && !alias.eq_ignore_ascii_case(active))
+            .then(|| alias.clone())
+    }) {
+        return ModelSwitch::Switch(alias);
+    }
+
+    // 2. Family inference. Unclassifiable ids keep the current client — same
+    //    behavior as before this fix, so a local / same-provider alt id isn't
+    //    disturbed.
+    let Some(family) = model_family(model) else {
+        return ModelSwitch::Keep;
+    };
+    // The id belongs to the active provider's own kind → keep + rename.
+    if active_provider_kind(providers, active) == Some(family) {
+        return ModelSwitch::Keep;
+    }
+    // A different kind: route to a configured provider of that kind if one
+    // exists (deterministic pick — sorted alias), else flag the misconfig.
+    match configured_alias_for_kind(providers, family) {
+        Some(alias) => ModelSwitch::Switch(alias),
+        None => ModelSwitch::NoProviderForFamily(kind_label(family).to_string()),
+    }
+}
+
+/// Resolve the active provider alias to its backend [`ProviderKind`], honoring
+/// a `provider_type` override on a config alias and falling back to treating
+/// the alias itself as a built-in provider name.
+fn active_provider_kind(
+    providers: &HashMap<String, ProviderEntry>,
+    active: &str,
+) -> Option<ProviderKind> {
+    let type_name = providers
+        .get(active)
+        .or_else(|| providers.get(&active.to_ascii_lowercase()))
+        .map(|entry| Config::provider_type_of(active, entry))
+        .unwrap_or_else(|| active.to_ascii_lowercase());
+    parse_provider(&type_name)
+}
+
+/// The lowest (sorted) configured alias whose backend kind is `kind`, or
+/// `None` when no configured provider serves that family. Sorted for a stable
+/// pick when several aliases share a kind.
+fn configured_alias_for_kind(
+    providers: &HashMap<String, ProviderEntry>,
+    kind: ProviderKind,
+) -> Option<String> {
+    let mut matches: Vec<&String> = providers
+        .iter()
+        .filter(|(alias, entry)| {
+            parse_provider(&Config::provider_type_of(alias, entry)) == Some(kind)
+        })
+        .map(|(alias, _)| alias)
+        .collect();
+    matches.sort();
+    matches.first().map(|alias| alias.to_string())
+}
+
+/// Human-facing family name for the misconfig warning.
+fn kind_label(kind: ProviderKind) -> &'static str {
+    match kind {
+        ProviderKind::OpenRouter => "openrouter",
+        ProviderKind::OpenAI => "openai",
+        ProviderKind::Anthropic => "anthropic",
+        ProviderKind::Gemini => "gemini",
+        ProviderKind::DeepSeek => "deepseek",
+        ProviderKind::Glm => "glm",
+        ProviderKind::Ollama => "ollama",
+        ProviderKind::OpenCode => "opencode",
+        ProviderKind::Custom => "custom",
+    }
+}
+
 pub struct ProviderInfo {
     pub kind: ProviderKind,
     pub base_url: Option<String>,
@@ -560,6 +715,186 @@ where
             "No API key found for {kind:?}. Set {env_var} (or one of: {}) or pass --api-key.{keyless_hint}",
             fallbacks.join(", ")
         )
+    }
+}
+
+#[cfg(test)]
+mod model_family_tests {
+    use super::*;
+
+    #[test]
+    fn matches_known_cloud_families_by_prefix() {
+        assert_eq!(model_family("glm-5.2"), Some(ProviderKind::Glm));
+        assert_eq!(model_family("glm-4.6"), Some(ProviderKind::Glm));
+        assert_eq!(
+            model_family("deepseek-v4-pro"),
+            Some(ProviderKind::DeepSeek)
+        );
+        assert_eq!(model_family("claude-opus-4"), Some(ProviderKind::Anthropic));
+        assert_eq!(model_family("gemini-2.0-flash"), Some(ProviderKind::Gemini));
+        assert_eq!(model_family("gpt-5.5"), Some(ProviderKind::OpenAI));
+        assert_eq!(
+            model_family("chatgpt-4o-latest"),
+            Some(ProviderKind::OpenAI)
+        );
+        assert_eq!(model_family("codex-mini"), Some(ProviderKind::OpenAI));
+        assert_eq!(model_family("o3"), Some(ProviderKind::OpenAI));
+        assert_eq!(model_family("o4-mini"), Some(ProviderKind::OpenAI));
+    }
+
+    #[test]
+    fn is_case_insensitive_and_trims() {
+        assert_eq!(model_family("  GLM-4.6 "), Some(ProviderKind::Glm));
+        assert_eq!(model_family("GPT-5.5"), Some(ProviderKind::OpenAI));
+    }
+
+    #[test]
+    fn strips_openrouter_vendor_prefix() {
+        assert_eq!(
+            model_family("deepseek/deepseek-v4-flash"),
+            Some(ProviderKind::DeepSeek)
+        );
+        assert_eq!(
+            model_family("anthropic/claude-opus-4"),
+            Some(ProviderKind::Anthropic)
+        );
+    }
+
+    #[test]
+    fn local_and_ambiguous_ids_are_unclassified() {
+        // No reliable provider signal — caller must keep the current client.
+        assert_eq!(model_family("llama3"), None);
+        assert_eq!(model_family("vibe-thinker:latest"), None);
+        assert_eq!(model_family("qwen3-coder-plus"), None);
+        assert_eq!(model_family("my-custom-model"), None);
+        assert_eq!(model_family(""), None);
+        // `o`-then-non-digit must not false-match the OpenAI o-series.
+        assert_eq!(model_family("ollama-thing"), None);
+        assert_eq!(model_family("opus-local"), None);
+    }
+}
+
+#[cfg(test)]
+mod resolve_model_switch_tests {
+    use super::*;
+
+    fn entry(model: Option<&str>) -> ProviderEntry {
+        ProviderEntry {
+            model: model.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// Alias entry with an explicit `provider_type` (e.g. a `glm` backend under
+    /// some other alias name).
+    fn typed_entry(provider_type: &str, model: Option<&str>) -> ProviderEntry {
+        ProviderEntry {
+            provider_type: Some(provider_type.to_string()),
+            model: model.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// The user's real shape: deepseek default + a pinned glm + local ollama.
+    fn user_like_providers() -> HashMap<String, ProviderEntry> {
+        HashMap::from([
+            ("deepseek".to_string(), entry(Some("deepseek-v4-pro"))),
+            ("glm".to_string(), typed_entry("glm", Some("glm-5.2"))),
+            (
+                "ollama".to_string(),
+                typed_entry("openai", Some("vibe-thinker:latest")),
+            ),
+        ])
+    }
+
+    #[test]
+    fn exact_pin_on_other_provider_switches() {
+        let providers = user_like_providers();
+        // Active = deepseek; the exactly-pinned glm id routes to `glm`.
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "glm-5.2"),
+            ModelSwitch::Switch("glm".to_string())
+        );
+    }
+
+    #[test]
+    fn free_form_family_id_routes_to_configured_provider() {
+        let providers = user_like_providers();
+        // The core dirge-cfaw fix: `glm-4.6` isn't pinned anywhere, but its
+        // family maps to the configured `glm` provider — switch, don't rename
+        // it onto the deepseek client.
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "glm-4.6"),
+            ModelSwitch::Switch("glm".to_string())
+        );
+    }
+
+    #[test]
+    fn same_family_free_form_id_keeps_current_client() {
+        let providers = user_like_providers();
+        // Already on glm, a different glm id is just a rename on the live client.
+        assert_eq!(
+            resolve_model_switch(&providers, "glm", "glm-4.6"),
+            ModelSwitch::Keep
+        );
+        // deepseek id while on deepseek → keep (deepseek client serves it).
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "deepseek-v4-flash"),
+            ModelSwitch::Keep
+        );
+    }
+
+    #[test]
+    fn unclassifiable_id_keeps_current_client() {
+        let providers = user_like_providers();
+        // No family signal → keep current client (unchanged pre-fix behavior),
+        // so a local / alt same-provider id isn't disturbed.
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "some-local-model"),
+            ModelSwitch::Keep
+        );
+    }
+
+    #[test]
+    fn foreign_family_without_a_provider_warns() {
+        let providers = user_like_providers();
+        // A claude id but no anthropic provider configured → warn, keep active.
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "claude-opus-4"),
+            ModelSwitch::NoProviderForFamily("anthropic".to_string())
+        );
+    }
+
+    #[test]
+    fn routing_honors_provider_type_alias() {
+        // A glm backend hidden under a non-glm alias name still catches glm ids.
+        let providers = HashMap::from([
+            ("deepseek".to_string(), entry(Some("deepseek-v4-pro"))),
+            (
+                "zhipu-proxy".to_string(),
+                typed_entry("glm", Some("glm-5.2")),
+            ),
+        ]);
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "glm-4.6"),
+            ModelSwitch::Switch("zhipu-proxy".to_string())
+        );
+    }
+
+    #[test]
+    fn switch_target_is_deterministic_across_duplicate_kinds() {
+        // Two glm aliases → the sorted-first one is chosen, stably.
+        let providers = HashMap::from([
+            ("deepseek".to_string(), entry(Some("deepseek-v4-pro"))),
+            ("glm-b".to_string(), typed_entry("glm", Some("glm-5.2"))),
+            ("glm-a".to_string(), typed_entry("glm", Some("glm-5.2"))),
+        ]);
+        // Not an exact pin (glm-4.6 is pinned by neither) → family route, and
+        // the deterministic pick is `glm-a`.
+        assert_eq!(
+            resolve_model_switch(&providers, "deepseek", "glm-4.6"),
+            ModelSwitch::Switch("glm-a".to_string())
+        );
     }
 }
 

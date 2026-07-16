@@ -44,9 +44,19 @@ pub(crate) struct LoopBits<'a> {
 
 /// Apply a `prepare-next-run` model swap on-loop (dirge-qhfk stage 3b).
 /// Rebuilds the agent for the new model so the next user prompt runs against
-/// it, updating the session's model/provider/context-window. No-op for an
-/// empty model or one equal to the current. Extracted from handle_done so the
-/// off-loop `done_phase` arm can run it after the hook chain resolves.
+/// it, updating the session's model/context-window. No-op for an empty model
+/// or one equal to the current. Extracted from handle_done so the off-loop
+/// `done_phase` arm can run it after the hook chain resolves.
+///
+/// This path rebuilds the agent from the EXISTING client (`deps.client`), so it
+/// can only rename the model on the active provider — it cannot hop providers
+/// (the loop's client isn't mutable here). dirge-cfaw: if the plugin asks for a
+/// model whose family belongs to a *different* provider than the active one, we
+/// can't serve it correctly, so warn and skip rather than misroute (the old
+/// code went ahead and also reset `session.provider` from CLI/config, so a
+/// same-provider rename on a session already switched to e.g. glm would falsely
+/// snap the displayed provider back to the config default). Follow-up:
+/// dirge-m6ut to thread a mutable client here for real cross-provider swaps.
 #[cfg(feature = "plugin")]
 pub(crate) async fn apply_next_model(
     ctx: &mut RunCtx<'_>,
@@ -60,6 +70,34 @@ pub(crate) async fn apply_next_model(
     // model with nothing, and skip a no-op swap to the same model.
     if trimmed.is_empty() || trimmed == ctx.session.model.as_str() {
         return Ok(());
+    }
+    // The client is fixed on this path, so only a same-provider rename is safe.
+    // A model that routes elsewhere would be sent to the active endpoint and
+    // fail — refuse it with a clear message instead.
+    let providers = ctx.cfg.providers_map();
+    match crate::provider::resolve_model_switch(&providers, ctx.session.provider.as_str(), trimmed)
+    {
+        crate::provider::ModelSwitch::Keep => {}
+        crate::provider::ModelSwitch::Switch(alias) => {
+            ctx.renderer.write_line(
+                &format!(
+                    "[plugin] ignoring model swap to '{trimmed}': it routes to provider '{alias}', but a plugin prepare-next-run swap can't change providers — staying on '{}'.",
+                    ctx.session.provider,
+                ),
+                c_error(),
+            )?;
+            return Ok(());
+        }
+        crate::provider::ModelSwitch::NoProviderForFamily(family) => {
+            ctx.renderer.write_line(
+                &format!(
+                    "[plugin] ignoring model swap to '{trimmed}': it matches the {family} model family with no {family} provider configured — staying on '{}'.",
+                    ctx.session.provider,
+                ),
+                c_error(),
+            )?;
+            return Ok(());
+        }
     }
     let new_model_compact = CompactString::new(trimmed);
     let model_obj = deps.client.completion_model(new_model_compact.to_string());
@@ -85,7 +123,9 @@ pub(crate) async fn apply_next_model(
     .await;
     let old_model = ctx.session.model.clone();
     ctx.session.model = new_model_compact.clone();
-    ctx.session.provider = ctx.cli.resolve_provider(ctx.cfg);
+    // Do NOT touch `session.provider` here: this path never swaps the client,
+    // so the active provider is unchanged. Re-resolving it from CLI/config used
+    // to clobber a session that had switched providers (dirge-cfaw).
     // Re-resolve context window for the new model — mirrors `/model` so a
     // 128k→1M jump (or vice versa) updates the status indicator.
     let new_ctx = ctx.cfg.resolve_context_window(new_model_compact.as_str());
