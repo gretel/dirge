@@ -4,6 +4,31 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.9] - 2026-07-16
+
+### Added
+- Prompt compression. dirge compresses outgoing request bodies with a
+  deterministic, no-model transform (an inlined build of llmtrim-core) before
+  they reach the provider: tool-output windowing for logs/diffs/grep plus
+  lossless JSON/columnar packing, guarded by a token gate that reverts any
+  change that doesn't pay off and cache-zones that keep provider prompt caching
+  warm. On by default for every provider; disable with `DIRGE_COMPRESSION=0` or
+  `[compression] enabled = false`, or choose a profile with `[compression]
+  preset`. Tool-heavy turns typically shrink ~60%.
+
+### Fixed
+- The agent no longer breaks or repeats itself on phantom tool calls. When a
+  reasoning model left tool-call-shaped JSON in its answer text, the scavenger
+  promoted it to a real call; if the args didn't validate, the error result
+  could desync the message history into a provider 400 and a duplicated
+  response. Scavenged calls are now validated before promotion and dropped when
+  invalid; native tool-call errors are unchanged.
+
+### Changed
+- Work tracking nudges earlier. After the first file edit with no active todo,
+  dirge injects a model-visible reminder to `write_todo_list` and mark the item
+  in_progress, instead of only a user-facing notice at the end of the turn.
+
 ## [0.19.8] - 2026-07-15
 
 ### Changed
