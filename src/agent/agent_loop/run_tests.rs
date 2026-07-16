@@ -4356,6 +4356,63 @@ fn should_advise_untracked_work_gate() {
     ));
 }
 
+// ── early track-work nudge (dirge-track v2): model-visible reminder ────────
+
+/// The early track-work reminder message is a model-visible `LoopMessage::User`
+/// (not a UI-only SystemNotice), with an imperative nudge in the same tone as
+/// the unfinished-todo nudge.
+#[test]
+fn early_track_work_reminder_is_model_visible_user_message() {
+    let msg = track_work_reminder_message();
+    // Must be a User message so the model reads it on its next turn.
+    match &msg {
+        LoopMessage::User(u) => {
+            let text = u.text_joined();
+            assert!(
+                text.contains("[track]"),
+                "expected [track] tag prefix, got: {text}"
+            );
+            assert!(
+                text.contains("write_todo_list"),
+                "expected write_todo_list mention, got: {text}"
+            );
+            assert!(
+                text.contains("in_progress"),
+                "expected in_progress mention, got: {text}"
+            );
+        }
+        other => panic!("expected LoopMessage::User, got {other:?}"),
+    }
+}
+
+/// build_early_track_work_reminder returns the message only when all
+/// conditions hold: session, budget unspent, no active todos, file edits.
+#[test]
+fn build_early_track_work_reminder_gate() {
+    // Fires: session + budget + no todos + edits.
+    assert!(build_early_track_work_reminder(Some("s"), 0, 0, true).is_some());
+    // No file edits → silent.
+    assert!(build_early_track_work_reminder(Some("s"), 0, 0, false).is_none());
+    // Has active todos → silent (ordinary todo nudge covers it).
+    assert!(build_early_track_work_reminder(Some("s"), 0, 2, true).is_none());
+    // No session → silent.
+    assert!(build_early_track_work_reminder(None, 0, 0, true).is_none());
+    // Budget spent → silent (one-shot).
+    assert!(build_early_track_work_reminder(Some("s"), MAX_TRACK_NUDGES, 0, true).is_none());
+}
+
+/// The reminder is a LoopMessage::User, not a SystemNotice — the model must
+/// see it. This test asserts the returned message role.
+#[test]
+fn early_track_work_reminder_role_is_user() {
+    let msg = build_early_track_work_reminder(Some("s"), 0, 0, true)
+        .expect("should fire when all conditions met");
+    assert!(
+        matches!(msg, LoopMessage::User(_)),
+        "expected User message, got {msg:?}"
+    );
+}
+
 fn temp_dir(suffix: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!(
         "dirge-ksjl-{}-{}-{suffix}",

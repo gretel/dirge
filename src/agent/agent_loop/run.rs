@@ -194,6 +194,10 @@ pub(crate) const OPEN_ISSUES_NUDGE_TAG: &str = "[open-issues]";
 /// it and attribute the injected message to the system rather than the user.
 pub(crate) const RESUME_NUDGE_TAG: &str = "[resume]";
 
+/// Display tag prefixing the early track-work reminder, so the UI can strip
+/// it and attribute the injected message to the system rather than the user.
+const TRACK_WORK_TAG: &str = "[track]";
+
 /// Upper bound on consecutive resume-after-failure nudges, so a model that
 /// repeatedly stops after broken tool calls can't loop forever.
 const MAX_RESUME_NUDGE: u8 = 3;
@@ -2091,6 +2095,23 @@ pub async fn run_loop(
                 }
             }
 
+            // dirge-track v2: early model-facing nudge when the model
+            // edited files without an active todo — fires at most once
+            // per run (shares the one-shot budget with the finalization
+            // advisory).
+            if let Some(reminder) = build_early_track_work_reminder(
+                config.session_id.as_deref(),
+                track_nudges,
+                crate::agent::tools::todo::unfinished_count(),
+                turn_made_file_edits(&new_messages),
+            ) {
+                track_nudges += 1;
+                current_context
+                    .messages
+                    .push(loop_message_to_value(&reminder));
+                new_messages.push(reminder);
+            }
+
             // Pi line 218: turn_end.
             let _ = emit
                 .send(LoopEvent::TurnEnd {
@@ -2471,6 +2492,34 @@ fn should_advise_untracked_work(
     made_file_edits: bool,
 ) -> bool {
     session_id.is_some() && track_nudges < MAX_TRACK_NUDGES && unfinished == 0 && made_file_edits
+}
+
+/// Model-visible reminder injected into the conversation when the model is
+/// editing files without an active todo. Imperative tone matching the
+/// unfinished-todo nudge — tells the model to create a todo before continuing.
+fn track_work_reminder_message() -> LoopMessage {
+    LoopMessage::User(super::message::UserMessage::text(format!(
+        "{TRACK_WORK_TAG} You're editing files without an active todo. Before continuing, \
+         add this task to your active work list with write_todo_list and mark the item \
+         you're working on in_progress, so your progress is tracked."
+    )))
+}
+
+/// Pure decision + message builder for the early track-work nudge (dirge-track
+/// v2). Returns `Some(message)` when all conditions hold — session, budget
+/// unspent, no active todos, file edits this turn — and `None` otherwise.
+/// Split out from the inner loop so it's unit-testable without the run loop.
+fn build_early_track_work_reminder(
+    session_id: Option<&str>,
+    track_nudges: u8,
+    unfinished: usize,
+    made_file_edits: bool,
+) -> Option<LoopMessage> {
+    if should_advise_untracked_work(session_id, track_nudges, unfinished, made_file_edits) {
+        Some(track_work_reminder_message())
+    } else {
+        None
+    }
 }
 
 /// Did any assistant turn this finalization cycle contain a file-edit tool
