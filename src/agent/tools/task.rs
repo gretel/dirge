@@ -40,6 +40,7 @@ fn writer_worktree_enabled(
     is_writer: bool,
     isolation: SubagentWriteIsolation,
     is_microvm: bool,
+    sandbox_confines_writes: bool,
 ) -> Result<bool, &'static str> {
     if !is_writer || isolation == SubagentWriteIsolation::Serialize {
         return Ok(false);
@@ -53,7 +54,27 @@ fn writer_worktree_enabled(
             SubagentWriteIsolation::Serialize => Ok(false),
         };
     }
+    if !sandbox_confines_writes {
+        return match isolation {
+            SubagentWriteIsolation::Worktree => Err(
+                "worktree write isolation requires a confining sandbox; run dirge with a Linux bwrap sandbox, or the writer's shell could escape the worktree",
+            ),
+            SubagentWriteIsolation::Auto => Ok(false),
+            SubagentWriteIsolation::Serialize => unreachable!(),
+        };
+    }
     Ok(true)
+}
+
+/// Check whether the process's current directory (the parent checkout)
+/// is dirty. Returns `Err` when we're not in a git repo at all — the
+/// caller should treat that as "no uncommitted work to clobber."
+fn current_repo_is_dirty() -> Result<bool, String> {
+    let repo = std::env::current_dir()
+        .map_err(|e| format!("failed to resolve current directory: {e}"))?
+        .canonicalize()
+        .map_err(|e| format!("failed to canonicalize repository: {e}"))?;
+    crate::extras::git_worktree::repo_is_dirty(&repo)
 }
 
 #[cfg(feature = "git-worktree")]
@@ -849,6 +870,7 @@ impl TaskTool {
                     is_writer,
                     self.write_isolation,
                     self.sandbox.is_microvm(),
+                    self.sandbox.confines_writes(),
                 )
                 .map_err(|error| ToolError::Msg(error.to_string()))?;
             if coordinator_dispatch {
@@ -951,6 +973,28 @@ impl TaskTool {
                 } else {
                     None
                 };
+            // A read-write subagent without worktree isolation runs in the
+            // parent checkout. Refuse to do this when the parent is dirty —
+            // the writer's edits and `git add -A` + `git commit` would
+            // clobber uncommitted work (data loss). This fires for BOTH the
+            // attempts_isolated_writer=false path AND the auto-fallback after
+            // a failed worktree creation.
+            if is_writer && rooted_worktree.is_none() {
+                match current_repo_is_dirty() {
+                    Ok(true) => {
+                        let error = "cannot run a read-write subagent in a dirty parent \
+                                     checkout without worktree isolation — commit or \
+                                     stash your changes, or run under a Linux bwrap \
+                                     sandbox for isolated worktrees"
+                            .to_string();
+                        self.bg_store
+                            .notify(&task_id, TaskState::Failed(error.clone()));
+                        return Err(ToolError::Msg(error));
+                    }
+                    Ok(false) => { /* clean — safe to proceed */ }
+                    Err(_) => { /* not a git repo — no uncommitted work to clobber */ }
+                }
+            }
             self.bg_store.notify_started(&task_id);
             self.emit_chat(SubagentChatEvent::Spawn {
                 id: task_id.clone(),
@@ -1698,23 +1742,44 @@ mod tests {
 
     #[test]
     fn writer_worktree_policy_respects_mode_and_sandbox() {
+        // Non-writer: always false regardless of isolation/sandbox.
         assert_eq!(
-            writer_worktree_enabled(false, SubagentWriteIsolation::Worktree, false),
+            writer_worktree_enabled(false, SubagentWriteIsolation::Worktree, false, false),
             Ok(false)
         );
+        // Serialize: always false.
         assert_eq!(
-            writer_worktree_enabled(true, SubagentWriteIsolation::Serialize, false),
+            writer_worktree_enabled(true, SubagentWriteIsolation::Serialize, false, false),
             Ok(false)
         );
+        // Writer + Auto + confining sandbox → worktree allowed.
         assert_eq!(
-            writer_worktree_enabled(true, SubagentWriteIsolation::Auto, false),
+            writer_worktree_enabled(true, SubagentWriteIsolation::Auto, false, true),
             Ok(true)
         );
+        // Writer + Auto + no confining sandbox (Off) → worktree disabled,
+        // fall back to serialized parent (safe when parent is clean).
         assert_eq!(
-            writer_worktree_enabled(true, SubagentWriteIsolation::Auto, true),
+            writer_worktree_enabled(true, SubagentWriteIsolation::Auto, false, false),
             Ok(false)
         );
-        assert!(writer_worktree_enabled(true, SubagentWriteIsolation::Worktree, true).is_err());
+        // Writer + Worktree + no confining sandbox → error (false isolation).
+        assert!(
+            writer_worktree_enabled(true, SubagentWriteIsolation::Worktree, false, false).is_err()
+        );
+        // Writer + Worktree + confining sandbox → allowed.
+        assert_eq!(
+            writer_worktree_enabled(true, SubagentWriteIsolation::Worktree, false, true),
+            Ok(true)
+        );
+        // MicroVM: Auto → false, Worktree → error (unchanged).
+        assert_eq!(
+            writer_worktree_enabled(true, SubagentWriteIsolation::Auto, true, true),
+            Ok(false)
+        );
+        assert!(
+            writer_worktree_enabled(true, SubagentWriteIsolation::Worktree, true, true).is_err()
+        );
     }
 
     #[test]

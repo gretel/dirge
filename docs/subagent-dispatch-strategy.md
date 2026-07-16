@@ -97,11 +97,11 @@ Cancelled work is intentionally not retryable: the main agent should decide whet
 
 Read-write subagents can modify code. Set `subagent_write_isolation` to choose where they work:
 
-- **`auto`** — the default. Dirge creates an isolated Git worktree when it can; otherwise it warns and runs one serialized writer in the parent checkout.
+- **`auto`** — the default. Dirge creates an isolated Git worktree when it can; otherwise it runs one serialized writer in the parent checkout.
 - **`worktree`** — require a worktree. The dispatch fails if isolation is unavailable.
 - **`serialize`** — always use the parent checkout and allow only one writer at a time.
 
-Worktree isolation requires a Git repository with a clean parent checkout, the `git-worktree` feature, and a supported sandbox. It is unavailable in the MicroVM sandbox. In `auto` mode, unavailable isolation falls back to serialized parent-checkout execution; in `worktree` mode, it fails instead.
+Worktree write-isolation requires a Linux sandbox (bwrap). Without a confining sandbox, the writer's shell could escape the worktree via `../` or absolute paths — a false isolation guarantee — so dirge refuses to create a worktree for `auto` and errors on `worktree`. When a worktree is unavailable, `auto` falls back to running the writer *serialized in the parent checkout*. This fallback path **requires a clean parent checkout** — a dirty checkout makes the writer fail with a clear message; commit or stash first. `worktree` mode fails whenever a worktree cannot be created (no confining sandbox, missing `git-worktree` feature, dirty parent, or MicroVM sandbox — which has its own full isolation).
 
 An isolated writer gets a newly built tool registry rooted at its own worktree. Its file, search, navigation, and shell tools are confined to that checkout. Background shell jobs also use a writer-local store, so the writer cannot inspect or terminate the parent agent's shell jobs.
 
@@ -123,8 +123,9 @@ A dirty worktree or a worktree containing commits is retained for recovery. A cl
 ## Troubleshooting
 
 - **Coordinator mode does not start:** ensure tools are enabled and that loaded profiles include both `readonly` and `readwrite` tiers. `full` prints the missing tier at startup.
-- **A writer runs in the parent checkout:** `auto` could not create an isolated worktree, commonly because the parent checkout has uncommitted changes, Git worktree support is unavailable, or the active sandbox does not support it.
+- **A writer runs in the parent checkout:** `auto` could not create an isolated worktree because Git worktree support is unavailable or the active sandbox is not confining (not bwrap), so the writer runs serialized in the parent checkout — which must be clean (see below).
 - **A writer dispatch fails immediately:** use `auto` for fallback behavior, or fix the repository/sandbox prerequisite required by `worktree` mode.
+- **A writer fails with "cannot run a read-write subagent in a dirty parent checkout":** commit or stash your uncommitted changes, or run under a Linux bwrap sandbox for worktree isolation.
 - **A writer's changes are not in the main branch:** this is expected. Inspect the reconciliation result and merge the reported branch deliberately.
 - **A task result has not appeared yet:** a coordinated batch is delivered only after every task in that batch reaches a terminal state. Do not poll for partial output; continue other work or wait for the reconciliation update.
 

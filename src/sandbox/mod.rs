@@ -133,6 +133,20 @@ impl Sandbox {
         }
     }
 
+    /// True when the sandbox actually confines file writes (bwrap active, or
+    /// microVM). Returns `false` for `Off` — on those hosts the shell can
+    /// escape a worktree root via `../` or absolute paths, so worktree-based
+    /// write isolation gives a false guarantee.
+    #[cfg(feature = "sandbox-microvm")]
+    pub fn confines_writes(&self) -> bool {
+        matches!(self.mode, SandboxMode::Bwrap | SandboxMode::Microvm)
+    }
+
+    #[cfg(not(feature = "sandbox-microvm"))]
+    pub fn confines_writes(&self) -> bool {
+        matches!(self.mode, SandboxMode::Bwrap)
+    }
+
     /// Override the microVM image. No-op when sandbox mode is not Microvm.
     #[cfg(feature = "sandbox-microvm")]
     pub fn set_microvm_image(&self, image: String) -> Result<(), anyhow::Error> {
@@ -927,6 +941,19 @@ mod tests {
     fn sandbox_new_off_stays_off() {
         let sb = Sandbox::new(SandboxMode::Off);
         assert_eq!(sb.mode, SandboxMode::Off);
+    }
+
+    #[test]
+    fn confines_writes_returns_false_for_off() {
+        let sb = Sandbox::new(SandboxMode::Off);
+        assert!(!sb.confines_writes());
+    }
+
+    #[test]
+    fn confines_writes_returns_true_for_bwrap_when_available() {
+        let sb = Sandbox::new(SandboxMode::Bwrap);
+        // On macOS (no bwrap in PATH), mode falls back to Off
+        assert_eq!(sb.confines_writes(), sb.mode == SandboxMode::Bwrap);
     }
 
     #[test]
