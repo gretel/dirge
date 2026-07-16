@@ -801,14 +801,18 @@ pub struct Config {
     /// prompt's own `critic_preamble` frontmatter overrides it. Unset
     /// (default) = built-in critic stance. See `resolve_critic_preamble`.
     pub critic_preamble: Option<String>,
-    /// How the diff-aware code reviewer engages at finalization. One of
-    /// `off` / `advisory` / `blocking` (case-insensitive, trimmed).
-    /// `advisory` *(default)* runs the review detached in the background
-    /// and surfaces findings as a non-blocking notice — it never holds up
-    /// a turn. `blocking` awaits the review and re-enters the loop on
-    /// high/critical findings (the legacy behaviour). `off` disables it
-    /// entirely. A prompt's `code_review` front-matter overrides this
-    /// per-prompt; only meaningful when a `critic_provider` is set. See
+    /// How the finalization judge reviews the run's diff. One of
+    /// `off` / `advisory` / `blocking` (case-insensitive, trimmed). dirge-8v98:
+    /// the diff review is folded into the completeness critic — ONE judge call
+    /// that both checks the task is done and reviews the diff for defects,
+    /// re-entering the loop with a single consolidated follow-up so the agent
+    /// actually acts on findings. `advisory` *(default)* reviews the diff and
+    /// re-enters ONCE (one-shot) with any findings — high/critical as must-fix,
+    /// medium/low as optional. `blocking` persists across finalizations,
+    /// re-reviewing until the diff is clean (bounded). `off` reviews
+    /// completeness only (no diff capture, no extra cost). A prompt's
+    /// `code_review` front-matter overrides this per-prompt; only meaningful
+    /// when a `critic_provider` is set. See
     /// [`resolve_code_review_mode`](Self::resolve_code_review_mode).
     pub code_review: Option<String>,
     /// How the open-issues finalization gate engages. One of `off` /

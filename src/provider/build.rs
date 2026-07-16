@@ -435,21 +435,35 @@ pub async fn build_agent(
                         ));
                         // Critic: wired unless the active prompt disables it.
                         if !critic_disabled {
+                            use crate::agent::agent_loop::types::CodeReviewMode;
+                            // dirge-8v98: ONE finalization judge does both the
+                            // completeness critique AND the diff review. When
+                            // `code_review` is on, append the reviewer's role to
+                            // the (possibly custom) critic preamble so the single
+                            // `critic_fn` call covers both; the combined output
+                            // format rides in the prompt (`UNIFIED_FORMAT`). A
+                            // custom `critic_preamble` is preserved — the review
+                            // instructions are added on top, not replaced.
+                            let judge_preamble: std::sync::Arc<str> =
+                                if code_review_mode != CodeReviewMode::Off {
+                                    std::sync::Arc::from(format!(
+                                        "{critic_preamble}\n\n{}",
+                                        crate::agent::agent_loop::code_review::REVIEW_PREAMBLE,
+                                    ))
+                                } else {
+                                    critic_preamble.clone()
+                                };
                             agent = agent.with_critic(build_judge_fn(
                                 client.clone(),
                                 model_name.clone(),
                                 "critic",
-                                critic_preamble.clone(),
+                                judge_preamble,
                             ));
-                            // dirge-iyf5: the diff-aware code reviewer shares
-                            // the critic's judge client but bakes its own
-                            // REVIEW_PREAMBLE. Gated on the same prompt flag —
-                            // a `critic: false` (read-only/exploratory) prompt
-                            // suppresses both; those modes leave no diff anyway.
-                            // `code_review = off` leaves the judge unarmed
-                            // entirely (no diff capture, no review, zero cost);
-                            // advisory/blocking arm it and forward the mode.
-                            use crate::agent::agent_loop::types::CodeReviewMode;
+                            // The standalone code-review judge stays armed only
+                            // for the manual `/review` command (which runs the
+                            // dedicated two-pass reviewer). `critic: false`
+                            // suppresses both judges; `code_review = off` leaves
+                            // this one unarmed and the unified judge diff-less.
                             if code_review_mode != CodeReviewMode::Off {
                                 agent = agent.with_code_review_fn(build_judge_fn(
                                     client.clone(),
@@ -465,7 +479,7 @@ pub async fn build_agent(
                                 target: "dirge::provider",
                                 alias = %alias,
                                 code_review = code_review_mode.as_str(),
-                                "in-loop critic wired; code reviewer armed per mode",
+                                "unified finalization judge wired (critic + diff review per mode)",
                             );
                         } else {
                             tracing::info!(

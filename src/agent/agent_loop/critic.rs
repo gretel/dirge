@@ -19,6 +19,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use super::code_review::{Finding, parse_findings, partition_findings};
 use super::message::{LoopMessage, UserMessage};
 use super::verifier::VerificationStatus;
 
@@ -98,8 +99,10 @@ pub const CRITIC_TAG: &str = "[critic]";
 /// System preamble for the critic: establishes its role and a calibrated —
 /// not trigger-happy — stance. Passed as the LLM system prompt by
 /// `build_judge_fn` so the model knows what it is BEFORE it sees the
-/// transcript. The response FORMAT lives in [`build_prompt`] instead —
-/// right next to the material being judged.
+/// transcript. The response FORMAT lives in [`UNIFIED_FORMAT`] instead —
+/// right next to the material being judged. dirge-8v98: when `code_review`
+/// is on, `build.rs` appends the reviewer's role to this preamble so the one
+/// judge covers both completeness and diff review.
 ///
 /// dirge-bedj: the stance was over-aggressive ("be skeptical", everything
 /// "NOT complete") and constraint-blind, so it demanded actions the agent
@@ -128,18 +131,6 @@ the latest request and the transcript.\n\
 the spec and evidence available, ABSTAIN — say what's missing (e.g. no test covering this change, \
 unclear acceptance criteria). An abstention is safer than a false pass. If you are unsure whether \
 there's a real gap, PASS — a false block wastes a whole turn.";
-
-/// Response-format instruction. Kept in the user prompt (not the system
-/// preamble) so the verdict shape sits directly beside the transcript.
-const CRITIC_FORMAT: &str = "\
-Respond in EXACTLY this format and nothing else:\n\
-On the first line, one of: `VERDICT: COMPLETE`, `VERDICT: INCOMPLETE`, or `VERDICT: ABSTAIN`.\n\
-- COMPLETE: the work is done and correct.\n\
-- INCOMPLETE: concrete, in-scope gaps remain. Follow with a short bullet list.\n\
-- ABSTAIN: the spec or evidence available is insufficient to judge correctness. \
-Say what test or spec detail is missing (e.g. no test covering the change, \
-acceptance criteria unclear). Do NOT pass: an ABSTAIN is still a block, \
-but one the assistant resolves by adding evidence rather than fixing gaps.";
 
 /// Cap on the instructions/constraints block fed to the critic, so a large
 /// system prompt (tool docs + project context) doesn't balloon the critic
@@ -202,33 +193,6 @@ fn verification_block(verification: Option<VerificationStatus>) -> &'static str 
     }
 }
 
-/// Build the critic prompt. `rules` is the assistant's own system prompt /
-/// instructions (so the critic judges against the SAME constraints the
-/// agent had — dirge-bedj), minus any compaction summary (see
-/// [`strip_compaction_summary`]); `transcript` is what the agent did;
-/// `verification` is the run's compile/lint/test signal (dirge-6q3w),
-/// `None` when no verifier gate is configured. The role lives in
-/// [`CRITIC_PREAMBLE`]; this carries the format + bodies.
-pub fn build_prompt(
-    rules: &str,
-    transcript: &str,
-    verification: Option<VerificationStatus>,
-) -> String {
-    let rules = strip_compaction_summary(rules).trim();
-    let rules_block = if rules.is_empty() {
-        "(no special constraints provided)".to_string()
-    } else {
-        truncate_rules(rules, MAX_RULES_CHARS, "\n…(instructions truncated)").into_owned()
-    };
-    format!(
-        "{CRITIC_FORMAT}\n\n\
-         --- assistant instructions & constraints (judge within these; never demand a \
-         forbidden/out-of-scope action) ---\n{rules_block}\n--- end instructions ---\n\n\
-         --- transcript ---\n{transcript}\n--- end transcript ---{}",
-        verification_block(verification)
-    )
-}
-
 /// Parse the critic's raw response into a verdict. `Verdict::Complete` means
 /// the work is done — or the response was empty/ambiguous, in which case we
 /// fail OPEN (don't block finalization on a confused critic).
@@ -269,46 +233,183 @@ pub fn parse_verdict(response: &str) -> Verdict {
     }
 }
 
-/// Run the critic over a run transcript. `rules` is the assistant's own
-/// system prompt / instructions, passed so the critic judges within the
-/// SAME constraints the agent had (dirge-bedj); `verification` is the
-/// run's compile/lint/test signal so the critic can be pickier about
-/// unverified changes (dirge-6q3w). Returns a one-element vec with a
-/// [`CRITIC_TAG`]-prefixed follow-up message when the critic judged the
-/// work incomplete; empty otherwise (complete, or the call errored — fail
-/// open). Never panics on a critic error.
-pub async fn run_critic(
-    critic: &CriticFn,
+// ── Unified finalization judge (dirge-8v98) ───────────────────────────────
+//
+// One judge call that does BOTH the critic's completeness check AND the
+// diff-aware code review, returning a single consolidated follow-up. Replaces
+// the two separate judge calls; the reviewer's role instructions are appended
+// to the (possibly custom) critic preamble at arm time in `build.rs`, and the
+// combined output format below rides in the prompt.
+
+/// Combined response-format instruction for the unified judge: a completeness
+/// verdict followed by a `FINDINGS:` section reviewing the diff. Carried in the
+/// prompt (not the preamble) so it sits beside the material and a custom
+/// `critic_preamble` still receives it. [`parse_unified`] keys on the
+/// `VERDICT:` first line and the `FINDINGS:` marker.
+const UNIFIED_FORMAT: &str = "\
+Respond in EXACTLY this structure and nothing else.\n\
+\n\
+First line — a verdict, one of `VERDICT: COMPLETE`, `VERDICT: INCOMPLETE`, or `VERDICT: ABSTAIN`:\n\
+- COMPLETE: the work is done and correct.\n\
+- INCOMPLETE: concrete, in-scope gaps remain. Follow with a short bullet list of the gaps.\n\
+- ABSTAIN: the spec or evidence available is insufficient to judge correctness. Say what test or \
+spec detail is missing. An ABSTAIN still blocks, but is resolved by adding evidence, not fixes.\n\
+\n\
+Then a line reading exactly `FINDINGS:` followed by any defects in the diff below — each on its \
+own bullet leading with a severity word (critical/high/medium/low), then the narrowest file/line \
+location, the concrete harm if left unfixed, and a suggested fix. Separate multiple findings with \
+`---` on its own line. If the diff is clean or none is shown, write `FINDINGS: none`.";
+
+/// Marker separating the completeness verdict from the diff findings in the
+/// unified response. Matched case-insensitively on its first occurrence.
+const FINDINGS_MARKER: &str = "FINDINGS:";
+
+/// Build the unified judge prompt: the completeness question always, plus the
+/// run's `diff` to review when `Some`. `rules` is the assistant's own system
+/// prompt (so the judge reasons within the same constraints); `verification`
+/// is the run's compile/lint/test signal.
+pub fn build_unified_prompt(
     rules: &str,
     transcript: &str,
+    diff: Option<&str>,
+    verification: Option<VerificationStatus>,
+) -> String {
+    let rules = strip_compaction_summary(rules).trim();
+    let rules_block = if rules.is_empty() {
+        "(no special constraints provided)".to_string()
+    } else {
+        truncate_rules(rules, MAX_RULES_CHARS, "\n…(instructions truncated)").into_owned()
+    };
+    let diff_block = match diff {
+        Some(d) if !d.trim().is_empty() => format!(
+            "\n\n--- diff under review (review for defects; report them in FINDINGS) ---\n{}\n--- end diff ---",
+            d.trim()
+        ),
+        _ => String::new(),
+    };
+    format!(
+        "{UNIFIED_FORMAT}\n\n\
+         --- assistant instructions & constraints (judge within these; never demand a \
+         forbidden/out-of-scope action) ---\n{rules_block}\n--- end instructions ---\n\n\
+         --- transcript ---\n{transcript}\n--- end transcript ---{diff_block}{}",
+        verification_block(verification)
+    )
+}
+
+/// Split the unified response into its completeness verdict and its diff
+/// findings, parsing each with the existing single-purpose parsers. Findings
+/// are severity-sorted (highest first).
+pub fn parse_unified(response: &str) -> (Verdict, Vec<Finding>) {
+    let (head, tail) = split_on_findings_marker(response);
+    let verdict = parse_verdict(head);
+    let mut findings = parse_findings(tail);
+    findings.sort_by_key(|f| std::cmp::Reverse(f.severity));
+    (verdict, findings)
+}
+
+/// Split at the first case-insensitive `FINDINGS:` marker → `(verdict head,
+/// findings tail)`. When the marker is absent the whole response is the verdict
+/// head and the findings tail is empty (a diff-less completeness-only run).
+fn split_on_findings_marker(response: &str) -> (&str, &str) {
+    let lower = response.to_ascii_lowercase();
+    match lower.find(&FINDINGS_MARKER.to_ascii_lowercase()) {
+        Some(idx) => (&response[..idx], &response[idx + FINDINGS_MARKER.len()..]),
+        None => (response, ""),
+    }
+}
+
+/// Join finding bodies with the `---` separator, each led by its severity.
+fn render_findings(findings: &[Finding]) -> String {
+    findings
+        .iter()
+        .map(|f| format!("[{}] {}", f.severity.label(), f.body.trim()))
+        .collect::<Vec<_>>()
+        .join("\n\n---\n\n")
+}
+
+/// Build the single consolidated finalization follow-up from the unified
+/// judge's verdict + findings (dirge-8v98). Completeness gaps and high/critical
+/// findings are must-address; medium/low ride along as optional notes so the
+/// model can knock them out in the same pass. Returns `None` only when the work
+/// is COMPLETE and the diff is clean — nothing to send, the loop finalizes.
+pub fn build_unified_followup(verdict: Verdict, findings: Vec<Finding>) -> Option<LoopMessage> {
+    let gaps = match &verdict {
+        Verdict::Complete => None,
+        Verdict::Incomplete(issues) => Some(("the task may not be done yet", issues.clone())),
+        Verdict::Abstain(missing) => Some((
+            "correctness couldn't be confirmed — add a focused test or state the missing spec detail",
+            missing.clone(),
+        )),
+    };
+    let (blocking, advisory) = partition_findings(findings);
+    if gaps.is_none() && blocking.is_empty() && advisory.is_empty() {
+        return None;
+    }
+    let mut sections: Vec<String> = Vec::new();
+    if let Some((label, body)) = gaps {
+        sections.push(format!("Completeness — {label}:\n{}", body.trim()));
+    }
+    if !blocking.is_empty() {
+        sections.push(format!(
+            "Bugs to fix (high severity):\n{}",
+            render_findings(&blocking)
+        ));
+    }
+    if !advisory.is_empty() {
+        sections.push(format!(
+            "Lower-priority notes (optional; address if quick, else say why you're leaving them):\n{}",
+            render_findings(&advisory)
+        ));
+    }
+    let body = sections.join("\n\n");
+    Some(LoopMessage::User(UserMessage::text(format!(
+        "{CRITIC_TAG} A review of your work found things to address before you report complete. \
+         Fix each, or explain why it doesn't apply (out of scope, intended, or something you were \
+         told not to do):\n\n{body}"
+    ))))
+}
+
+/// Run the unified finalization judge: ONE call that judges completeness AND
+/// reviews the run's diff (when `diff` is `Some`), returning at most one
+/// consolidated [`CRITIC_TAG`] follow-up. Replaces the separate critic +
+/// code-review calls (dirge-8v98). Fail-open: a judge error/timeout finalizes
+/// without blocking.
+pub async fn run_unified_review(
+    judge: &CriticFn,
+    rules: &str,
+    transcript: &str,
+    diff: Option<&str>,
     verification: Option<VerificationStatus>,
 ) -> Vec<LoopMessage> {
-    let prompt = build_prompt(rules, transcript, verification);
+    let prompt = build_unified_prompt(rules, transcript, diff, verification);
     let response = run_judge!(
-        critic,
+        judge,
         prompt,
         "dirge::critic",
-        "critic call failed; finalizing without it",
+        "unified review call failed; finalizing without it",
         Vec::new()
     );
-    match parse_verdict(&response) {
-        Verdict::Complete => Vec::new(),
-        Verdict::Incomplete(issues) => vec![LoopMessage::User(UserMessage::text(format!(
-            "{CRITIC_TAG} A review of your work found it may not be done yet. Address these \
-             before reporting complete, or explain why they don't apply (e.g. they're out of \
-             scope or something you were told not to do):\n{issues}"
-        )))],
-        Verdict::Abstain(missing) => vec![LoopMessage::User(UserMessage::text(format!(
-            "{CRITIC_TAG} A review could not confirm this is correct from the spec and \
-             evidence available. Rather than assume it's done, add a focused test (or state \
-             the missing spec detail) that would prove it, then continue.\n{missing}"
-        )))],
-    }
+    let (verdict, findings) = parse_unified(&response);
+    build_unified_followup(verdict, findings)
+        .into_iter()
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test shim (dirge-8v98): the old `build_prompt` was folded into
+    /// `build_unified_prompt` with a `None` diff (completeness-only). The prompt
+    /// tests below still exercise the shared rules/compaction/verification/format
+    /// behavior through it.
+    fn build_prompt(
+        rules: &str,
+        transcript: &str,
+        verification: Option<VerificationStatus>,
+    ) -> String {
+        build_unified_prompt(rules, transcript, None, verification)
+    }
 
     #[test]
     fn truncate_rules_counts_chars_not_bytes() {
@@ -574,104 +675,156 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_critic_threads_verification_into_prompt() {
+    async fn unified_review_threads_verification_and_rules_into_prompt() {
         use std::sync::Mutex;
         let seen: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let seen2 = seen.clone();
-        let critic: CriticFn = Arc::new(move |prompt: String| {
+        let judge: CriticFn = Arc::new(move |prompt: String| {
             *seen2.lock().unwrap() = prompt;
-            Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) })
+            Box::pin(async { Ok("VERDICT: COMPLETE\nFINDINGS: none".to_string()) })
         });
-        let _ = run_critic(
-            &critic,
-            "rules",
+        let _ = run_unified_review(
+            &judge,
+            "RULE: do not deploy",
             "edited foo.rs",
+            None,
             Some(VerificationStatus::Unverified),
         )
         .await;
+        let prompt = seen.lock().unwrap().clone();
         assert!(
-            seen.lock().unwrap().contains("verification status"),
-            "the verification signal must reach the critic prompt",
+            prompt.contains("verification status"),
+            "the verification signal must reach the judge prompt"
+        );
+        assert!(
+            prompt.contains("do not deploy"),
+            "the agent's constraints must reach the judge prompt"
         );
     }
 
     #[tokio::test]
-    async fn run_critic_injects_followup_when_incomplete() {
-        let critic: CriticFn = Arc::new(|_prompt| {
-            Box::pin(async { Ok("VERDICT: INCOMPLETE\n- the test was never run".to_string()) })
-        });
-        let msgs = run_critic(&critic, "rules", "did stuff", None).await;
-        assert_eq!(msgs.len(), 1);
-        let content = match &msgs[0] {
-            LoopMessage::User(u) => u.text_joined(),
-            _ => panic!("expected user message"),
-        };
-        assert!(content.starts_with(CRITIC_TAG));
-        assert!(content.contains("test was never run"));
-    }
-
-    #[tokio::test]
-    async fn run_critic_abstain_injects_test_request_nudge() {
-        let critic: CriticFn = Arc::new(|_prompt| {
-            Box::pin(async {
-                Ok("VERDICT: ABSTAIN\nNo test covers the retry-on-timeout path.".to_string())
-            })
-        });
-        let msgs = run_critic(&critic, "rules", "did stuff", None).await;
-        assert_eq!(msgs.len(), 1);
-        let content = match &msgs[0] {
-            LoopMessage::User(u) => u.text_joined(),
-            _ => panic!("expected user message"),
-        };
+    async fn unified_review_silent_when_complete_and_clean() {
+        let judge: CriticFn =
+            Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE\nFINDINGS: none".to_string()) }));
         assert!(
-            content.starts_with(CRITIC_TAG),
-            "abstain nudge must use CRITIC_TAG"
-        );
-        assert!(
-            content.contains("could not confirm"),
-            "abstain nudge must say 'could not confirm', got: {content}"
-        );
-        assert!(
-            content.contains("retry-on-timeout"),
-            "abstain nudge must carry the critic's detail, got: {content}"
-        );
-    }
-
-    #[tokio::test]
-    async fn run_critic_passes_rules_into_prompt() {
-        use std::sync::Mutex;
-        let seen: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let seen2 = seen.clone();
-        let critic: CriticFn = Arc::new(move |prompt: String| {
-            *seen2.lock().unwrap() = prompt;
-            Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) })
-        });
-        let _ = run_critic(&critic, "RULE: do not deploy", "did stuff", None).await;
-        assert!(
-            seen.lock().unwrap().contains("do not deploy"),
-            "the agent's constraints must reach the critic prompt",
-        );
-    }
-
-    #[tokio::test]
-    async fn run_critic_silent_when_complete() {
-        let critic: CriticFn =
-            Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE".to_string()) }));
-        assert!(
-            run_critic(&critic, "rules", "did stuff", None)
+            run_unified_review(&judge, "rules", "did stuff", None, None)
                 .await
                 .is_empty()
         );
     }
 
-    #[tokio::test]
-    async fn run_critic_fails_open_on_error() {
-        let critic: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
+    // ── Unified finalization judge (dirge-8v98) ──
+
+    use crate::agent::agent_loop::code_review::Severity;
+
+    fn msg_text(m: &LoopMessage) -> String {
+        match m {
+            LoopMessage::User(u) => u.text_joined(),
+            _ => panic!("expected a user follow-up message"),
+        }
+    }
+
+    #[test]
+    fn parse_unified_complete_and_clean() {
+        let (v, f) = parse_unified("VERDICT: COMPLETE\n\nFINDINGS: none");
+        assert!(matches!(v, Verdict::Complete));
+        assert!(f.is_empty());
+    }
+
+    #[test]
+    fn parse_unified_incomplete_with_findings_severity_sorted() {
+        let resp = "VERDICT: INCOMPLETE\n- the --skill arg is never parsed\n\n\
+                    FINDINGS:\n- low: inconsistent spacing in warnings.\n---\n\
+                    - high: line 834 missing closing paren -> SyntaxError. Fix: add ).";
+        let (v, f) = parse_unified(resp);
+        match v {
+            Verdict::Incomplete(gaps) => assert!(gaps.contains("--skill"), "gaps: {gaps}"),
+            other => panic!("expected incomplete, got {other:?}"),
+        }
+        assert_eq!(f.len(), 2);
+        assert_eq!(f[0].severity, Severity::High, "sorted highest-first");
+        assert_eq!(f[1].severity, Severity::Low);
+    }
+
+    #[test]
+    fn parse_unified_marker_case_insensitive_and_absent() {
+        // Marker absent (a diff-less completeness run) → verdict only.
+        let (v, f) = parse_unified("VERDICT: COMPLETE");
+        assert!(matches!(v, Verdict::Complete));
+        assert!(f.is_empty());
+        // Lowercase marker still splits verdict from findings.
+        let (v2, f2) =
+            parse_unified("VERDICT: INCOMPLETE\n- gap\n\nfindings:\n- critical: rce in exec path.");
+        assert!(matches!(v2, Verdict::Incomplete(_)));
+        assert_eq!(f2.len(), 1);
+        assert_eq!(f2[0].severity, Severity::Critical);
+    }
+
+    #[test]
+    fn unified_followup_none_when_complete_and_clean() {
+        assert!(build_unified_followup(Verdict::Complete, Vec::new()).is_none());
+    }
+
+    #[test]
+    fn unified_followup_reenters_for_high_finding_even_when_complete() {
+        // Completeness passed but the diff has a showstopper — must still
+        // re-enter. This is the exact case the display-only advisory swallowed.
+        let findings = parse_findings("- high: missing closing paren -> SyntaxError.");
+        let msg = build_unified_followup(Verdict::Complete, findings).expect("some");
+        let text = msg_text(&msg);
+        assert!(text.starts_with(CRITIC_TAG));
+        assert!(text.contains("Bugs to fix"));
+        assert!(text.to_lowercase().contains("syntaxerror"));
         assert!(
-            run_critic(&critic, "rules", "did stuff", None)
+            !text.contains("Completeness"),
+            "no completeness section when verdict was COMPLETE"
+        );
+    }
+
+    #[test]
+    fn unified_followup_reenters_for_low_only_finding() {
+        // "Re-enter once for any finding": a nitpick-only result still reaches
+        // the model (as optional), never a user-only wall.
+        let findings = parse_findings("- low: inconsistent spacing in warnings.");
+        let msg = build_unified_followup(Verdict::Complete, findings).expect("some");
+        let text = msg_text(&msg);
+        assert!(text.contains("Lower-priority notes"));
+        assert!(!text.contains("Bugs to fix"));
+    }
+
+    #[test]
+    fn unified_followup_combines_completeness_and_findings() {
+        let findings = parse_findings("- critical: auth bypass.\n---\n- medium: dup logic.");
+        let msg =
+            build_unified_followup(Verdict::Incomplete("- X is missing".to_string()), findings)
+                .expect("some");
+        let text = msg_text(&msg);
+        assert!(text.contains("Completeness"));
+        assert!(text.contains("X is missing"));
+        assert!(text.contains("Bugs to fix"));
+        assert!(text.contains("Lower-priority notes"));
+    }
+
+    #[test]
+    fn unified_prompt_includes_diff_only_when_present() {
+        let with = build_unified_prompt("rules", "did stuff", Some("@@ -1 +1 @@\n-a\n+b"), None);
+        assert!(with.contains("diff under review"));
+        assert!(with.contains("+b"));
+        let without = build_unified_prompt("rules", "did stuff", None, None);
+        assert!(!without.contains("diff under review"));
+        // Both carry the combined verdict+findings format contract.
+        assert!(with.contains("FINDINGS:"));
+        assert!(without.contains("FINDINGS:"));
+    }
+
+    #[tokio::test]
+    async fn run_unified_review_fails_open_on_error() {
+        let judge: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
+        assert!(
+            run_unified_review(&judge, "rules", "did stuff", Some("diff"), None)
                 .await
                 .is_empty(),
-            "a critic error must not block finalization"
+            "a judge error must not block finalization"
         );
     }
 }

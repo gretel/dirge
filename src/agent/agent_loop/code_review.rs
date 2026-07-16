@@ -1023,83 +1023,11 @@ pub fn partition_findings(findings: Vec<Finding>) -> (Vec<Finding>, Vec<Finding>
         .partition(|f| matches!(f.severity, Severity::High | Severity::Critical))
 }
 
-/// Build the blocking `[code-review]` follow-up from high/critical
-/// findings — the agent re-enters and must fix each or justify why it
-/// doesn't apply. `None` when there is nothing blocking.
-pub fn blocking_followup(blocking: &[Finding]) -> Option<LoopMessage> {
-    if blocking.is_empty() {
-        return None;
-    }
-    let body = render_findings(blocking);
-    Some(LoopMessage::User(UserMessage::text(format!(
-        "{CODE_REVIEW_TAG} A review of the diff you just made found these high-severity \
-         issues. Fix each, or explain why it doesn't apply (out of scope, intended, or \
-         something you were told not to do):\n{body}"
-    ))))
-}
-
-/// Render the advisory (medium/low) findings as a non-blocking
-/// `SystemNotice` body. `None` when there is nothing to advise. The caller
-/// emits this to the user without re-entering the loop.
-pub fn advisory_notice(advisory: &[Finding]) -> Option<String> {
-    if advisory.is_empty() {
-        return None;
-    }
-    let body = render_findings(advisory);
-    Some(format!(
-        "{CODE_REVIEW_TAG} lower-severity notes on your changes (advisory — not blocking):\n{body}"
-    ))
-}
-
-/// Render ALL findings (every severity) as one non-blocking `SystemNotice`
-/// body for background advisory mode (dirge-iyf5). Unlike
-/// [`advisory_notice`], which is fed only the medium/low split, this
-/// surfaces high/critical findings too — advisory mode reports them for the
-/// user's attention but never re-enters the loop. `None` when empty.
-pub fn background_review_notice(findings: &[Finding]) -> Option<String> {
-    if findings.is_empty() {
-        return None;
-    }
-    let body = render_findings(findings);
-    Some(format!(
-        "{CODE_REVIEW_TAG} review of the changes you just made (advisory — not blocking):\n{body}"
-    ))
-}
-
-/// dirge-kdwz: a SESSION-lived sink for background advisory-review notices.
-/// The detached review runs a (bounded but slow) judge call off the
-/// finalization path, so its notice lands AFTER the turn's AgentEnd — by
-/// which point the interactive UI has already dropped the per-turn event
-/// channel (`handle_done` nulls `agent_rx`) and headless has broken at
-/// Done, so the notice reached no live consumer and Advisory mode was a
-/// silent no-op. Routing it through a process-global sink set once at
-/// interactive startup (mirrors `task::set_subagent_chat_sink`) delivers it
-/// to a receiver the UI selects on across turns. Unset in headless/tests,
-/// where the detached review falls back to the per-turn (weak) sender.
-static REVIEW_NOTICE_SINK: std::sync::OnceLock<tokio::sync::mpsc::Sender<String>> =
-    std::sync::OnceLock::new();
-
-/// Install the session-lived review-notice sink. First writer wins; a
-/// re-set is logged and ignored (tests / hot reload may try twice).
-pub fn set_review_notice_sink(sink: tokio::sync::mpsc::Sender<String>) {
-    if REVIEW_NOTICE_SINK.set(sink).is_err() {
-        tracing::debug!("review notice sink already set; ignoring re-set");
-    }
-}
-
-/// The session-lived review-notice sender, if one was installed.
-pub fn review_notice_sink() -> Option<tokio::sync::mpsc::Sender<String>> {
-    REVIEW_NOTICE_SINK.get().cloned()
-}
-
-/// Join finding bodies with the `---` separator, each led by its severity.
-fn render_findings(findings: &[Finding]) -> String {
-    findings
-        .iter()
-        .map(|f| format!("[{}] {}", f.severity.label(), f.body.trim()))
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n")
-}
+// dirge-8v98: the finalization follow-up + advisory-notice builders and the
+// detached background-review sink lived here. The unified finalization judge
+// (`critic::run_unified_review`) now owns follow-up construction, so they were
+// removed. `partition_findings` stays — the unified follow-up builder and the
+// `/review` command both split on severity.
 
 #[cfg(test)]
 mod tests {
@@ -1659,65 +1587,6 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
     }
 
     #[test]
-    fn blocking_followup_none_when_empty_and_tags_when_present() {
-        assert!(blocking_followup(&[]).is_none());
-        let blocking = vec![Finding {
-            severity: Severity::High,
-            location: Some("src/a.rs:1".into()),
-            body: "High — auth skipped".into(),
-        }];
-        let msg = blocking_followup(&blocking).expect("some");
-        let content = match &msg {
-            LoopMessage::User(u) => u.text_joined(),
-            _ => panic!("expected user message"),
-        };
-        assert!(content.starts_with(CODE_REVIEW_TAG));
-        assert!(content.contains("auth skipped"));
-        assert!(content.to_lowercase().contains("fix each"));
-    }
-
-    #[test]
-    fn advisory_notice_none_when_empty_and_marks_non_blocking() {
-        assert!(advisory_notice(&[]).is_none());
-        let advisory = vec![Finding {
-            severity: Severity::Low,
-            location: None,
-            body: "Low — nit".into(),
-        }];
-        let text = advisory_notice(&advisory).expect("some");
-        assert!(text.starts_with(CODE_REVIEW_TAG));
-        assert!(text.contains("nit"));
-        assert!(text.to_lowercase().contains("advisory"));
-    }
-
-    #[test]
-    fn background_review_notice_surfaces_all_severities_non_blocking() {
-        // Background advisory mode reports high/critical too (it never
-        // re-enters, so nothing else would surface them to the user).
-        assert!(background_review_notice(&[]).is_none());
-        let findings = vec![
-            Finding {
-                severity: Severity::Critical,
-                location: None,
-                body: "Critical — data loss".into(),
-            },
-            Finding {
-                severity: Severity::Low,
-                location: None,
-                body: "Low — nit".into(),
-            },
-        ];
-        let text = background_review_notice(&findings).expect("some");
-        assert!(text.starts_with(CODE_REVIEW_TAG));
-        assert!(text.contains("data loss"), "includes the critical finding");
-        assert!(text.contains("nit"), "includes the low finding");
-        assert!(
-            text.to_lowercase().contains("not blocking"),
-            "flags itself non-blocking"
-        );
-    }
-
-    #[test]
     fn code_review_mode_from_wire_parses_vocabulary() {
         use crate::agent::agent_loop::types::CodeReviewMode;
         assert_eq!(CodeReviewMode::from_wire("off"), Some(CodeReviewMode::Off));
@@ -1946,30 +1815,6 @@ diff --git a/Cargo.lock b/Cargo.lock\n\
         assert!(
             f.is_empty(),
             "a timed-out reviewer must fail open to no findings"
-        );
-    }
-
-    /// dirge-kdwz: the session-lived review-notice sink delivers a notice to
-    /// a receiver decoupled from the per-turn event channel — the path the
-    /// detached advisory review now uses so its notice reaches the UI after
-    /// the turn's AgentEnd. (The OnceLock sink is set exactly once per test
-    /// binary; no other test installs it.)
-    #[tokio::test]
-    async fn review_notice_sink_delivers_out_of_band() {
-        assert!(
-            review_notice_sink().is_none(),
-            "unset by default so headless/tests fall back to the per-turn sender"
-        );
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(4);
-        set_review_notice_sink(tx);
-        let sink = review_notice_sink().expect("sink installed");
-        sink.send("[code-review] advisory note".to_string())
-            .await
-            .unwrap();
-        assert_eq!(
-            rx.recv().await.as_deref(),
-            Some("[code-review] advisory note"),
-            "a notice sent to the session sink reaches its receiver"
         );
     }
 }

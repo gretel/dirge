@@ -163,11 +163,10 @@ enum FollowUpSource {
     ResumeAfterFailure,
     /// Verifier gate: code was edited but nothing was run to check it.
     Verifier,
-    /// Bounded LLM critic judgment (at most once per run).
+    /// Unified finalization judge (dirge-8v98): completeness verdict + diff
+    /// findings in one call. One-shot (Off/Advisory) or persistent up to
+    /// [`super::code_review::MAX_REVIEW_REACT`] (Blocking).
     Critic,
-    /// Diff-aware code reviewer: findings on the run's diff. Re-enters the
-    /// loop, bounded by [`super::code_review::MAX_REVIEW_REACT`].
-    CodeReview,
     /// Goal gate: user-defined stop condition not yet met. Re-enters the
     /// loop, bounded by [`super::goal::MAX_GOAL_REACT`].
     Goal,
@@ -303,14 +302,11 @@ async fn poll_finalization_follow_up(
     config: &LoopConfig,
     system_prompt: &str,
     new_messages: &[LoopMessage],
+    // dirge-8v98: one-shot flag for the Off/Advisory unified judge; the
+    // persistent Blocking path uses `code_review_reacts` instead.
     critic_done: &mut bool,
     code_review_reacts: &mut u8,
     code_review_baseline: Option<&super::code_review::RunDiff>,
-    emitted_advisories: &mut std::collections::HashSet<String>,
-    // Shared with the detached advisory task (Arc so a background review
-    // spawned from an earlier finalization and the next one dedup against
-    // the same set). dirge-iyf5.
-    advisory_dedup: &std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     goal_reacts: &mut u8,
     todo_nudges: &mut u8,
     resume_nudges: &mut u8,
@@ -355,159 +351,74 @@ async fn poll_finalization_follow_up(
             return (msgs, FollowUpSource::Verifier);
         }
     }
-    // 3. F6 tier 3 — bounded LLM critic, once per run, only if the run did real
-    //    work. `critic_done` flips unconditionally so it fires at most once
-    //    regardless of verdict.
-    if !*critic_done && config.critic_fn.is_some() && run_made_tool_calls(new_messages) {
-        *critic_done = true;
-        if let Some(critic) = &config.critic_fn {
-            let transcript = build_critic_transcript(new_messages);
-            // dirge-6q3w: hand the critic the run's compile/lint/test signal
-            // (read-only, doesn't spend the cheap verifier's one-shot nudge)
-            // so it can be pickier about unverified code changes. `None` when
-            // no verifier gate is configured → critic behaves as before.
-            let verification = config.verifier.as_ref().map(|v| v.status());
-            // dirge-bedj: judge within the agent's own system prompt so the
-            // critic never demands a forbidden action.
-            let msgs =
-                super::critic::run_critic(critic, system_prompt, &transcript, verification).await;
-            if !msgs.is_empty() {
-                return (msgs, FollowUpSource::Critic);
-            }
-        }
-    }
-    // 3.25 dirge-iyf5 — diff-aware code reviewer. Reviews the run's
-    //      uncommitted diff and surfaces severity-ranked findings. Unlike
-    //      the one-shot critic it PERSISTS across finalizations (bounded by
-    //      MAX_REVIEW_REACT) so the agent can fix findings and be
-    //      re-reviewed. The precondition is a change on disk SINCE RUN START:
-    //      the current working-tree diff is compared against the run-start
-    //      baseline (dirge-1g3v), so a read-only turn — even one over
-    //      pre-existing uncommitted WIP — has an unchanged diff and skips the
-    //      reviewer entirely, never paying for a judge call. Active only when
-    //      a `critic_provider` is configured (the reviewer reuses its judge) —
-    //      off with no cost for default sessions.
-    //      dirge-iyf5: `config.code_review_mode` decides HOW it engages.
-    //      `Off` never arms `code_review_fn` (build.rs), so the `is_some()`
-    //      guard already excludes it. `Blocking` is the synchronous,
-    //      re-entering path below. `Advisory` (the default) runs the whole
-    //      capture+review detached in the background so finalization never
-    //      waits and never re-enters — findings surface as one notice.
-    if config.code_review_fn.is_some()
-        && config.code_review_mode != CodeReviewMode::Off
-        && run_made_tool_calls(new_messages)
-        && let Some(review_fn) = &config.code_review_fn
-    {
-        match config.code_review_mode {
-            CodeReviewMode::Blocking
-                if *code_review_reacts < super::code_review::MAX_REVIEW_REACT =>
-            {
+    // 3. Unified finalization judge (dirge-8v98) — ONE judge call that both
+    //    judges completeness (the old F6 critic) AND reviews the run's diff for
+    //    defects (the old diff-aware reviewer), returning a single consolidated
+    //    follow-up. Fires only if a judge is armed (`critic_fn`, i.e. a
+    //    `critic_provider` is configured) and the run did real work.
+    //
+    //    `code_review_mode` tunes it: `Off` reviews completeness only (no diff
+    //    capture, zero extra cost — behaves as the old transcript-only critic);
+    //    `Advisory` (default) and `Blocking` additionally capture and review the
+    //    run's diff. The diff is compared against the run-start baseline
+    //    (dirge-1g3v), so a read-only turn has an unchanged diff and reviews
+    //    completeness only — never paying to review nothing.
+    //
+    //    Lifecycle: `Off`/`Advisory` fire ONCE per run (one-shot, gated by
+    //    `critic_done`); `Blocking` PERSISTS across finalizations (bounded by
+    //    MAX_REVIEW_REACT via `code_review_reacts`) so the agent can fix findings
+    //    and be re-reviewed until the diff is clean. Any finding — even
+    //    medium/low — re-enters the loop so the model actually sees and acts on
+    //    it, rather than a display-only notice it never reads.
+    if config.critic_fn.is_some() && run_made_tool_calls(new_messages) {
+        let mode = config.code_review_mode;
+        let one_shot = mode != CodeReviewMode::Blocking;
+        let may_fire = if one_shot {
+            !*critic_done
+        } else {
+            *code_review_reacts < super::code_review::MAX_REVIEW_REACT
+        };
+        if may_fire && let Some(judge) = &config.critic_fn {
+            // Capture the run's diff only when diff-review is on AND the working
+            // tree changed since run start; otherwise review completeness alone.
+            let diff_owned: Option<String> = if mode != CodeReviewMode::Off {
                 let repo =
                     std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
                 // Diff capture shells out to git — do it off the async runtime.
-                let diff = tokio::task::spawn_blocking(move || {
+                let captured = tokio::task::spawn_blocking(move || {
                     super::code_review::capture_run_diff(&repo)
                 })
                 .await
                 .ok()
                 .flatten();
-                // Review only what THIS run changed: skip when the diff is
-                // identical to the run-start baseline (nothing touched on disk).
-                if let Some(diff) = run_delta_to_review(diff.as_ref(), code_review_baseline) {
-                    let transcript = build_critic_transcript(new_messages);
-                    let findings = super::code_review::run_code_review(
-                        review_fn,
-                        system_prompt,
-                        diff,
-                        &transcript,
-                    )
-                    .await;
-                    if !findings.is_empty() {
-                        let reaction = decide_review_reaction(findings, emitted_advisories);
-                        // Medium/Low → surface a non-blocking `<system>` notice,
-                        // but only the first time this exact advisory comes up.
-                        if let Some(text) = reaction.advisory_to_emit {
-                            let _ = emit.send(LoopEvent::SystemNotice { content: text }).await;
-                        }
-                        // Only a blocking engagement spends the react budget — an
-                        // advisory-only review finalizes without burning it.
-                        if reaction.counts_against_budget {
-                            *code_review_reacts += 1;
-                        }
-                        // High/Critical → re-enter the loop; the agent must fix
-                        // or justify. Advisory-only reviews fall through.
-                        if let Some(msg) = reaction.blocking_followup {
-                            return (vec![msg], FollowUpSource::CodeReview);
-                        }
-                    }
-                }
+                run_delta_to_review(captured.as_ref(), code_review_baseline).map(str::to_string)
+            } else {
+                None
+            };
+            let transcript = build_critic_transcript(new_messages);
+            // dirge-6q3w: thread the run's compile/lint/test signal so the judge
+            // can be pickier about unverified changes. dirge-bedj: judge within
+            // the agent's own system prompt so it never demands a forbidden
+            // action.
+            let verification = config.verifier.as_ref().map(|v| v.status());
+            let msgs = super::critic::run_unified_review(
+                judge,
+                system_prompt,
+                &transcript,
+                diff_owned.as_deref(),
+                verification,
+            )
+            .await;
+            // One-shot modes fire at most once (flip regardless of verdict);
+            // blocking spends its budget only when it actually re-enters.
+            if one_shot {
+                *critic_done = true;
+            } else if !msgs.is_empty() {
+                *code_review_reacts += 1;
             }
-            CodeReviewMode::Advisory => {
-                // Detached: capture + review + emit run off the finalization
-                // path, so a tight debug loop is never held up. ALL findings
-                // (high/critical included) surface as one non-blocking notice;
-                // the loop is never re-entered and the react budget is untouched.
-                let review_fn = review_fn.clone();
-                let system_prompt = system_prompt.to_string();
-                let transcript = build_critic_transcript(new_messages);
-                let baseline = code_review_baseline.cloned();
-                // dirge-ioym: a WEAK sender — the review runs off the
-                // finalization path (a bounded but slow judge call), so a
-                // strong clone would keep the per-turn event channel open past
-                // AgentEnd and stall a drain-to-close consumer on the judge.
-                let emit = emit.downgrade();
-                let dedup = advisory_dedup.clone();
-                tokio::spawn(async move {
-                    let repo =
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-                    let diff = tokio::task::spawn_blocking(move || {
-                        super::code_review::capture_run_diff(&repo)
-                    })
-                    .await
-                    .ok()
-                    .flatten();
-                    let Some(diff) = run_delta_to_review(diff.as_ref(), baseline.as_ref()) else {
-                        return;
-                    };
-                    let findings = super::code_review::run_code_review(
-                        &review_fn,
-                        &system_prompt,
-                        diff,
-                        &transcript,
-                    )
-                    .await;
-                    let Some(notice) = super::code_review::background_review_notice(&findings)
-                    else {
-                        return;
-                    };
-                    // Dedup against the shared set so the same advisory isn't
-                    // repeated across finalizations. Lock is released before the
-                    // await (no lock held across `.send`).
-                    {
-                        let mut seen = dedup.lock().unwrap_or_else(|e| e.into_inner());
-                        if !seen.insert(notice.clone()) {
-                            return;
-                        }
-                    }
-                    // dirge-kdwz: deliver on the session-lived review-notice
-                    // sink so the UI sees it even though the per-turn channel
-                    // is gone by now (the review's judge call finishes after
-                    // AgentEnd). Fall back to the (weak) per-turn sender for
-                    // consumers without a sink — headless, tests — which stop
-                    // at Done and wouldn't render it anyway. try_send (not
-                    // send().await) so a stalled UI can't back-pressure this
-                    // detached task; an advisory dropped on a full queue is
-                    // acceptable, matching task::emit_chat's drop-on-overflow.
-                    if let Some(sink) = super::code_review::review_notice_sink() {
-                        let _ = sink.try_send(notice);
-                    } else if let Some(emit) = emit.upgrade() {
-                        let _ = emit.send(LoopEvent::SystemNotice { content: notice }).await;
-                    }
-                });
+            if !msgs.is_empty() {
+                return (msgs, FollowUpSource::Critic);
             }
-            // Off is excluded by the guard above; Blocking with an exhausted
-            // budget falls through without re-reviewing.
-            _ => {}
         }
     }
     // 3.5 Goal gate — user-defined stop condition. Unlike the one-shot
@@ -1494,23 +1405,11 @@ pub async fn run_loop(
     // Lives outside the outer loop so it persists across turns.
     let mut reflections = super::reflexion::ReflectionLog::new();
 
-    // F6 tier 3: the bounded LLM critic fires at most once per run.
+    // dirge-8v98: the unified finalization judge fires at most once per run in
+    // Off/Advisory mode (one-shot); Blocking mode persists across finalizations
+    // (fix-then-re-review) bounded by MAX_REVIEW_REACT.
     let mut critic_done = false;
-
-    // dirge-iyf5: the diff-aware code reviewer persists across
-    // finalizations (fix-then-re-review) bounded by MAX_REVIEW_REACT.
     let mut code_review_reacts: u8 = 0;
-
-    // dirge-jo0o: advisory (medium/low) notices already emitted this run, so a
-    // persistent low-severity finding is advised once rather than re-posted as
-    // a duplicate SystemNotice at every finalization.
-    let mut emitted_advisories: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    // dirge-iyf5: background advisory reviews (default mode) dedup against
-    // this shared set — a detached task from an earlier finalization and the
-    // next one must not both surface the same finding.
-    let advisory_dedup: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
 
     // dirge-1g3v: snapshot the working-tree diff at run start so the reviewer
     // can tell what THIS run changed. Without a baseline it diffed the whole
@@ -2457,8 +2356,8 @@ pub async fn run_loop(
 
         // Outer-loop finalization poll (pi lines 256-262): the single
         // priority-ordered authority for follow-up interjections —
-        // hook → verifier → critic → code-review → goal → todo, at most
-        // one per finalization.
+        // hook → verifier → unified judge → goal → todo, at most one per
+        // finalization.
         let (follow_up, source) = poll_finalization_follow_up(
             &config,
             &current_context.system_prompt,
@@ -2466,8 +2365,6 @@ pub async fn run_loop(
             &mut critic_done,
             &mut code_review_reacts,
             code_review_baseline.as_ref(),
-            &mut emitted_advisories,
-            &advisory_dedup,
             &mut goal_reacts,
             &mut todo_nudges,
             &mut resume_nudges,
@@ -2608,44 +2505,6 @@ fn run_delta_to_review<'a>(
         None => true,
     };
     if changed { Some(&current.capped) } else { None }
-}
-
-/// One code-review engagement's outcome at finalization, split from the
-/// async diff/judge plumbing so the counting + advisory-dedup rules are
-/// unit-testable (dirge-jo0o).
-struct ReviewReaction {
-    /// Advisory (medium/low) notice to emit, or `None` when there is
-    /// nothing new to advise — no advisory findings, or an identical notice
-    /// already went out this run.
-    advisory_to_emit: Option<String>,
-    /// Blocking (high/critical) follow-up that re-enters the loop.
-    blocking_followup: Option<LoopMessage>,
-    /// Whether this engagement spends one unit of the bounded react budget.
-    counts_against_budget: bool,
-}
-
-/// Decide what a single code-review engagement does with its findings.
-///
-/// dirge-jo0o: the budget (`MAX_REVIEW_REACT`) exists to stop a *stubbern*
-/// blocking finding from looping forever, so only a blocking engagement
-/// spends it — an advisory-only review finalizes and must not burn budget.
-/// And a persistent medium/low finding must be advised once, not re-posted
-/// as a duplicate `SystemNotice` at every finalization: `emitted_advisories`
-/// remembers the exact notice text already sent this run.
-fn decide_review_reaction(
-    findings: Vec<super::code_review::Finding>,
-    emitted_advisories: &mut std::collections::HashSet<String>,
-) -> ReviewReaction {
-    let (blocking, advisory) = super::code_review::partition_findings(findings);
-    let advisory_to_emit = super::code_review::advisory_notice(&advisory)
-        .filter(|text| emitted_advisories.insert(text.clone()));
-    let blocking_followup = super::code_review::blocking_followup(&blocking);
-    let counts_against_budget = blocking_followup.is_some();
-    ReviewReaction {
-        advisory_to_emit,
-        blocking_followup,
-        counts_against_budget,
-    }
 }
 
 /// Build a compact transcript of one run for the F6 critic: the user
