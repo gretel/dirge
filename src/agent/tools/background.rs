@@ -759,6 +759,20 @@ impl BackgroundStore {
                 .any(|n| !tracked.contains(n.id.as_str()))
     }
 
+    pub fn coordinator_generation_running(&self) -> bool {
+        let inner = self.lock();
+        let Some(coordinator) = &inner.coordinator else {
+            return false;
+        };
+        !coordinator.active_task_ids.is_empty()
+            && coordinator.active_task_ids.iter().any(|id| {
+                matches!(
+                    inner.tasks.get(id).map(|task| &task.state),
+                    Some(TaskState::Running)
+                )
+            })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
         self.inner.lock_ignore_poison()
     }
@@ -971,6 +985,20 @@ fn truncate_state(state: TaskState) -> TaskState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coordinator_reports_nonterminal_generation_until_batch_finishes() {
+        let store = BackgroundStore::new();
+        store.enable_coordinator(crate::config::SubagentDispatchStrategy::Full);
+        store
+            .insert_coordinator_dispatch("task".into(), "research".into(), false, false, None)
+            .unwrap();
+
+        assert!(store.coordinator_generation_running());
+
+        store.notify("task", TaskState::Completed("done".into()));
+        assert!(!store.coordinator_generation_running());
+    }
 
     #[test]
     fn coordinator_allows_one_retry_for_a_failed_dispatch() {

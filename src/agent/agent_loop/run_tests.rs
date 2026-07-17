@@ -109,6 +109,7 @@ fn build_config() -> LoopConfig {
         should_stop_after_turn: None,
         get_steering_messages: None,
         get_followup_messages: None,
+        should_defer_finalization: None,
         reasoning: None,
         thinking_budgets: None,
         headers: std::collections::HashMap::new(),
@@ -3944,6 +3945,63 @@ fn run_delta_to_review_engages_when_capped_identical_but_fingerprint_differs() {
     );
 }
 
+/// A nonterminal coordinator generation is an intentional suspension, not a
+/// completion candidate. The finalization poll must return before invoking the
+/// critic, and must leave its one-shot budget untouched for reconciliation.
+#[tokio::test]
+async fn finalization_defers_critic_while_external_work_is_pending() {
+    use crate::agent::agent_loop::critic::CriticFn;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut config = build_config();
+    config.should_defer_finalization = Some(Arc::new(|| true));
+    let judge: CriticFn = Arc::new({
+        let calls = calls.clone();
+        move |_prompt| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok("VERDICT: COMPLETE\nFINDINGS: none".to_string()) })
+        }
+    });
+    config.critic_fn = Some(judge);
+    let new_messages = vec![LoopMessage::ToolResult(
+        crate::agent::agent_loop::message::ToolResultMessage {
+            tool_call_id: "call_1".into(),
+            tool_name: "task".into(),
+            content: vec![crate::agent::agent_loop::message::ContentBlock::Text {
+                text: "background task started".into(),
+            }],
+            details: serde_json::Value::Null,
+            is_error: false,
+        },
+    )];
+    let mut critic_done = false;
+    let (emit, _emit_rx) = tokio::sync::mpsc::channel(8);
+    let (msgs, source) = poll_finalization_follow_up(
+        &config,
+        "sys",
+        &new_messages,
+        &mut critic_done,
+        &mut 0u8,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &mut 0u8,
+        GateMode::Off,
+        None,
+        None,
+        &mut 0u8,
+        &mut 0u8,
+        &emit,
+    )
+    .await;
+
+    assert!(msgs.is_empty());
+    assert_eq!(source, FollowUpSource::None);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    assert!(!critic_done);
+}
+
 /// Highest-priority gate (the caller hook) short-circuits the lower gates:
 /// when it yields a follow-up, the critic is never consulted (`critic_done`
 /// stays false) and the todo gate isn't reached. This locks the precedence.
@@ -3957,7 +4015,9 @@ async fn finalization_hook_short_circuits_lower_gates() {
             )]
         })
     }));
-
+    // A batch can become terminal at this exact boundary. Delivery must win
+    // over a stale/overlapping deferral signal.
+    config.should_defer_finalization = Some(Arc::new(|| true));
     let mut critic_done = false;
     let mut goal_reacts = 0u8;
     let mut todo_nudges = 0u8;

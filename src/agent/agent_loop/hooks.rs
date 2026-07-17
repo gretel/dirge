@@ -170,6 +170,12 @@ pub type GetSteeringMessagesFn =
 pub type GetFollowupMessagesFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<LoopMessage>> + Send>> + Send + Sync>;
 
+/// Polled at the finalization boundary. Returns `true` when the run should
+/// defer finalization — e.g. coordinated subagent work is still running, so the
+/// parent turn should end WITHOUT the critic (and lower gates) firing and be
+/// re-woken when the batch becomes deliverable.
+pub type ShouldDeferFinalizationFn = Arc<dyn Fn() -> bool + Send + Sync>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

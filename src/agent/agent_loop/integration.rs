@@ -571,6 +571,10 @@ pub fn spawn_loop_runner(cfg: LoopSpawnConfig) -> LoopRunner {
             .bg_store
             .clone()
             .map(|store| crate::agent::tools::background::followup_from_background_store(store)),
+        should_defer_finalization: cfg.bg_store.clone().map(|store| {
+            std::sync::Arc::new(move || store.coordinator_generation_running())
+                as crate::agent::agent_loop::hooks::ShouldDeferFinalizationFn
+        }),
         reasoning: None,
         thinking_budgets: None,
         headers: std::collections::HashMap::new(),

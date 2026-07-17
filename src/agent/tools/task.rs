@@ -1267,6 +1267,12 @@ pub struct Args {
     pub retry_of: Option<String>,
 }
 
+fn normalize_retry_of(retry_of: Option<String>) -> Option<String> {
+    retry_of
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
 impl Tool for TaskTool {
     const NAME: &'static str = "task";
 
@@ -1406,11 +1412,12 @@ impl Tool for TaskTool {
         };
 
         let background = args.background.unwrap_or(false);
+        let retry_of = normalize_retry_of(args.retry_of);
         let is_writer = matches!(
             tier,
             crate::context::agent_defs::SubagentToolTier::ReadWrite
         );
-        if args.retry_of.is_some() && !background {
+        if retry_of.is_some() && !background {
             return Err(ToolError::Msg("retry_of requires background=true".into()));
         }
         if self.bg_store.coordinator_strategy().is_some() && !background && is_writer {
@@ -1443,7 +1450,7 @@ impl Tool for TaskTool {
                     timeout,
                     background,
                     is_writer,
-                    args.retry_of,
+                    retry_of,
                     args.prompt,
                     args.agent,
                 )
@@ -1476,7 +1483,7 @@ impl Tool for TaskTool {
                         args.prompt.clone(),
                         is_writer,
                         false,
-                        args.retry_of.as_deref(),
+                        retry_of.as_deref(),
                     )
                     .map_err(ToolError::Msg)?;
             } else {
@@ -1707,6 +1714,16 @@ mod tests {
     use crate::provider::AnyModel;
     use rig::client::CompletionClient;
     use rig::providers::openrouter;
+
+    #[test]
+    fn blank_retry_id_is_treated_as_absent() {
+        assert_eq!(normalize_retry_of(Some("".to_string())), None);
+        assert_eq!(normalize_retry_of(Some("   ".to_string())), None);
+        assert_eq!(
+            normalize_retry_of(Some(" task-id ".to_string())),
+            Some("task-id".to_string())
+        );
+    }
 
     fn mock_tool() -> TaskTool {
         // The model is never invoked in these tests — they exercise the
