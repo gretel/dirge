@@ -326,6 +326,21 @@ async fn poll_finalization_follow_up(
             return (msgs, FollowUpSource::Hook);
         }
     }
+
+    // Coordinator work may intentionally outlive this parent turn. The
+    // completion hook above gets first chance to deliver a batch that became
+    // terminal at the boundary; only a still-running generation defers the
+    // critic and every lower "are we done?" gate. The UI wakes the parent when
+    // the batch becomes deliverable, so returning no follow-up here suspends
+    // cleanly without polling or consuming one-shot gate budgets.
+    if config
+        .should_defer_finalization
+        .as_ref()
+        .is_some_and(|should_defer| should_defer())
+    {
+        return (Vec::new(), FollowUpSource::None);
+    }
+
     // 1.5 Deterministic resume-after-failure: fires when the model's last
     //     action was a failed tool call and it stopped without retrying.
     //     Cheap, no LLM call, always-on. Bounded by MAX_RESUME_NUDGE.

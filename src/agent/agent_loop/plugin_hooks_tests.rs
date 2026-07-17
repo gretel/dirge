@@ -77,6 +77,7 @@ fn build_config() -> LoopConfig {
         should_stop_after_turn: None,
         get_steering_messages: None,
         get_followup_messages: None,
+        should_defer_finalization: None,
         reasoning: None,
         thinking_budgets: None,
         headers: std::collections::HashMap::new(),

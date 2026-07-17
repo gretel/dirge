@@ -170,6 +170,8 @@ pub type GetSteeringMessagesFn =
 pub type GetFollowupMessagesFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Vec<LoopMessage>> + Send>> + Send + Sync>;
 
+pub type ShouldDeferFinalizationFn = Arc<dyn Fn() -> bool + Send + Sync>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

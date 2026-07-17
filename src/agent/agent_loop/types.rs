@@ -327,6 +327,8 @@ pub struct LoopConfig {
     /// (types.ts:243).
     pub get_followup_messages: Option<super::hooks::GetFollowupMessagesFn>,
 
+    pub should_defer_finalization: Option<super::hooks::ShouldDeferFinalizationFn>,
+
     // ============================================================
     // Phase 4.6 — provider stream options (pi parity)
     // ============================================================
@@ -707,6 +709,7 @@ impl Clone for LoopConfig {
             should_stop_after_turn: self.should_stop_after_turn.clone(),
             get_steering_messages: self.get_steering_messages.clone(),
             get_followup_messages: self.get_followup_messages.clone(),
+            should_defer_finalization: self.should_defer_finalization.clone(),
             reasoning: self.reasoning,
             thinking_budgets: self.thinking_budgets.clone(),
             headers: self.headers.clone(),
@@ -761,6 +764,7 @@ impl LoopConfig {
             should_stop_after_turn: None,
             get_steering_messages: None,
             get_followup_messages: None,
+            should_defer_finalization: None,
             reasoning: None,
             thinking_budgets: None,
             headers: std::collections::HashMap::new(),
