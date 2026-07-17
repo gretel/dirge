@@ -273,6 +273,12 @@ pub fn build_unified_prompt(
     transcript: &str,
     diff: Option<&str>,
     verification: Option<VerificationStatus>,
+    // dirge-9b2k R2: findings a prior Blocking reaction raised. The judge is told
+    // to re-raise one only if it's still present AND the model neither fixed nor
+    // justified it (blindly re-emitting a declined finding is the duplicate bug;
+    // silently dropping an unaddressed one is the opposite failure). `None`/blank
+    // = no section.
+    prior_findings: Option<&str>,
 ) -> String {
     let rules = strip_compaction_summary(rules).trim();
     let rules_block = if rules.is_empty() {
@@ -287,11 +293,23 @@ pub fn build_unified_prompt(
         ),
         _ => String::new(),
     };
+    let prior_findings_block = match prior_findings {
+        Some(p) if !p.trim().is_empty() => format!(
+            "\n\n--- findings raised on an earlier review (the assistant's response is in the \
+             transcript above) ---\n{}\n--- end prior findings ---\n\
+             For each: if the assistant fixed it, or gave a sound reason for leaving it, do NOT \
+             re-raise it. If it is still present and the assistant neither fixed nor justified \
+             it, DO re-raise it. Only re-raise a justified finding when the justification is \
+             factually wrong — then explain why it fails.",
+            p.trim()
+        ),
+        _ => String::new(),
+    };
     format!(
         "{UNIFIED_FORMAT}\n\n\
          --- assistant instructions & constraints (judge within these; never demand a \
          forbidden/out-of-scope action) ---\n{rules_block}\n--- end instructions ---\n\n\
-         --- transcript ---\n{transcript}\n--- end transcript ---{diff_block}{}",
+         --- transcript ---\n{transcript}\n--- end transcript ---{diff_block}{prior_findings_block}{}",
         verification_block(verification)
     )
 }
@@ -380,19 +398,28 @@ pub async fn run_unified_review(
     transcript: &str,
     diff: Option<&str>,
     verification: Option<VerificationStatus>,
-) -> Vec<LoopMessage> {
-    let prompt = build_unified_prompt(rules, transcript, diff, verification);
+    prior_findings: Option<&str>,
+) -> (Vec<LoopMessage>, Option<String>) {
+    let prompt = build_unified_prompt(rules, transcript, diff, verification, prior_findings);
     let response = run_judge!(
         judge,
         prompt,
         "dirge::critic",
         "unified review call failed; finalizing without it",
-        Vec::new()
+        (Vec::new(), None)
     );
     let (verdict, findings) = parse_unified(&response);
-    build_unified_followup(verdict, findings)
+    // dirge-9b2k R2: surface the rendered findings so the caller can hand them
+    // to the next reaction's judge prompt (Blocking path in run.rs).
+    let raised = if findings.is_empty() {
+        None
+    } else {
+        Some(render_findings(&findings))
+    };
+    let msgs = build_unified_followup(verdict, findings)
         .into_iter()
-        .collect()
+        .collect();
+    (msgs, raised)
 }
 
 #[cfg(test)]
@@ -408,7 +435,7 @@ mod tests {
         transcript: &str,
         verification: Option<VerificationStatus>,
     ) -> String {
-        build_unified_prompt(rules, transcript, None, verification)
+        build_unified_prompt(rules, transcript, None, verification, None)
     }
 
     #[test]
@@ -689,6 +716,7 @@ mod tests {
             "edited foo.rs",
             None,
             Some(VerificationStatus::Unverified),
+            None,
         )
         .await;
         let prompt = seen.lock().unwrap().clone();
@@ -707,8 +735,9 @@ mod tests {
         let judge: CriticFn =
             Arc::new(|_p| Box::pin(async { Ok("VERDICT: COMPLETE\nFINDINGS: none".to_string()) }));
         assert!(
-            run_unified_review(&judge, "rules", "did stuff", None, None)
+            run_unified_review(&judge, "rules", "did stuff", None, None, None)
                 .await
+                .0
                 .is_empty()
         );
     }
@@ -807,22 +836,78 @@ mod tests {
 
     #[test]
     fn unified_prompt_includes_diff_only_when_present() {
-        let with = build_unified_prompt("rules", "did stuff", Some("@@ -1 +1 @@\n-a\n+b"), None);
+        let with = build_unified_prompt(
+            "rules",
+            "did stuff",
+            Some("@@ -1 +1 @@\n-a\n+b"),
+            None,
+            None,
+        );
         assert!(with.contains("diff under review"));
         assert!(with.contains("+b"));
-        let without = build_unified_prompt("rules", "did stuff", None, None);
+        let without = build_unified_prompt("rules", "did stuff", None, None, None);
         assert!(!without.contains("diff under review"));
         // Both carry the combined verdict+findings format contract.
         assert!(with.contains("FINDINGS:"));
         assert!(without.contains("FINDINGS:"));
     }
 
+    #[test]
+    fn unified_prompt_omits_prior_findings_section_when_none() {
+        // dirge-9b2k R2: no prior findings → no new section (identical to the
+        // pre-R2 prompt).
+        let p = build_unified_prompt(
+            "rules",
+            "did stuff",
+            Some("@@ -1 +1 @@\n-a\n+b"),
+            None,
+            None,
+        );
+        assert!(!p.contains("earlier review"));
+        assert!(p.contains("diff under review"));
+    }
+
+    #[test]
+    fn unified_prompt_omits_prior_findings_section_when_blank() {
+        // A whitespace-only string carries no real findings — still no section.
+        let p = build_unified_prompt("rules", "did stuff", Some("diff"), None, Some("  \n "));
+        assert!(!p.contains("earlier review"));
+    }
+
+    #[test]
+    fn unified_prompt_includes_prior_findings_section_when_present() {
+        let p = build_unified_prompt(
+            "rules",
+            "did stuff",
+            Some("diff"),
+            None,
+            Some("- High — sql injection"),
+        );
+        assert!(
+            p.contains("earlier review"),
+            "prior-findings section must appear"
+        );
+        assert!(
+            p.contains("- High — sql injection"),
+            "the prior findings must be inlined"
+        );
+        assert!(
+            p.contains("do NOT re-raise"),
+            "the suppress-if-addressed instruction must be present"
+        );
+        assert!(
+            p.contains("neither fixed nor justified"),
+            "the re-raise-if-unaddressed instruction must be present"
+        );
+    }
+
     #[tokio::test]
     async fn run_unified_review_fails_open_on_error() {
         let judge: CriticFn = Arc::new(|_p| Box::pin(async { anyhow::bail!("provider down") }));
         assert!(
-            run_unified_review(&judge, "rules", "did stuff", Some("diff"), None)
+            run_unified_review(&judge, "rules", "did stuff", Some("diff"), None, None)
                 .await
+                .0
                 .is_empty(),
             "a judge error must not block finalization"
         );
