@@ -4,6 +4,16 @@ All notable changes to dirge are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.19.16] - 2026-07-18
+
+### Added
+- macOS microVM sandbox backend via libkrun on Hypervisor.framework: a pure-Rust
+  OCI image puller (blob digests verified, tar entries path-checked), ephemeral
+  SSH host-key generation with exact host-key verification, PTY-based attach, and
+  runtime codesigning of the runner with the hypervisor entitlement. See
+  `docs/microvm/SETUP.md` for prerequisites. Opt-in behind the `sandbox-microvm`
+  feature (#688).
+
 ## [0.19.15] - 2026-07-18
 
 ### Added
