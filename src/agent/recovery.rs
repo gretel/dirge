@@ -153,6 +153,12 @@ where
                 let msg = err.to_string();
                 let kind = classify_error(&msg);
                 if !policy.should_retry(attempts, kind) {
+                    tracing::error!(
+                        op = label,
+                        error_kind = %format!("{:?}", kind),
+                        error = %msg,
+                        "non-retryable error, bailing"
+                    );
                     return Err(err);
                 }
                 let delay = policy.backoff_duration_for_msg(attempts, &msg);

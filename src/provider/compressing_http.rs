@@ -3,6 +3,14 @@ use rig::http_client::{
     self, HttpClientExt, LazyBody, MultipartForm, Request, Response, StreamingResponse,
 };
 
+/// Render a request URI for logging with its query string removed. Some
+/// providers (notably Gemini, whose rig client builds `…?key=<API_KEY>`) carry
+/// the API key in the query, so the raw URI must never reach the logs. Keeps
+/// scheme://authority/path — enough to debug routing.
+fn log_safe_uri(uri: &str) -> String {
+    uri.split('?').next().unwrap_or(uri).to_string()
+}
+
 /// Wraps an inner HTTP client and optionally compresses request bodies before
 /// delegating — fail-open: any compression error passes the original body
 /// through unchanged, so a compression bug can never break a request.
@@ -122,7 +130,28 @@ where
         let req = self.normalized_request(req);
         async move {
             let req = req?;
-            inner.send(req).await
+            let method = req.method().to_string();
+            let uri = log_safe_uri(&req.uri().to_string());
+            let result = inner.send(req).await;
+            match &result {
+                Ok(resp) => {
+                    tracing::debug!(
+                        method = %method,
+                        uri = %uri,
+                        status = resp.status().as_u16(),
+                        "HTTP response received"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        method = %method,
+                        uri = %uri,
+                        error = %e,
+                        "sending HTTP request"
+                    );
+                }
+            }
+            result
         }
     }
 
@@ -147,7 +176,51 @@ where
         let req = self.normalized_request(req);
         async move {
             let req = req?;
-            inner.send_streaming(req).await
+            let method = req.method().to_string();
+            let uri = log_safe_uri(&req.uri().to_string());
+            let result = inner.send_streaming(req).await;
+            match &result {
+                Ok(_) => {
+                    tracing::debug!(
+                        method = %method,
+                        uri = %uri,
+                        "sending HTTP streaming request"
+                    );
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        method = %method,
+                        uri = %uri,
+                        error = %e,
+                        "sending HTTP streaming request"
+                    );
+                }
+            }
+            result
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_safe_uri;
+
+    #[test]
+    fn log_safe_uri_strips_the_query_string() {
+        // Gemini carries the API key in `?key=…` — it must not survive into logs.
+        assert_eq!(
+            log_safe_uri(
+                "https://generativelanguage.googleapis.com/v1beta/models/x:generateContent?alt=sse&key=SECRET"
+            ),
+            "https://generativelanguage.googleapis.com/v1beta/models/x:generateContent"
+        );
+    }
+
+    #[test]
+    fn log_safe_uri_leaves_query_less_urls_untouched() {
+        assert_eq!(
+            log_safe_uri("https://api.cerebras.ai/v1/chat/completions"),
+            "https://api.cerebras.ai/v1/chat/completions"
+        );
     }
 }

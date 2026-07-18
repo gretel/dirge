@@ -144,7 +144,7 @@ pub struct Cli {
     #[arg(
         short = 'v',
         long = "verbose",
-        help = "Enable verbose logging (debug for dirge, warn for plugin hooks; equivalent to RUST_LOG=dirge=debug,dirge::plugin=warn). RUST_LOG env takes precedence if set."
+        help = "Enable verbose logging (debug for dirge, warn for plugin hooks; equivalent to RUST_LOG=dirge=debug,dirge::plugin=warn). Logs HTTP request/response status codes and error classifications. RUST_LOG env takes precedence if set."
     )]
     pub verbose: bool,
 

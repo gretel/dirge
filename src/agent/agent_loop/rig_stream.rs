@@ -149,6 +149,7 @@ where
             if let Some(sig) = signal.as_ref()
                 && sig.is_cancelled()
             {
+                tracing::debug!(error_kind = "abort", "stream event: error");
                 yield StreamEvent::Error {
                     error: "stream aborted by cancellation signal".to_string(),
                 };
@@ -194,6 +195,7 @@ where
                     };
                     match waited {
                         None => {
+                            tracing::debug!(error_kind = "abort", "stream event: error");
                             yield StreamEvent::Error {
                                 error: "stream aborted by cancellation signal".to_string(),
                             };
@@ -234,6 +236,7 @@ where
                     };
                     match waited {
                         None => {
+                            tracing::debug!(error_kind = "abort", "stream event: error");
                             yield StreamEvent::Error {
                                 error: "stream aborted by cancellation signal".to_string(),
                             };
@@ -503,8 +506,15 @@ where
                     }
                 }
                 Err(err) => {
+                    let error_msg = err.to_string();
+                    use crate::agent::recovery::classify_error;
+                    let kind = classify_error(&error_msg);
+                    tracing::debug!(
+                        error_kind = %format!("{:?}", kind),
+                        "stream event: error"
+                    );
                     yield StreamEvent::Error {
-                        error: err.to_string(),
+                        error: error_msg,
                     };
                     return;
                 }
